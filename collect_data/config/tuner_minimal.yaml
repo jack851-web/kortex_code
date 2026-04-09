@@ -1,0 +1,11 @@
+# 标定最小配置：只保留你需要的3个核心参数 + 基础场景xml
+object_name: "cup"
+object_position: [0.212, -0.400, 0.02]
+object_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/cup/model_new.xml"
+
+simulation:
+  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  scene_base_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  coord_rotation_z: 0
+  initial_joints_unit: rad
+  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]

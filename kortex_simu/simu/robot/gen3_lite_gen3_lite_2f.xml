@@ -1,0 +1,147 @@
+<mujoco model="gen3_lite_gen3_lite_2f">
+  <compiler angle="radian" coordinate="local"/>
+  <asset>
+    <mesh name="BASE" file="meshes/BASE.STL"/>
+    <mesh name="SHOULDER" file="meshes/SHOULDER.STL"/>
+    <mesh name="ARM" file="meshes/ARM.STL"/>
+    <mesh name="FOREARM" file="meshes/FOREARM.STL"/>
+    <mesh name="LOWER_WRIST" file="meshes/LOWER_WRIST.STL"/>
+    <mesh name="UPPER_WRIST" file="meshes/UPPER_WRIST.STL"/>
+    <mesh name="GRIPPER_FRAME" file="meshes/GRIPPER_FRAME.STL"/>
+    <mesh name="RIGHT_FINGER_PROX" file="meshes/RIGHT_FINGER_PROX.STL"/>
+    <mesh name="RIGHT_FINGER_DIST" file="meshes/RIGHT_FINGER_DIST.STL"/>
+    <mesh name="LEFT_FINGER_PROX" file="meshes/LEFT_FINGER_PROX.STL"/>
+    <mesh name="LEFT_FINGER_DIST" file="meshes/LEFT_FINGER_DIST.STL"/>
+  </asset>
+  <worldbody>
+    <body name="BASE" pos="0 0 0.4">
+      <geom type="mesh" mesh="BASE"/>
+      <body name="SHOULDER" pos="0 0 0.12825">
+        <joint name="J0" axis="0 0 1" range="-2.76 2.76" damping="100.0"/>
+        <geom type="mesh" mesh="SHOULDER"/>
+        <body name="ARM" pos="0 -0.03 0.115" quat="0.707105 0.707108 0 0">
+          <joint name="J1" axis="0 0 1" range="-2.76 2.76" damping="100.0"/>
+          <geom type="mesh" mesh="ARM"/>
+          <body name="FOREARM" pos="0 0.28 0" quat="-3.67321e-06 -1 0 0">
+            <joint name="J2" axis="0 0 1" range="-2.76 2.76" damping="100.0"/>
+            <geom type="mesh" mesh="FOREARM"/>
+            <body name="LOWER_WRIST" pos="0 -0.14 0.02" quat="0.707105 0.707108 0 0">
+              <joint name="J3" axis="0 0 1" range="-2.67 2.67" damping="100.0"/>
+              <geom type="mesh" mesh="LOWER_WRIST"/>
+              <body name="UPPER_WRIST" pos="0.0285 0 0.105" quat="0.707105 0 0.707108 0">
+                <joint name="J4" axis="0 0 1" range="-2.67 2.67" damping="100.0"/>
+                <geom type="mesh" mesh="UPPER_WRIST"/>
+                <body name="END_EFFECTOR" pos="-0.105 0 0.0285" quat="0.707105 0 -0.707108 0">
+                  <joint name="J5" axis="0 0 1" range="-2.67 2.67" damping="100.0"/>
+                  <geom type="mesh" mesh="GRIPPER_FRAME"/>
+                  <site name="tcp" pos="0 0 0.13" size="0.005" rgba="0 1 0 1"/>
+                  <body name="RIGHT_FINGER_PROX" pos="0 -0.030501 0.070003" quat="0.707105 0 0.707108 0">
+                    <joint name="RIGHT_BOTTOM" axis="0 0 1" range="-0.09 0.96" damping="20.0" armature="0.02"/>
+                    <!-- 视觉模型 -->
+                    <geom type="mesh" mesh="RIGHT_FINGER_PROX" contype="1" conaffinity="1" condim="4" friction="1.2 0.005 0.0005" solref="0.02 1" solimp="0.9 0.95 0.001" group="1"/>
+                    <!-- 碰撞接触点 - 参考aloha设计使用小球体 -->
+                    <geom type="sphere" size="0.008" pos="-0.015 0 0"
+                          contype="1" conaffinity="1" condim="4" group="0"
+                          friction="1.6 0.005 0.0005"
+                          solref="0.02 1"
+                          solimp="0.9 0.95 0.001"/>
+                    <geom type="sphere" size="0.008" pos="-0.035 0 0"
+                          contype="1" conaffinity="1" condim="4" group="0"
+                          friction="1.6 0.005 0.0005"
+                          solref="0.02 1"
+                          solimp="0.9 0.95 0.001"/>
+                    <body name="RIGHT_FINGER_DIST" pos="-0.045636 0.020423 0">
+                      <joint name="RIGHT_TIP" axis="0 0 1" range="-1.03 0.21" damping="20.0" armature="0.02"/>
+                      <!-- 视觉模型 -->
+                      <geom type="mesh" mesh="RIGHT_FINGER_DIST" contype="1" conaffinity="1" condim="4" friction="1.2 0.005 0.0005" solref="0.02 1" solimp="0.9 0.95 0.001" group="1"/>
+                      <!-- 远端手指接触点 -->
+                      <geom type="sphere" size="0.008" pos="-0.015 0 0"
+                            contype="1" conaffinity="1" condim="4" group="0"
+                            friction="1.6 0.005 0.0005"
+                            solref="0.02 1"
+                            solimp="0.9 0.95 0.001"/>
+                      <geom type="sphere" size="0.006" pos="-0.035 0.005 0"
+                            contype="1" conaffinity="1" condim="4" group="0"
+                            friction="1.6 0.005 0.0005"
+                            solref="0.02 1"
+                            solimp="0.9 0.95 0.001"/>
+                      <site name="right_fingertip"
+                            pos="-0.03 0.005 -0.001"
+                            type="box"
+                            size="0.008 0.002 0.008"
+                            rgba="1 0 0 0.5"
+                            euler="0 0 0"/>
+                    </body>
+                  </body>
+                  <body name="LEFT_FINGER_PROX" pos="0 0.0305 0.070003" quat="0.707105 0 0.707108 0">
+                    <joint name="LEFT_BOTTOM" axis="0 0 1" range="-0.96 0.09" damping="20.0" armature="0.02"/>
+                    <!-- 视觉模型 -->
+                    <geom type="mesh" mesh="LEFT_FINGER_PROX" contype="1" conaffinity="1" condim="4" friction="1.2 0.005 0.0005" solref="0.02 1" solimp="0.9 0.95 0.001" group="1"/>
+                    <!-- 碰撞接触点 -->
+                    <geom type="sphere" size="0.008" pos="-0.015 0 0"
+                          contype="1" conaffinity="1" condim="4" group="0"
+                          friction="1.6 0.005 0.0005"
+                          solref="0.02 1"
+                          solimp="0.9 0.95 0.001"/>
+                    <geom type="sphere" size="0.008" pos="-0.035 0 0"
+                          contype="1" conaffinity="1" condim="4" group="0"
+                          friction="1.6 0.005 0.0005"
+                          solref="0.02 1"
+                          solimp="0.9 0.95 0.001"/>
+                    <body name="LEFT_FINGER_DIST" pos="-0.045636 -0.020423 0">
+                      <joint name="LEFT_TIP" axis="0 0 -1" range="-0.21 1.03" damping="20.0" armature="0.02"/>
+                      <!-- 视觉模型 -->
+                      <geom type="mesh" mesh="LEFT_FINGER_DIST" contype="1" conaffinity="1" condim="4" friction="1.2 0.005 0.0005" solref="0.02 1" solimp="0.9 0.95 0.001" group="1"/>
+                      <!-- 远端手指接触点 -->
+                      <geom type="sphere" size="0.008" pos="-0.015 0 0"
+                            contype="1" conaffinity="1" condim="4" group="0"
+                            friction="1.6 0.005 0.0005"
+                            solref="0.02 1"
+                            solimp="0.9 0.95 0.001"/>
+                      <geom type="sphere" size="0.006" pos="-0.035 -0.005 0"
+                            contype="1" conaffinity="1" condim="4" group="0"
+                            friction="1.6 0.005 0.0005"
+                            solref="0.02 1"
+                            solimp="0.9 0.95 0.001"/>
+                      <site name="left_fingertip"
+                            pos="-0.03 -0.005 0"
+                            type="box"
+                            size="0.008 0.002 0.008"
+                            rgba="0 0 1 0.5"
+                            euler="0 0 0"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <contact>
+    <exclude body1="RIGHT_FINGER_PROX" body2="RIGHT_FINGER_DIST"/>
+    <exclude body1="LEFT_FINGER_PROX" body2="LEFT_FINGER_DIST"/>
+    <exclude body1="RIGHT_FINGER_DIST" body2="END_EFFECTOR"/>
+    <exclude body1="LEFT_FINGER_DIST" body2="END_EFFECTOR"/>
+    <exclude body1="RIGHT_FINGER_PROX" body2="END_EFFECTOR"/>
+    <exclude body1="LEFT_FINGER_PROX" body2="END_EFFECTOR"/>
+  </contact>
+  <sensor>
+    <touch name="right_fingertip_force" site="right_fingertip"/>
+    <touch name="left_fingertip_force" site="left_fingertip"/>
+  </sensor>
+  <actuator>
+    <position name="actuator_J0" joint="J0" kp="5000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J1" joint="J1" kp="5000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J2" joint="J2" kp="5000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J3" joint="J3" kp="5000" ctrlrange="-2.6 2.6"/>
+    <position name="actuator_J4" joint="J4" kp="5000" ctrlrange="-2.6 2.6"/>
+    <position name="actuator_J5" joint="J5" kp="5000" ctrlrange="-2.6 2.6"/>
+    <!-- 夹爪执行器：高 kp 确保足够夹持力 -->
+    <position name="actuator_RIGHT_BOTTOM" joint="RIGHT_BOTTOM" kp="1800" forcerange="-60 60" ctrlrange="0 0.8"/>
+    <position name="actuator_RIGHT_TIP" joint="RIGHT_TIP" kp="1500" forcerange="-40 40" ctrlrange="-0.3 0.3"/>
+    <position name="actuator_LEFT_BOTTOM" joint="LEFT_BOTTOM" kp="1800" forcerange="-60 60" ctrlrange="-0.8 0"/>
+    <position name="actuator_LEFT_TIP" joint="LEFT_TIP" kp="1500" forcerange="-40 40" ctrlrange="-0.3 0.3"/>
+  </actuator>
+</mujoco>

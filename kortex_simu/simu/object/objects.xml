@@ -1,0 +1,90 @@
+<!-- 可抓取物体定义文件 -->
+<!-- 使用方法: 在主场景 XML 中添加 <include file="../object/objects.xml"/> -->
+
+<mujoco>
+  <!-- ========== 球体 ========== -->
+  <body name="ball_green" pos="0.4 0.0 0.033">
+    <freejoint/>
+    <geom name="ball_green_geom" type="sphere" size="0.033" mass="0.058"
+          rgba="0.2 0.8 0.2 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <body name="ball_red" pos="0.35 0.1 0.033">
+    <freejoint/>
+    <geom name="ball_red_geom" type="sphere" size="0.033" mass="0.058"
+          rgba="0.8 0.2 0.2 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <body name="ball_blue" pos="0.35 -0.1 0.033">
+    <freejoint/>
+    <geom name="ball_blue_geom" type="sphere" size="0.033" mass="0.058"
+          rgba="0.2 0.2 0.8 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 小球体 (更易抓取) ========== -->
+  <body name="ball_small" pos="0.5 0.0 0.025">
+    <freejoint/>
+    <geom name="ball_small_geom" type="sphere" size="0.025" mass="0.03"
+          rgba="0.8 0.8 0.2 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 立方体 ========== -->
+  <body name="cube_red" pos="0.45 0.15 0.02">
+    <freejoint/>
+    <geom name="cube_red_geom" type="box" size="0.02 0.02 0.02" mass="0.05"
+          rgba="0.9 0.1 0.1 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <body name="cube_blue" pos="0.45 -0.15 0.02">
+    <freejoint/>
+    <geom name="cube_blue_geom" type="box" size="0.02 0.02 0.02" mass="0.05"
+          rgba="0.1 0.1 0.9 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <body name="cube_green" pos="0.5 0.0 0.02">
+    <freejoint/>
+    <geom name="cube_green_geom" type="box" size="0.02 0.02 0.02" mass="0.05"
+          rgba="0.1 0.9 0.1 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 小立方体 (更易抓取) ========== -->
+  <body name="cube_small" pos="0.55 0.1 0.015">
+    <freejoint/>
+    <geom name="cube_small_geom" type="box" size="0.015 0.015 0.015" mass="0.02"
+          rgba="0.9 0.9 0.1 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 圆柱体 ========== -->
+  <body name="cylinder_red" pos="0.35 0.2 0.03">
+    <freejoint/>
+    <geom name="cylinder_red_geom" type="cylinder" size="0.02 0.03" mass="0.08"
+          rgba="0.9 0.2 0.2 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <body name="cylinder_blue" pos="0.35 -0.2 0.03">
+    <freejoint/>
+    <geom name="cylinder_blue_geom" type="cylinder" size="0.02 0.03" mass="0.08"
+          rgba="0.2 0.2 0.9 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 小圆柱体 (更易抓取) ========== -->
+  <body name="cylinder_small" pos="0.55 -0.1 0.02">
+    <freejoint/>
+    <geom name="cylinder_small_geom" type="cylinder" size="0.015 0.02" mass="0.03"
+          rgba="0.2 0.9 0.9 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 长方体 ========== -->
+  <body name="box_long" pos="0.5 0.2 0.015">
+    <freejoint/>
+    <geom name="box_long_geom" type="box" size="0.04 0.015 0.015" mass="0.04"
+          rgba="0.6 0.4 0.2 1" friction="1 0.01 0.001"/>
+  </body>
+
+  <!-- ========== 椭球体 ========== -->
+  <body name="ellipsoid" pos="0.5 -0.2 0.025">
+    <freejoint/>
+    <geom name="ellipsoid_geom" type="ellipsoid" size="0.03 0.02 0.02" mass="0.05"
+          rgba="0.8 0.4 0.8 1" friction="1 0.01 0.001"/>
+  </body>
+</mujoco>

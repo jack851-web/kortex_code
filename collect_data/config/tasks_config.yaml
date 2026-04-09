@@ -1,0 +1,157 @@
+robot:
+  ip: "192.168.1.10"
+  control_mode: "joint"
+  gripper_enabled: true
+
+cameras:
+  real:
+    top:
+      type: "opencv"
+      index: 0
+      width: 640
+      height: 480
+      fps: 30
+  simu:
+    agentview:
+      width: 640
+      height: 480
+    side:
+      width: 640
+      height: 480
+    robot0_eye_in_hand:
+      width: 640
+      height: 480
+    
+
+simulation:
+  # 基础场景（仅机械臂/地面/相机，不含任务物体）
+  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  scene_base_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  target_name: "place_target"
+  # 坐标变换参数：绕Z轴旋转角度（度）
+  # 用于将用户坐标系转换到MuJoCo坐标系
+  coord_rotation_z: 0
+
+  # 仿真初始关节（J0~J5）
+  # 支持单位: rad / deg
+  initial_joints_unit: rad
+  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
+
+  # 任务物体库：每个任务可按 object_name 动态切换模型
+
+  object_library:
+    cup:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/cup/model_new.xml"
+      body_name: "body_obj_cup"
+    mug:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/mug_5/model_new.xml"
+      body_name: "body_obj_mug_5"
+    plate:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate/model_new.xml"
+      body_name: "body_obj_plate"
+    plate_11:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+      body_name: "body_obj_plate_11"
+
+  # 放置目标（碟子）配置
+  plate_target:
+    model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+    body_name: "body_obj_plate_11"
+
+
+
+grasp:
+  pre_grasp_offset:
+    default: [0, 0, 0.5]
+    cup: [0, 0, 0.1]
+    bottle: [0, 0, 0.25]
+    bowl: [0, 0, 0.28]
+
+  lift_height: 0.1
+  
+  # 放置时的抬升高度
+  micro_lift_height: 0.02  # 松开前微抬（米），避免夹爪撤力弹开物体
+  release_lift_height: 0.08  # 松开后抬升（米），避免碰到物体
+
+  default_orientation:
+    default: [180, 0, 0]
+    cup: [180, 0, 0]
+    bottle: [180, 0, 0]
+    bowl: [180, 0, 0]
+
+  grasp_offsets:
+    default: [0.0, 0.0, 0.0]
+    cup: [0.03816283815695817, 0.0026173041716465173, 0.09023269408092091]
+    bottle: [0.04, 0.0, 0.0]
+    bowl: [0.05, 0.0, 0.0]
+
+  gripper_positions:
+    default: {open: 0.0, close: 0.65}
+    cup: {open: 0.707882988755566, close: 0.907882988755566}
+    bottle: {open: 0.0, close: 0.80}
+    bowl: {open: 0.0, close: 0.72}
+
+
+  # 专用物体适配配置（若存在，会覆盖上面的分散配置）
+  object_profiles:
+    default:
+      orientation: [180, 0, 0]
+      pre_grasp_offset: [0, 0, 0.5]
+      grasp_offset: [0.0, 0.0, 0.0]
+      gripper: {open: 0.0, close: 0.65}
+    cup:
+      orientation: [176.0210956262833, 5.814018915415558, -83.23193841293518]
+      pre_grasp_offset: [0, 0, 0.1]
+      grasp_offset: [0.04739725297172223, 0.012058507768091253, 0]
+      gripper: {open: 0.799994706451461, close: 0.799994706451461}
+
+
+
+dataset:
+  repo_name: "kortex_grasp_data"
+  # 实机模式数据路径
+  real_data_root: "D:/VLA/data/Real/realdata"
+  simu_data_root: "D:/VLA/data/Real/simudata"
+  # Mock模式数据路径
+  mock_simu_data_root: "D:/VLA/data/Simu/simu_data"
+  fps: 20
+
+tasks:
+  # 物体位置说明：
+  # - 机械臂基座在 (0, 0, 0.02)，可达半径约 0.55m
+  # - 桌面中心 x=0.35, y=0, z=0.42（桌面顶面）
+  # - 物体 X 坐标应在 0.25~0.50 范围（机械臂前方）
+  # - 物体 Y 坐标应在 -0.25~0.25 范围（左右）
+  # - 物体 Z 坐标 = 桌面顶面 + 物体底部偏移 ≈ 0.44
+  task1:
+    object_name: "mug"
+    object_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
+    description: "grasp mug and place to right side"
+  task2:
+    object_name: "mug"
+    object_position: [0.35, -0.15, 0.44]
+    plate_position: [0.35, 0.15, 0.44]
+    description: "grasp mug and place to left side"
+  task3:
+    object_name: "mug"
+    object_position: [0.45, 0.0, 0.44]
+    plate_position: [0.25, 0.0, 0.44]
+    description: "grasp mug and place closer"
+  task4:
+    object_name: "mug"
+    object_position: [0.30, 0.20, 0.44]
+    plate_position: [0.40, -0.20, 0.44]
+    description: "grasp mug and place diagonally"
+  task5:
+    object_name: "mug"
+    object_position: [0.40, 0.10, 0.44]
+    plate_position: [0.30, -0.10, 0.44]
+    description: "grasp mug and place to right front"
+  task6:
+    object_name: "mug"
+    object_position: [0.35,0.0, 0.44]
+    plate_position: [0.45, 0.15, 0.44]
+    description: "grasp mug from center and place to front right"
+    
+
