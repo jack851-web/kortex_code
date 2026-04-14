@@ -24,8 +24,8 @@ class MockTaskTunerWindow(QWidget):
         self._data_system = data_system
 
         self._keys_pressed = set()
-        self._teleop_step_size = 0.008
-        self._rot_step_size = 5.0
+        self._teleop_step_size = 0.04  # 增大移动步长，提高键盘控制灵敏度
+        self._rot_step_size = 12.0  # 增大旋转步长（度）
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_state)

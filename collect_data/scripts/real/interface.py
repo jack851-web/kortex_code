@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import threading
 import time
-from .simple_camera import CameraManager
+from .camera import CameraManager
 
 
 class RobotNotConnectedError(Exception):
@@ -206,8 +206,20 @@ class RealInterface:
         self._check_connection()
         if self._camera_manager is not None:
             all_images = self._camera_manager.get_images()
-            return {name: all_images.get(name, np.zeros((480, 640, 3), dtype=np.uint8)) 
-                    for name in self._camera_names}
+            result = {}
+            for name in self._camera_names:
+                if name in all_images:
+                    img = all_images[name]
+                    # 检测全黑帧
+                    if img.max() == 0:
+                        print(f"[WARNING] Camera '{name}' returned all-black frame! "
+                              f"Camera may not be working properly.")
+                    result[name] = img
+                else:
+                    print(f"[WARNING] Camera '{name}' not found in camera manager results! "
+                          f"Returning black placeholder. Available cameras: {list(all_images.keys())}")
+                    result[name] = np.zeros((480, 640, 3), dtype=np.uint8)
+            return result
         return {name: np.zeros((480, 640, 3), dtype=np.uint8) for name in self._camera_names}
 
     def disconnect(self):

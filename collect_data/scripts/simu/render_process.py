@@ -34,6 +34,7 @@ def render_worker(
         joint_queue: 接收关节位置的队列
         object_queue: 接收物块位置的队列
         gripper_queue: 接收夹爪位置的队列
+        object_body_name: 物体 body 名称
     """
     # 在子进程中初始化 MuJoCo
     model = mujoco.MjModel.from_xml_path(xml_path)

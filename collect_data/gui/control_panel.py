@@ -24,6 +24,9 @@ class ControlPanel(QWidget):
     
     def __init__(self):
         super().__init__()
+        self._is_running = False
+        self._all_task_btns = []  # 所有任务操作按钮的列表
+        self._btn_original_states = {}  # set_busy 时保存的按钮启用状态
         self._init_ui()
     
     def _init_ui(self):
@@ -34,13 +37,13 @@ class ControlPanel(QWidget):
         task_group = QGroupBox("任务控制")
         task_layout = QVBoxLayout(task_group)
         
-        # 开始/停止Episode按钮
+        # 开始/停止数据收集按钮
         btn_layout = QHBoxLayout()
-        self._start_btn = QPushButton("开启 Episode")
+        self._start_btn = QPushButton("开始收集")
         self._start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self._start_btn.clicked.connect(self.start_clicked.emit)
 
-        self._stop_btn = QPushButton("关闭 Episode")
+        self._stop_btn = QPushButton("停止收集")
         self._stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
         self._stop_btn.clicked.connect(self.stop_clicked.emit)
         self._stop_btn.setEnabled(False)
@@ -83,11 +86,19 @@ class ControlPanel(QWidget):
         pause_layout.addWidget(self._pause_btn)
         pause_layout.addWidget(self._skip_btn)
         task_layout.addLayout(pause_layout)
+
+        # 收集所有任务操作按钮
+        self._all_task_btns = [
+            self._start_btn, self._stop_btn,
+            self._next_task_btn, self._retry_btn,
+            self._complete_task_btn,
+            self._pause_btn, self._skip_btn,
+        ]
         
         layout.addWidget(task_group)
         
-        # Episode 设置组
-        episode_group = QGroupBox("Episode 设置")
+        # 任务设置组
+        episode_group = QGroupBox("任务设置")
         episode_layout = QVBoxLayout(episode_group)
         
         # 开始任务索引
@@ -117,6 +128,7 @@ class ControlPanel(QWidget):
     
     def set_running(self, running: bool):
         """设置运行状态"""
+        self._is_running = running
         self._start_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
         self._pause_btn.setEnabled(running)
@@ -135,3 +147,34 @@ class ControlPanel(QWidget):
     
     def set_current_task_index(self, index: int):
         self._task_index_spin.setValue(index)
+
+    def set_busy(self, label: str = "处理中..."):
+        """禁用所有按钮并显示处理状态（点击后立即调用，防止重复操作）"""
+        # 保存当前每个按钮的启用状态
+        self._btn_original_states = {id(btn): btn.isEnabled() for btn in self._all_task_btns}
+        self._task_index_spin.setEnabled(False)
+
+        # 全部禁用
+        for btn in self._all_task_btns:
+            btn.setEnabled(False)
+
+        # 在对应按钮上显示状态文字
+        if self._complete_task_btn.isEnabled() == False and self._btn_original_states.get(id(self._complete_task_btn)):
+            self._complete_task_btn.setText(label)
+        if self._stop_btn.isEnabled() == False and self._btn_original_states.get(id(self._stop_btn)):
+            self._stop_btn.setText(label)
+
+    def set_idle(self):
+        """恢复按钮到 set_busy 之前的状态"""
+        for btn in self._all_task_btns:
+            btn.setEnabled(self._btn_original_states.get(id(btn), btn.isEnabled()))
+        self._task_index_spin.setEnabled(not self._is_running)
+
+        # 恢复按钮文字
+        self._complete_task_btn.setText("抓取任务完毕")
+        self._stop_btn.setText("停止收集")
+        self._start_btn.setText("开始收集")
+        self._next_task_btn.setText("执行下一个任务")
+        self._retry_btn.setText("重做当前任务")
+        self._skip_btn.setText("跳过当前")
+        self._btn_original_states = {}

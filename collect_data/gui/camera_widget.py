@@ -36,30 +36,37 @@ class CameraWidget(QWidget):
         self._image_label.setText("等待图像...")
         layout.addWidget(self._image_label)
     
-    def update_image(self, image: np.ndarray):
-        """更新图像显示"""
+    def update_image(self, image: np.ndarray, is_bgr: bool = False):
+        """更新图像显示
+        
+        Args:
+            image: numpy 图像数组
+            is_bgr: 是否为 BGR 格式（如 OpenCV 捕获的图像），默认 False 表示 RGB
+        """
         if image is None or image.size == 0:
             return
         
         try:
-            # 确保图像是 numpy 数组
-            image = np.array(image)
+            # 确保图像是 numpy 数组并拷贝，避免与调用方共享 buffer
+            image = np.array(image, copy=True)
             
-            # 确保图像是 RGB 格式
+            # 灰度图转 RGB
             if len(image.shape) == 2:
                 image = np.stack([image] * 3, axis=-1)
             elif image.shape[2] == 4:
                 image = image[:, :, :3]
             
-            # 转换 BGR 到 RGB（如果是 OpenCV 格式）
-            if image.shape[2] == 3:
+            # 仅在明确标记为 BGR 时才转换
+            if is_bgr and image.shape[2] == 3:
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
             h, w, ch = image.shape
             
-            # 转换为 QImage
+            # 必须使用 contiguous 数组 + copy，确保 QImage 持有独立内存
+            # 否则多个 CameraWidget 共享 numpy buffer 会导致串帧（不同视角图片混杂）
+            image = np.ascontiguousarray(image)
             bytes_per_line = ch * w
-            q_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            q_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
             
             # 缩放并显示
             pixmap = QPixmap.fromImage(q_image).scaled(
@@ -115,15 +122,29 @@ class CameraPanel(QWidget):
         self._camera_widgets[camera_name] = widget
         self._reflow()
     
-    def update_camera(self, camera_name: str, image: np.ndarray):
-        """更新指定相机的图像"""
+    def update_camera(self, camera_name: str, image: np.ndarray, is_bgr: bool = False):
+        """更新指定相机的图像
+        
+        Args:
+            camera_name: 相机名称
+            image: numpy 图像数组
+            is_bgr: 是否为 BGR 格式
+        """
         if camera_name in self._camera_widgets:
-            self._camera_widgets[camera_name].update_image(image)
+            self._camera_widgets[camera_name].update_image(image, is_bgr=is_bgr)
     
-    def update_all_cameras(self, images: dict):
-        """更新所有相机图像"""
+    def update_all_cameras(self, images: dict, is_bgr: bool = False):
+        """更新所有相机图像，自动添加缺失的相机
+        
+        Args:
+            images: {camera_name: image} 字典
+            is_bgr: 是否为 BGR 格式
+        """
         for name, image in images.items():
-            self.update_camera(name, image)
+            # 如果相机不存在，自动添加
+            if name not in self._camera_widgets:
+                self.add_camera(name, 320, 240)
+            self.update_camera(name, image, is_bgr=is_bgr)
     
     def clear_all(self):
         """清除所有相机"""

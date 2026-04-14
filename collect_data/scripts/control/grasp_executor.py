@@ -8,6 +8,7 @@ class GraspExecutor:
     # 物体类型定义
     OBJECT_TYPE_CUBE = "cube"           # 方块 - 中心抓取
     OBJECT_TYPE_CUP = "cup"             # 茶杯 - 侧壁抓取
+    OBJECT_TYPE_MUG = "mug"             # 马克杯 - 侧壁抓取（与 cup 类似）
     OBJECT_TYPE_BOTTLE = "bottle"       # 瓶子 - 侧面抓取
     OBJECT_TYPE_BOWL = "bowl"           # 碗 - 边缘抓取
     
@@ -30,6 +31,13 @@ class GraspExecutor:
             "gripper_open": 0.0,     # 完全张开
             "gripper_close": 0.58,   # 保守闭合，先稳定接触避免挤压弹飞
             "description": "向x方向偏移抓取杯壁"
+        },
+        OBJECT_TYPE_MUG: {
+            "offset": [0.04, 0.0, 0.0],
+            "height_adjust": 0.0,    # 马克杯与茶杯类似
+            "gripper_open": 0.0,     # 完全张开
+            "gripper_close": 0.58,   # 保守闭合
+            "description": "向x方向偏移抓取杯壁（与cup类似）"
         },
         OBJECT_TYPE_BOTTLE: {
             "offset": [0.04, 0.0, 0.0],
@@ -379,6 +387,12 @@ class GraspExecutor:
             hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
         )
 
+        # 仿真模式下 IK 必须可用，否则无法移动
+        if self._use_simulation and not (hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()):
+            print("[GraspExecutor] ERROR: Simulation mode requires IK but IK is not available!")
+            print(f"  _use_simulation={self._use_simulation}, is_ik_available={self._simu.is_ik_available() if hasattr(self._simu, 'is_ik_available') else 'N/A'}")
+            return False
+
         if use_simu_ik:
             target_pos = np.asarray(pose[:3], dtype=float)
             target_ori = None
@@ -618,7 +632,6 @@ class GraspExecutor:
             print(f"[GraspExecutor] Gripper config: open={gripper_open}, close={gripper_close}")
             print(f"[GraspExecutor] End-effector orientation: {orientation.tolist()}")
             print(f"[GraspExecutor] Pre-grasp offset: {pre_grasp_offset.tolist()}")
-
 
         else:
             print(f"[GraspExecutor] Warning: Unknown object type '{object_type}', using default 'cube'")
@@ -863,6 +876,10 @@ class GraspExecutor:
 
     def set_sim_object_body_name(self, object_body_name: str):
         self._sim_object_body_name = object_body_name or "cube"
+
+    def set_simu_interface(self, simu_interface):
+        """更新仿真接口引用（任务切换后 SimuInterface 被重建时调用）"""
+        self._simu = simu_interface
 
 
 

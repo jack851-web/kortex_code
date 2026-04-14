@@ -9,6 +9,7 @@ import mujoco
 import mujoco.viewer
 import glfw
 import time
+import gc
 import threading
 import xml.etree.ElementTree as ET
 from typing import Optional, List, Dict, Any, Tuple, Callable
@@ -82,6 +83,10 @@ class SimuInterface:
         self._process_render_lock = threading.Lock()
         self._renderer_thread_id = None
         self._renderer_thread_name = None
+        # 数据采集状态标志：采集期间暂停 GLFW viewer 渲染，避免 OpenGL context 竞争
+        self._collecting_active = False
+        # 每线程渲染器缓存（避免线程切换时反复创建/销毁导致 OpenGL OOM）
+        self._thread_renderers: Dict[int, mujoco.Renderer] = {}
 
         # 物块物理控制标志
 
@@ -342,37 +347,71 @@ class SimuInterface:
             print("[SimuInterface] Error: No XML path provided")
             return False
 
+        init_thread_name = threading.current_thread().name
+        print(f"[SimuInterface] === initialize() starting on thread [{init_thread_name}] ===", flush=True)
+
         try:
-            # 先清理 GLFW 查看器（必须在替换 model/data 之前）
-            glfw_was_running = self._glfw_viewer_running
-            if glfw_was_running:
-                self.close_glfw_viewer()
-            # 额外确保清理所有 GLFW 渲染上下文引用
-            self._glfw_ctx = None
-            self._glfw_scn = None
-            self._glfw_cam = None
-            self._glfw_opt = None
-            self._glfw_pert = None
-            self._glfw_viewport = None
+            # ============================================================
+            # 阶段0：关闭 GLFW 查看器（必须在替换 model/data 之前）
+            # ============================================================
+            print(f"[SimuInterface] >>> PHASE-0: closing GLFW viewer...", flush=True)
+            self.close_glfw_viewer()
+            print(f"[SimuInterface] >>> PHASE-0: GLFW viewer closed", flush=True)
 
-            if self._renderer is not None:
-                self._renderer.close()
-                self._renderer = None
-            self._renderer_thread_id = None
-            self._renderer_thread_name = None
+            # 清理旧的 IK 求解器和模拟控制器（必须在加载新模型前，因为它们持有旧 MjData 引用）
+            self._ik_solver = None
+            self._sim_controller = None
 
-            if self._viewer is not None:
-                try:
-                    self._viewer.close()
-                except Exception:
-                    pass
-                self._viewer = None
+            # ============================================================
+            # 阶段1：安全释放旧的模型/渲染资源（全部在锁内完成）
+            # ============================================================
+            print(f"[SimuInterface] >>> PHASE-1: acquiring lock for resource cleanup...", flush=True)
+            with self._lock:
+                print(f"[SimuInterface] >>> PHASE-1: lock acquired", flush=True)
+                
+                # 显式释放旧的 MuJoCo 模型和数据
+                old_model = self._model
+                old_data = self._data
+                self._model = None
+                self._data = None
+                del old_model
+                del old_data
 
-            print(f"[SimuInterface] Loading model from: {self._xml_path}")
+                # 清理全局 renderer（不跨线程销毁 GLFW 窗口，只释放 MjrContext）
+                if self._renderer is not None:
+                    self._safe_close_renderer(self._renderer, destroy_window=False)
+                    self._renderer = None
+                self._renderer_thread_id = None
+                self._renderer_thread_name = None
 
+                # 清理缓存的线程渲染器
+                for tid, renderer in list(self._thread_renderers.items()):
+                    self._safe_close_renderer(renderer, destroy_window=False)
+                self._thread_renderers.clear()
 
+                # 【关键修复】不调用 _viewer.close()！
+                # launch_passive() 在创建线程上创建内部 GLFW 窗口，
+                # 跨线程调用 .close() 会触发跨线程 glfw 操作 → Windows C 层 segfault。
+                # 只清空引用，让 Python GC 安全回收（GLFW 窗口会随进程退出自动关闭）。
+                if self._viewer is not None:
+                    print(f"[SimuInterface] WARNING: Dropping old passive viewer reference "
+                          f"(was created on another thread, cannot safely close here)", flush=True)
+                    self._viewer = None
+
+            print(f"[SimuInterface] >>> PHASE-1: resource cleanup done, lock released", flush=True)
+
+            # 短暂等待 + 强制 GC，确保 OpenGL 和 MuJoCo 旧资源完全释放
+            import time as _time
+            _time.sleep(0.15)
+            gc.collect()
+
+            # ============================================================
+            # 阶段2：加载新模型
+            # ============================================================
+            print(f"[SimuInterface] >>> PHASE-2: loading model from {self._xml_path}", flush=True)
             self._model = mujoco.MjModel.from_xml_path(self._xml_path)
             self._data = mujoco.MjData(self._model)
+            print(f"[SimuInterface] >>> PHASE-2: model loaded OK", flush=True)
             
             # 获取关节索引
             self._joint_indices = []
@@ -381,7 +420,6 @@ class SimuInterface:
                 if idx >= 0:
                     self._joint_indices.append(idx)
                     qpos_idx = self._model.jnt_qposadr[idx]
-                    # 读取当前值
                     current_val = self._data.qpos[qpos_idx]
                     print(f"[SimuInterface] Joint {name}: id={idx}, qpos_idx={qpos_idx}, current_val={current_val:.4f} ({np.rad2deg(current_val):.2f} deg)")
             print(f"[SimuInterface] Joint indices: {self._joint_indices}")
@@ -438,26 +476,43 @@ class SimuInterface:
                 name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_CAMERA, i)
                 if name:
                     camera_names.append(name)
-            print(f"[SimuInterface] Found cameras: {camera_names}")
+            print(f"[SimuInterface] Found cameras: {camera_names}", flush=True)
             
-            # 初始化仿真
+            # ============================================================
+            # 阶段3：mj_forward + IK 初始化
+            # ============================================================
+            print("[SimuInterface] >>> PHASE-3: mj_forward start", flush=True)
             mujoco.mj_forward(self._model, self._data)
+            print("[SimuInterface] >>> PHASE-3: mj_forward done", flush=True)
             
-            # 初始化 IK 求解器（纯仿真模式）
+            print(f"[SimuInterface] >>> PHASE-3: IK init, _use_ik={self._use_ik}, IK_AVAILABLE={IK_AVAILABLE}", flush=True)
             if self._use_ik and IK_AVAILABLE:
                 try:
+                    print("[SimuInterface] >>> PHASE-3: Creating MuJoCoIK...", flush=True)
                     self._ik_solver = MuJoCoIK(self._model, self._data, self._tcp_site_name)
-                    print(f"[SimuInterface] IK solver initialized")
-                    print(f"[SimuInterface] IK joints: {self._ik_solver.joint_names}")
+                    print(f"[SimuInterface] IK solver initialized", flush=True)
+                    print(f"[SimuInterface] IK joints: {self._ik_solver.joint_names}", flush=True)
                 except Exception as e:
-                    print(f"[SimuInterface] Failed to initialize IK: {e}")
+                    print(f"[SimuInterface] Failed to initialize IK: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
                     self._use_ik = False
+            else:
+                print("[SimuInterface] >>> PHASE-3: SKIPPED (IK disabled)", flush=True)
+            print("[SimuInterface] >>> PHASE-3: IK init done", flush=True)
             
-            # 启动 MuJoCo 查看器
+            # ============================================================
+            # 阶段4：启动查看器（仅在明确请求时）
+            # ============================================================
+            print(f"[SimuInterface] >>> PHASE-4: start_viewer, show_viewer={show_viewer}", flush=True)
             if show_viewer:
+                print("[SimuInterface] >>> PHASE-4: Calling start_viewer()...", flush=True)
                 self.start_viewer()
+                print("[SimuInterface] >>> PHASE-4: start_viewer() returned", flush=True)
+            else:
+                print("[SimuInterface] >>> PHASE-4: SKIPPED (show_viewer=False)", flush=True)
             
-            print(f"[SimuInterface] Model initialized successfully")
+            print(f"[SimuInterface] Model initialized successfully", flush=True)
             print(f"[SimuInterface] Bodies: {self._model.nbody}, Joints: {self._model.njnt}")
             print(f"[SimuInterface] IK mode: {self._use_ik}")
 
@@ -472,7 +527,9 @@ class SimuInterface:
 
             
         except Exception as e:
-            print(f"[SimuInterface] Error initializing model: {e}")
+            print(f"[SimuInterface] Error initializing model: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             return False
     
     def start_viewer(self):
@@ -494,7 +551,7 @@ class SimuInterface:
                           title: str = "MuJoCo Simulation") -> bool:
         """启动基于 GLFW 的独立 MuJoCo 查看器窗口 (用于 Mock 模式)
         
-        这个查看器在独立窗口中运行，使用 QTimer 进行渲染
+        使用独立线程运行 GLFW 渲染循环，避免与 Qt 主线程冲突
         """
         print(f"[SimuInterface] start_glfw_viewer called: width={width}, height={height}, title={title}")
         print(f"[SimuInterface] _model={self._model is not None}, _data={self._data is not None}, _glfw_viewer_running={self._glfw_viewer_running}")
@@ -507,37 +564,70 @@ class SimuInterface:
             print("[SimuInterface] GLFW viewer already running, skipping")
             return True
         
+        # 保存参数供线程使用
+        self._glfw_width = width
+        self._glfw_height = height
+        self._glfw_title = title
+        self._glfw_stop_event = threading.Event()
+        
+        # 启动独立的 GLFW 渲染线程
+        self._glfw_thread = threading.Thread(
+            target=self._glfw_viewer_loop,
+            daemon=True,
+            name="GLFW-Viewer-Thread"
+        )
+        self._glfw_thread.start()
+        
+        # 等待窗口创建完成（最多等待 5 秒）
+        import time
+        timeout = 5.0
+        start_wait = time.time()
+        while not self._glfw_viewer_running and (time.time() - start_wait) < timeout:
+            time.sleep(0.05)
+        
+        if self._glfw_viewer_running:
+            print(f"[SimuInterface] GLFW viewer started in separate thread: {width}x{height}")
+            return True
+        else:
+            print("[SimuInterface] GLFW viewer failed to start within timeout")
+            return False
+    
+    def _glfw_viewer_loop(self):
+        """GLFW 查看器的主循环（在独立线程中运行）"""
         try:
-            print("[SimuInterface] Starting GLFW viewer initialization...")
+            print("[SimuInterface] [_glfw_viewer_loop] Starting...")
             
-            if self._glfw_window is not None:
-                print("[SimuInterface] Closing existing GLFW window...")
-                self.close_glfw_viewer()
-            
+            # 初始化 GLFW（必须在创建窗口的线程中）
+            # 注意：disconnect() 可能调用了 glfw.terminate()，需要重新 init
             if not SimuInterface._glfw_initialized:
-                print("[SimuInterface] Initializing GLFW...")
                 if not glfw.init():
                     print("[SimuInterface] Failed to initialize GLFW")
-                    return False
+                    return
                 SimuInterface._glfw_initialized = True
+                print("[SimuInterface] GLFW initialized")
             
-            self._glfw_window = glfw.create_window(width, height, title, None, None)
+            # 设置窗口提示（在创建窗口前）
+            glfw.window_hint(glfw.VISIBLE, glfw.TRUE)  # 确保窗口可见
+            glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
+            
+            # 创建窗口
+            self._glfw_window = glfw.create_window(
+                self._glfw_width, self._glfw_height, self._glfw_title, None, None
+            )
             
             if not self._glfw_window:
                 print("[SimuInterface] Failed to create GLFW window")
-                return False
+                return
             
-            print("[SimuInterface] GLFW window created successfully")
+            print("[SimuInterface] GLFW window created")
             glfw.make_context_current(self._glfw_window)
             glfw.swap_interval(1)
             
             framebuffer_width, framebuffer_height = glfw.get_framebuffer_size(self._glfw_window)
-            print(f"[SimuInterface] Framebuffer size: {framebuffer_width}x{framebuffer_height}")
+            print(f"[SimuInterface] Framebuffer: {framebuffer_width}x{framebuffer_height}")
             
-            print("[SimuInterface] Creating MuJoCo rendering context...")
+            # 创建 MuJoCo 渲染资源（必须在 GL 上下文所在的线程）
             self._glfw_ctx = mujoco.MjrContext(self._model, mujoco.mjtFontScale.mjFONTSCALE_150)
-            
-            print("[SimuInterface] Creating MuJoCo scene...")
             self._glfw_scn = mujoco.MjvScene(self._model, maxgeom=10000)
             self._glfw_pert = mujoco.MjvPerturb()
             self._glfw_cam = mujoco.MjvCamera()
@@ -556,51 +646,65 @@ class SimuInterface:
             
             self._glfw_viewer_running = True
             
-            # QTimer 必须在 Qt 主线程创建，否则 timeout 信号不会触发
-            from PyQt5.QtCore import QTimer, QThread
-            in_main_thread = (not QT_AVAILABLE or 
-                              QApplication.instance() is None or 
-                              QThread.currentThread() == QApplication.instance().thread())
-            if not in_main_thread:
-                # 从后台线程调用：通过信号回到主线程创建 QTimer
-                QTimer.singleShot(0, self._start_glfw_timer_qt)
-            else:
-                self._start_glfw_timer_qt()
+            # 显式显示窗口
+            glfw.show_window(self._glfw_window)
+            print("[SimuInterface] GLFW window shown")
             
-            print(f"[SimuInterface] GLFW viewer started: {width}x{height}")
-            return True
+            print("[SimuInterface] GLFW viewer running, entering render loop...")
+            
+            # 渲染循环
+            import time as _time
+            self._start_time = _time.time()
+            self._render_frame_count = 0
+            
+            while not self._glfw_stop_event.is_set() and self._glfw_window:
+                if glfw.window_should_close(self._glfw_window):
+                    break
+                
+                self._glfw_render_frame()
+                self._render_frame_count += 1
+                
+                # 每60帧打印一次状态
+                if self._render_frame_count % 60 == 0:
+                    print(f"[SimuInterface] Rendered {self._render_frame_count} frames")
+                
+                # 控制渲染频率 (~30 FPS，减少资源占用)
+                _time.sleep(0.033)
+            
+            print(f"[SimuInterface] Exiting GLFW render loop, total frames: {self._render_frame_count}")
             
         except Exception as e:
-            print(f"[SimuInterface] Failed to start GLFW viewer: {e}")
+            print(f"[SimuInterface] _glfw_viewer_loop error: {e}")
             import traceback
             traceback.print_exc()
-            return False
-    
-    def _start_glfw_timer_qt(self):
-        """在 Qt 主线程中创建并启动 GLFW 渲染定时器"""
-        from PyQt5.QtCore import QTimer
-        print("[SimuInterface] _start_glfw_timer_qt called")
-        
-        if hasattr(self, '_glfw_timer') and self._glfw_timer is not None:
-            print("[SimuInterface] Stopping existing timer...")
-            try:
-                self._glfw_timer.stop()
-            except Exception:
-                pass
-            try:
-                self._glfw_timer.deleteLater()
-            except Exception:
-                pass
-            self._glfw_timer = None
-        
-        print("[SimuInterface] Creating new QTimer...")
-        self._glfw_timer = QTimer()
-        self._glfw_timer.timeout.connect(self._glfw_render_frame)
-        self._glfw_timer.start(16)
-        print(f"[SimuInterface] QTimer started with interval=16ms, active={self._glfw_timer.isActive()}")
-    
+        finally:
+            self._glfw_viewer_running = False
+            # 显式释放 MuJoCo GPU 资源（内部已调用 gc.collect()）
+            self._free_glfw_mujoco_resources()
+            
+            if self._glfw_window:
+                try:
+                    glfw.destroy_window(self._glfw_window)
+                except Exception:
+                    pass
+                self._glfw_window = None
+            
+            print("[SimuInterface] GLFW viewer thread exited")
+
     def _glfw_render_frame(self):
-        """渲染一帧 (由 QTimer 调用) - 多视口布局"""
+        """渲染一帧（在线程渲染循环中调用）- 多视口布局
+        
+        使用非阻塞锁：如果锁被 IK/step 等操作持有，跳过本帧而非阻塞等待。
+        这避免了 move_to_cartesian（IK迭代）和 step(300) 长时间持锁导致窗口白屏无响应。
+        
+        注意：GLFW 查看器使用独立的 GL 上下文和 MjrContext（自己的窗口），
+        与数据采集线程的离屏 Renderer（另一个 GL 上下文/窗口）完全隔离，
+        不受 _collecting_active 标志影响。
+        """
+        # 注意：移除了 _collecting_active 检查，因为 GLFW 查看器与采集 Renderer
+        # 使用独立的 OpenGL 上下文，互不影响。之前因 start_recording() 在 
+        # start_glfw_viewer() 之前执行，导致 _collecting_active=True 使窗口永远不渲染。
+        
         if not self._glfw_viewer_running:
             return
         
@@ -609,123 +713,212 @@ class SimuInterface:
         
         try:
             if glfw.window_should_close(self._glfw_window):
-                self.close_glfw_viewer()
+                # 只设置停止标志，让线程循环退出（不调用 close_glfw_viewer 避免死锁）
+                if hasattr(self, '_glfw_stop_event'):
+                    self._glfw_stop_event.set()
                 return
             
             glfw.make_context_current(self._glfw_window)
             
-            with self._lock:
-                mujoco.mj_forward(self._model, self._data)
+            # 非阻塞锁：IK/step 持锁期间直接跳过帧，不阻塞等待
+            if not self._lock.acquire(blocking=False):
+                # 锁被占用，跳过此帧（只 poll 保持窗口响应，不 swap 旧画面避免闪烁）
+                glfw.poll_events()
+                return
+            
+            # === 诊断日志：前3帧打印每步状态 ===
+            tick = getattr(self, '_render_tick', 0)
+            do_diag = tick < 5
+
+            try:
+                # 检查模型和数据是否有效
+                if self._model is None or self._data is None:
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: model/data is None, SKIP")
+                    return
+
+                try:
+                    mujoco.mj_forward(self._model, self._data)
+                except Exception as e:
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: mj_forward FAILED: {e}")
+                    return  # 模型可能已被重新加载，跳过此帧
                 
+                if do_diag:
+                    print(f"[GLFW-RENDER] tick={tick}: mj_forward OK")
+
                 viewport_width, viewport_height = glfw.get_framebuffer_size(self._glfw_window)
+                if viewport_width <= 0 or viewport_height <= 0:
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: bad viewport {viewport_width}x{viewport_height}, SKIP")
+                    return
                 
+                if do_diag:
+                    print(f"[GLFW-RENDER] tick={tick}: viewport={viewport_width}x{viewport_height}")
+
                 overlay_w = int(viewport_width * 0.22)
                 overlay_h = int(viewport_height * 0.22)
-                
+
                 main_viewport = mujoco.MjrRect(0, 0, viewport_width, viewport_height)
-                
-                mujoco.mjv_updateScene(
-                    self._model, self._data, self._glfw_opt, self._glfw_pert, 
-                    self._glfw_cam, mujoco.mjtCatBit.mjCAT_ALL, self._glfw_scn
-                )
-                mujoco.mjr_render(main_viewport, self._glfw_scn, self._glfw_ctx)
-                
-                cam_names = ['agentview', 'side', 'robot0_eye_in_hand']
-                positions = [
-                    (10, viewport_height - overlay_h - 10),
-                    (viewport_width - overlay_w - 10, viewport_height - overlay_h - 10),
-                    (viewport_width - overlay_w - 10, 10)
+
+                try:
+                    mujoco.mjv_updateScene(
+                        self._model, self._data, self._glfw_opt, self._glfw_pert,
+                        self._glfw_cam, mujoco.mjtCatBit.mjCAT_ALL, self._glfw_scn
+                    )
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: mjv_updateScene OK (ngeom={self._glfw_scn.ngeom})")
+                    
+                    mujoco.mjr_render(main_viewport, self._glfw_scn, self._glfw_ctx)
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: mjr_render OK (main)")
+                except Exception as e:
+                    if do_diag:
+                        print(f"[GLFW-RENDER] tick={tick}: render FAILED: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                    return  # 渲染失败，跳过此帧
+
+                # 使用 set_display_cameras() 设置的相机名称，分布于四角
+                display_cams = getattr(self, '_camera_names', [])
+                margin = 10
+                corner_positions = [
+                    (margin, viewport_height - overlay_h - margin),                     # 左上
+                    (viewport_width - overlay_w - margin, viewport_height - overlay_h - margin),  # 右上
+                    (margin, margin),                                                    # 左下
+                    (viewport_width - overlay_w - margin, margin),                        # 右下
                 ]
-                
-                for cam_name, (x, y) in zip(cam_names, positions):
+                for i, cam_name in enumerate(display_cams):
+                    if i >= len(corner_positions):
+                        break
+                    x, y = corner_positions[i]
                     try:
                         cam_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
                         if cam_id >= 0:
                             overlay_viewport = mujoco.MjrRect(x, y, overlay_w, overlay_h)
-                            
+
                             overlay_cam = mujoco.MjvCamera()
                             overlay_cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                             overlay_cam.fixedcamid = cam_id
-                            
+
                             mujoco.mjv_updateScene(
                                 self._model, self._data, self._glfw_opt, self._glfw_pert,
                                 overlay_cam, mujoco.mjtCatBit.mjCAT_ALL, self._glfw_scn
                             )
                             mujoco.mjr_render(overlay_viewport, self._glfw_scn, self._glfw_ctx)
-                            
-                            border = mujoco.MjrRect(x, y, overlay_w, 3)
-                            mujoco.mjr_overlay(mujoco.mjtFontScale.mjFONTSCALE_100,
-                                            mujoco.mjtGridPos.mjGRID_TOPLEFT, border,
-                                            "", "", self._glfw_ctx)
-                    except Exception as e:
+                    except Exception:
                         pass
-                
+
                 import time as _time
                 current_time = _time.time()
                 if not hasattr(self, '_start_time'):
                     self._start_time = current_time
-                
+
                 sim_time = self._data.time if self._data else 0
                 wall_time = current_time - self._start_time
-                tick = getattr(self, '_render_tick', 0)
                 self._render_tick = tick + 1
-                
+
                 info_lines = [
                     f"tick:        {tick:>6}",
                     f"sim time:    {sim_time:>8.2f}sec",
                     f"wall time:   {wall_time:>8.2f}sec",
                 ]
                 
-                mujoco.mjr_overlay(mujoco.mjtFontScale.mjFONTSCALE_150,
-                                 mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
-                                 main_viewport,
-                                 "\n".join(info_lines), "", self._glfw_ctx)
-                
-                glfw.swap_buffers(self._glfw_window)
-            
-            glfw.poll_events()
-            
-        except Exception as e:
-            print(f"[SimuInterface] GLFW render frame error: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def close_glfw_viewer(self):
-        """关闭 GLFW 查看器"""
-        print(f"[SimuInterface] close_glfw_viewer called, _glfw_viewer_running={self._glfw_viewer_running}")
-        self._glfw_viewer_running = False
-        
-        if hasattr(self, '_glfw_timer') and self._glfw_timer:
-            # QTimer 必须在创建它的线程（Qt主线程）中停止
-            try:
-                from PyQt5.QtCore import QThread
-                if QT_AVAILABLE and QApplication.instance() is not None and \
-                   QThread.currentThread() != QApplication.instance().thread():
-                    # 从后台线程：通过 deleteLater 让主线程安全清理
-                    self._glfw_timer.deleteLater()
-                else:
-                    self._glfw_timer.stop()
-            except Exception:
                 try:
-                    self._glfw_timer.stop()
+                    mujoco.mjr_overlay(mujoco.mjtFontScale.mjFONTSCALE_150,
+                                     mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
+                                     main_viewport,
+                                     "\n".join(info_lines), "", self._glfw_ctx)
                 except Exception:
                     pass
-            self._glfw_timer = None
+
+                if do_diag:
+                    print(f"[GLFW-RENDER] tick={tick}: calling swap_buffers...", flush=True)
+                glfw.swap_buffers(self._glfw_window)
+                if do_diag:
+                    print(f"[GLFW-RENDER] tick={tick}: DONE", flush=True)
+            finally:
+                self._lock.release()
+
+            glfw.poll_events()
+
+        except Exception as e:
+            # 不打印堆栈跟踪，避免日志刷屏
+            if not hasattr(self, '_last_render_error_time') or \
+               (hasattr(self, '_last_render_error_time') and 
+                (time.time() - self._last_render_error_time) > 1.0):
+                print(f"[SimuInterface] GLFW render frame error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._last_render_error_time = time.time()
+
+    def _free_glfw_mujoco_resources(self):
+        """显式释放 GLFW 相关的 MuJoCo GPU 资源
         
-        # 清理 GLFW 渲染上下文（必须在销毁窗口前）
-        self._glfw_ctx = None
-        self._glfw_scn = None
+        MjrContext 持有 OpenGL 帧缓冲区、纹理等 GPU 资源，
+        仅设为 None 依赖 GC 回收会导致 GPU 资源累积（GC 不保证及时执行）。
+        必须通过 del + gc.collect() 强制立即释放。
+        """
+        # MjrContext: 持有 OpenGL 帧缓冲区/纹理，必须立即释放
+        if self._glfw_ctx is not None:
+            try:
+                del self._glfw_ctx
+            except Exception:
+                pass
+            self._glfw_ctx = None
+        
+        # MjvScene: 持有渲染缓冲区
+        if self._glfw_scn is not None:
+            try:
+                del self._glfw_scn
+            except Exception:
+                pass
+            self._glfw_scn = None
+        
+        # 其他 Mjv* 对象体积较小，直接置空即可
         self._glfw_cam = None
         self._glfw_opt = None
         self._glfw_pert = None
         self._glfw_viewport = None
         
-        if hasattr(self, '_glfw_window') and self._glfw_window:
-            try:
-                glfw.destroy_window(self._glfw_window)
-            except Exception:
-                pass
-            self._glfw_window = None
+        # 强制 GC 确保上述 del 触发的 __del__ 被执行
+        gc.collect()
+
+    def close_glfw_viewer(self):
+        """关闭 GLFW 查看器
+        
+        注意：GLFW 窗口必须在创建它的线程中销毁。
+        这里只设置停止标志，让渲染线程自行清理资源。
+        """
+        print(f"[SimuInterface] close_glfw_viewer called, _glfw_viewer_running={self._glfw_viewer_running}")
+        
+        if not self._glfw_viewer_running:
+            # 即使查看器未运行，也要确保残留资源被清理
+            self._free_glfw_mujoco_resources()
+            print("[SimuInterface] GLFW viewer already stopped, resources cleaned")
+            return
+        
+        # 通知线程停止（线程会在 finally 块中清理所有资源）
+        if hasattr(self, '_glfw_stop_event') and self._glfw_stop_event:
+            self._glfw_stop_event.set()
+        
+        # 等待线程结束（最多 5 秒）
+        # 线程会在 finally 块中清理所有 GLFW 资源
+        if hasattr(self, '_glfw_thread') and self._glfw_thread and self._glfw_thread.is_alive():
+            self._glfw_thread.join(timeout=5.0)
+            if self._glfw_thread.is_alive():
+                print("[SimuInterface] Warning: GLFW thread did not stop within timeout")
+                # 线程超时未退出，强制清理 MuJoCo 资源（可能导致渲染线程崩溃，但避免资源泄漏）
+                self._free_glfw_mujoco_resources()
+        
+        self._glfw_viewer_running = False
+        
+        # 确保资源已释放（可能已由线程 finally 块释放，这里是兜底）
+        self._free_glfw_mujoco_resources()
+        
+        self._glfw_window = None
+        self._glfw_stop_event = None
+        self._glfw_thread = None
         
         print("[SimuInterface] GLFW viewer closed")
     
@@ -735,6 +928,8 @@ class SimuInterface:
             self._viewer.sync()
 
     def _get_ctrl_idx_for_joint(self, joint_idx: int) -> int:
+        if self._model is None:
+            return -1
         joint_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint_idx)
         for i in range(self._model.nu):
             actuator_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
@@ -756,9 +951,10 @@ class SimuInterface:
             print(f"[SimuInterface] Joint {joint_name} (idx={joint_idx}) -> Actuator idx={ctrl_idx}")
 
     def get_joint_state(self) -> np.ndarray:
-        if self._model is None or self._data is None:
-            return np.zeros(6)
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return np.zeros(6)
             try:
                 joint_positions = []
                 for joint_idx in self._joint_indices:
@@ -773,9 +969,10 @@ class SimuInterface:
 
     def set_joint_target(self, positions: np.ndarray) -> bool:
         """设置关节目标位置"""
-        if self._model is None or self._data is None:
-            return False
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return False
             try:
                 # 将角度归一化到 [-180, 180] 范围
                 positions_normalized = np.mod(positions + 180, 360) - 180
@@ -797,9 +994,10 @@ class SimuInterface:
                 return False
 
     def get_gripper_state(self) -> float:
-        if self._model is None or self._data is None:
-            return 0.0
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return 0.0
             try:
                 # 读取 RIGHT_BOTTOM 的位置并映射回 0-1
                 if len(self._gripper_indices) > 0:
@@ -814,9 +1012,10 @@ class SimuInterface:
 
     def set_gripper(self, position: float) -> bool:
         """设置夹爪位置"""
-        if self._model is None or self._data is None:
-            return False
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return False
             try:
                 # position: 0 = 张开, 1 = 闭合
                 # RIGHT_BOTTOM: ctrlrange [-0.2, 0.8]
@@ -844,6 +1043,9 @@ class SimuInterface:
 
         with self._lock:
             try:
+                # 锁内再次检查，防止竞态
+                if self._model is None or self._data is None:
+                    return False
                 all_joint_indices = list(self._joint_indices) + list(self._gripper_indices)
                 for joint_idx in all_joint_indices:
                     ctrl_idx = self._get_ctrl_idx_for_joint(joint_idx)
@@ -860,9 +1062,10 @@ class SimuInterface:
 
 
     def get_object_position(self, object_name: str) -> np.ndarray:
-        if self._model is None or self._data is None:
-            return np.zeros(3)
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return np.zeros(3)
             try:
                 body_idx = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, object_name)
                 if body_idx < 0:
@@ -874,9 +1077,10 @@ class SimuInterface:
     def set_object_position(self, object_name: str, position: np.ndarray, reset_z: bool = False) -> bool:
         """设置物块位置。只设置 x 和 y，z 保持当前值（除非 reset_z=True）。
         如果 _object_physics_enabled 为 True，则只重置到初始位置，之后让物理引擎控制。"""
-        if self._model is None or self._data is None:
-            return False
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return False
             try:
                 body_idx = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, object_name)
                 if body_idx < 0:
@@ -884,7 +1088,7 @@ class SimuInterface:
                 joint_adr = self._model.body_jntadr[body_idx]
                 if joint_adr >= 0:
                     qpos_adr = self._model.jnt_qposadr[joint_adr]
-                    # 先设置 x/y，并统一姿态，z 在 reset_z 模式下按“底部高度”自动对齐
+                    # 先设置 x/y，并统一姿态，z 在 reset_z 模式下按"底部高度"自动对齐
                     self._data.qpos[qpos_adr] = position[0]  # x
                     self._data.qpos[qpos_adr+1] = position[1]  # y
                     # 重置四元数为单位四元数 (w=1, x=0, y=0, z=0)
@@ -896,7 +1100,7 @@ class SimuInterface:
                     self._data.qvel[qvel_adr:qvel_adr+6] = 0
 
                     if reset_z:
-                        # 将传入 z 解释为“物体底部目标高度”
+                        # 将传入 z 解释为"物体底部目标高度"
                         # 优先使用对象里的 bottom site（若存在），其次再退化到 geom 包围球估计。
                         mujoco.mj_forward(self._model, self._data)
 
@@ -969,14 +1173,23 @@ class SimuInterface:
         if self._model is None or self._data is None:
             return
 
-        with self._lock:
-            # 在 step 之前同步 TIP 关节位置
-            self._sync_gripper_tips()
+        # 分段执行：每 _lock_chunk 步释放一次锁，让 GLFW viewer 和
+        # SimuPublisher 有机会获取锁更新画面/采集数据
+        _lock_chunk = 20  # 每次持锁执行的步数
+        steps_done = 0
 
-            for _ in range(n_steps):
-                mujoco.mj_step(self._model, self._data)
-                # 同步更新查看器
+        while steps_done < n_steps:
+            chunk = min(_lock_chunk, n_steps - steps_done)
+            with self._lock:
+                if steps_done == 0:
+                    self._sync_gripper_tips()
+                for _ in range(chunk):
+                    mujoco.mj_step(self._model, self._data)
                 self.sync_viewer()
+            steps_done += chunk
+            # 每个 chunk 之间让出，给 GLFW viewer 和 SimuPublisher 获取锁的机会
+            if steps_done < n_steps:
+                time.sleep(0.001)
 
     def _sync_gripper_tips(self):
         """同步夹爪指尖关节位置（TIP 始终保持为 0）"""
@@ -992,35 +1205,93 @@ class SimuInterface:
             except:
                 pass
 
+    @staticmethod
+    def _safe_close_renderer(renderer, destroy_window=False):
+        """安全关闭 Renderer，防止 __del__ 二次调用导致 AttributeError
+        
+        Args:
+            renderer: mujoco.Renderer 实例
+            destroy_window: 是否同时销毁 GLFW offscreen 窗口。
+                           在 disconnect() 中应为 True（最终清理，会 gc.collect + glfw.terminate）。
+                           在 initialize()/线程切换时应为 False（避免跨线程 GLFW 操作导致 C 层崩溃）。
+        """
+        if renderer is None:
+            return
+        try:
+            # 释放 MjrContext（GPU 帧缓冲区/纹理等资源，这是最占 GPU 内存的）
+            if hasattr(renderer, '_mjr_context') and renderer._mjr_context is not None:
+                try:
+                    renderer._mjr_context.free()
+                except Exception:
+                    pass
+                renderer._mjr_context = None
+            # 释放 MjvScene（渲染缓冲区）
+            if hasattr(renderer, '_scene') and renderer._scene is not None:
+                renderer._scene = None
+            if destroy_window:
+                # 最终清理场景：主动销毁 GLFW 窗口 + 置空，防止 __del__ 二次调用
+                if hasattr(renderer, '_gl_context') and renderer._gl_context is not None:
+                    try:
+                        renderer._gl_context.free()
+                    except Exception:
+                        pass
+                    renderer._gl_context = None
+            else:
+                # 线程切换/initialize 场景：不能跨线程调用 glfw.destroy_window()
+                # 必须阻止 GC 在错误线程触发 GLContext.__del__ -> free() -> glfw.destroy_window()
+                # 解决方案：先将 GLContext 内部的 _context（GLFW 窗口指针）置空，
+                # 使其 __del__ 调用 free() 时跳过 glfw.destroy_window()
+                if hasattr(renderer, '_gl_context') and renderer._gl_context is not None:
+                    gl_ctx = renderer._gl_context
+                    if hasattr(gl_ctx, '_context') and gl_ctx._context is not None:
+                        gl_ctx._context = None
+                    renderer._gl_context = None
+        except Exception:
+            pass
+
     def _ensure_renderer_for_current_thread(self):
-        current_thread_id = threading.get_ident()
-        current_thread_name = threading.current_thread().name
-
-        if self._renderer is not None and self._renderer_thread_id != current_thread_id:
-            try:
-                self._renderer.close()
-            except Exception:
-                pass
+        """确保当前线程有可用的 Renderer
+        
+        采用单 Renderer 策略：所有线程共享同一个 Renderer 实例。
+        mujoco.Renderer.render() 内部会调用 _gl_context.make_current()，
+        因此同一个 Renderer 可以在不同线程间安全使用（通过锁串行化）。
+        这避免了每线程缓存导致的 renderer 反复创建/销毁问题。
+        """
+        # 如果已有有效的 renderer，直接复用
+        if self._renderer is not None:
+            if hasattr(self._renderer, '_mjr_context') and self._renderer._mjr_context is not None:
+                return
+            # renderer 已失效（_mjr_context 被关闭），需要重建
+            self._safe_close_renderer(self._renderer)
             self._renderer = None
-            print(
-                f"[SimuInterface] Renderer recreated for thread switch: "
-                f"{self._renderer_thread_name} -> {current_thread_name}"
-            )
 
-        if self._renderer is None:
+        # 清理所有缓存的线程 renderer（如果有的话）
+        for tid, rnd in list(self._thread_renderers.items()):
+            self._safe_close_renderer(rnd)
+        self._thread_renderers.clear()
+
+        # 创建新的全局 renderer
+        print(f"[SimuInterface] Creating new Renderer (thread: {threading.current_thread().name})")
+        try:
             self._renderer = mujoco.Renderer(self._model, height=self._render_height, width=self._render_width)
-            self._renderer_thread_id = current_thread_id
-            self._renderer_thread_name = current_thread_name
+        except Exception as e:
+            print(f"[SimuInterface] Failed to create renderer: {e}")
+            self._renderer = None
+            return
+        self._renderer_thread_id = threading.get_ident()
+        self._renderer_thread_name = threading.current_thread().name
 
     def render(self, camera_name: Optional[str] = None) -> np.ndarray:
-
-        if self._model is None or self._data is None:
-            return np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)
-        
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)
             try:
                 mujoco.mj_forward(self._model, self._data)
                 self._ensure_renderer_for_current_thread()
+                
+                if self._renderer is None:
+                    return np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)
                 
                 if camera_name:
 
@@ -1032,8 +1303,8 @@ class SimuInterface:
                 else:
                     self._renderer.update_scene(self._data)
                 
-                # 关键：返回独立拷贝，避免不同相机/线程读到同一底层缓冲区导致串帧
-                return np.ascontiguousarray(self._renderer.render()).copy()
+                # 返回独立拷贝，避免渲染缓冲区被覆盖（单次 copy 即可）
+                return np.copy(self._renderer.render())
 
                 
             except Exception as e:
@@ -1060,25 +1331,47 @@ class SimuInterface:
                 proc_images = self._render_process.get_images()
                 # 仅返回请求相机，防止字典残留/错配
                 return {
-                    name: np.ascontiguousarray(proc_images.get(name, np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8))).copy()
+                    name: np.copy(proc_images.get(name, np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)))
                     for name in cam_names
                 }
 
-
-        
-
+        # === 诊断日志：前5次调用打印详情 ===
+        diag_cnt = getattr(self, '_get_cam_diag_cnt', 0)
+        do_diag = diag_cnt < 5
 
         images = {}
 
+        # 采集期间：非采集线程的渲染请求直接返回空帧，避免 GL context 跨线程竞争
+        if self._collecting_active and threading.current_thread() != getattr(self, '_collector_thread_id', None):
+            if do_diag:
+                print(f"[GET-CAM] #{diag_cnt}: collecting active + non-collector -> empty frames", flush=True)
+            self._get_cam_diag_cnt = diag_cnt + 1
+            return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
         # 一次加锁完成多相机渲染，避免 GUI 线程与采集线程交错导致相机串帧
         with self._lock:
             try:
                 if self._model is None or self._data is None:
+                    if do_diag:
+                        print(f"[GET-CAM] #{diag_cnt}: model/data None -> empty", flush=True)
+                    self._get_cam_diag_cnt = diag_cnt + 1
                     return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
                 mujoco.mj_forward(self._model, self._data)
+
+                if do_diag:
+                    print(f"[GET-CAM] #{diag_cnt}: mj_forward OK, ensure_renderer...", flush=True)
+
                 self._ensure_renderer_for_current_thread()
+
+                if do_diag:
+                    print(f"[GET-CAM] #{diag_cnt}: renderer={'OK' if self._renderer else 'NONE'}", flush=True)
+
+                if self._renderer is None:
+                    if do_diag:
+                        print(f"[GET-CAM] #{diag_cnt}: renderer NONE -> empty", flush=True)
+                    self._get_cam_diag_cnt = diag_cnt + 1
+                    return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
                 for name in cam_names:
 
@@ -1087,20 +1380,46 @@ class SimuInterface:
                         self._renderer.update_scene(self._data, camera=cam_id)
                     else:
                         self._renderer.update_scene(self._data)
-                    images[name] = np.ascontiguousarray(self._renderer.render()).copy()
+                    img = self._renderer.render()
+
+                    if do_diag:
+                        img_min, img_max = img.min(), img.max()
+                        print(f"[GET-CAM] #{diag_cnt}: cam={name} shape={img.shape} min={img_min} max={img_max} mean={img.mean():.1f}", flush=True)
+
+                    images[name] = np.copy(img)
 
             except Exception as e:
-                print(f"[SimuInterface] get_camera_images error: {e}")
+                print(f"[SimuInterface] get_camera_images error: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                self._get_cam_diag_cnt = diag_cnt + 1
                 return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
+        self._get_cam_diag_cnt = diag_cnt + 1
         return images
 
 
     def set_display_cameras(self, camera_names: List[str]):
         self._camera_names = camera_names
 
+    def set_collecting_active(self, active: bool):
+        """设置数据采集状态标志。
+        
+        采集期间（active=True）：
+          - GLFW viewer 渲染循环暂停，避免与 Renderer 的 offscreen GL context 竞争
+          - Qt GUI 的 get_camera_images() 返回空帧，不干扰采集线程的渲染
+          
+        非采集期间（active=False）：
+          - GLFW viewer 恢复正常渲染
+          - Qt GUI 可以正常获取预览图像
+        """
+        self._collecting_active = active
+
+    def is_collecting_active(self) -> bool:
+        return self._collecting_active
+
     def start_process_renderer(self, camera_names: Optional[List[str]] = None):
-        from scripts.simu_render_process import SimuRenderProcess
+        from scripts.simu.render_process import SimuRenderProcess
         cam_names = camera_names or self._camera_names
         self._render_process = SimuRenderProcess(
             self._xml_path,
@@ -1150,6 +1469,7 @@ class SimuInterface:
         """
         if not self._use_ik or self._ik_solver is None:
             print("[SimuInterface] IK not available, cannot move to cartesian position")
+            print(f"  _use_ik={self._use_ik}, _ik_solver={'None' if self._ik_solver is None else 'initialized'}, IK_AVAILABLE={IK_AVAILABLE}")
             return False
         
         print(f"[SimuInterface] Starting move_to_cartesian to {position}")
@@ -1169,40 +1489,54 @@ class SimuInterface:
                 print(f"[SimuInterface] Target orientation matrix enabled")
             
             # 生成轨迹中间点 (笛卡尔空间插值)
-
+            # 优化：减少轨迹点数量以提高性能
             trajectory_points = []
-            for i in range(steps + 1):
-                alpha = i / steps
+            # 使用更少的插值点（从 steps+1 减少到约 20-30 个）
+            n_interp = min(steps + 1, 50)  # 增加路径点数量，提高轨迹跟踪精度
+            for i in range(n_interp):
+                alpha = i / (n_interp - 1)  # 归一化到 [0, 1]
                 interp_pos = current_pos + alpha * (target_pos - current_pos)
                 trajectory_points.append(interp_pos)
             
-            print(f"[SimuInterface] Generated {len(trajectory_points)} trajectory points")
+            print(f"[SimuInterface] Generated {len(trajectory_points)} trajectory points (optimized)")
             
             # 逐点执行：对每个中间点求解 IK 并执行一步仿真
             q = current_q.copy()
             
             for step_idx, traj_pos in enumerate(trajectory_points):
+                ik_start_time = time.time()  # IK 计时开始
+                
                 if target_ori is not None:
                     try:
+                        # 增加 IK 迭代次数，提高精度
                         q_ik = self._ik_solver.inverse_kinematics(
                             traj_pos,
                             target_ori,
                             initial_guess=q,
+                            max_iterations=50,  # 增加迭代次数
+                            tolerance=5e-4,    # 收紧容差到 0.5mm
                         )
                         solve_info = self._ik_solver.get_last_solve_info() if hasattr(self._ik_solver, 'get_last_solve_info') else {}
                         ik_success = bool(solve_info.get('success', False))
                         ik_pos_err = float(solve_info.get('position_error', 1e9))
+                        ik_iter = int(solve_info.get('iterations', 0))
+
+                        ik_time = time.time() - ik_start_time
+                        # 每步都打印 IK 信息（调试）
+                        print(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter}, err={ik_pos_err:.4f}m")
 
                         # 注意：inverse_kinematics 总会返回 q，不会返回 None
                         # 若姿态约束不可达，退化为位置IK，避免路径长时间偏离目标
-                        if ik_success or ik_pos_err < 0.02:
+                        # 减小接受误差阈值，提高精度
+                        if ik_success or ik_pos_err < 0.005:  # 误差小于 5mm 才接受
                             q = np.array(q_ik, dtype=float)
                             for i in range(len(q)):
                                 q[i] = np.clip(q[i], self._ik_solver.joint_ranges[i][0], self._ik_solver.joint_ranges[i][1])
                         else:
+                            # 使用快速雅可比迭代（单步）
                             current_pos = self._ik_solver.forward_kinematics(q)
                             pos_error = traj_pos - current_pos
-                            J = self._ik_solver.jacobian(q)
+                            J = self._ik_solver.jacobian(q, skip_forward=True)  # 跳过重复 forward
                             J_pos = J[:3, :]
                             damping = 0.1
                             JtJ = J_pos.T @ J_pos
@@ -1212,7 +1546,7 @@ class SimuInterface:
                     except Exception:
                         current_pos = self._ik_solver.forward_kinematics(q)
                         pos_error = traj_pos - current_pos
-                        J = self._ik_solver.jacobian(q)
+                        J = self._ik_solver.jacobian(q, skip_forward=True)  # 跳过重复 forward
                         J_pos = J[:3, :]
                         damping = 0.1
                         JtJ = J_pos.T @ J_pos
@@ -1222,34 +1556,40 @@ class SimuInterface:
 
                 else:
                     # IK求解是纯计算，不访问MuJoCo资源，不需要锁
-                    for ik_iter in range(10):
+                    # 增加迭代次数，提高 IK 精度
+                    for ik_iter in range(30):  # 增加到 30 次迭代
                         current_pos = self._ik_solver.forward_kinematics(q)
                         pos_error = traj_pos - current_pos
                         error_norm = np.linalg.norm(pos_error)
-                        
-                        if error_norm < 1e-3:
+
+                        if error_norm < 5e-4:  # 收紧收敛阈值到 0.5mm
                             break
-                        
-                        J = self._ik_solver.jacobian(q)
+
+                        J = self._ik_solver.jacobian(q, skip_forward=True)  # 跳过重复 forward
                         J_pos = J[:3, :]
-                        
-                        damping = 0.1
+
+                        damping = 0.03  # 进一步减小阻尼，加快收敛
                         JtJ = J_pos.T @ J_pos
                         JtJ_damped = JtJ + damping**2 * np.eye(JtJ.shape[0])
                         delta_q = np.linalg.solve(JtJ_damped, J_pos.T @ pos_error)
-                        
-                        max_delta = 0.2
+
+                        max_delta = 0.2  # 减小步长限制，避免跳过最优解
                         if np.linalg.norm(delta_q) > max_delta:
                             delta_q = delta_q / np.linalg.norm(delta_q) * max_delta
                         
-                        q = q + delta_q * 0.5
+                        q = q + delta_q * 0.7  # 增大步长缩放因子
                         
                         for i in range(len(q)):
                             q[i] = np.clip(q[i], self._ik_solver.joint_ranges[i][0], 
                                           self._ik_solver.joint_ranges[i][1])
+                    
+                    ik_time = time.time() - ik_start_time
+                    if step_idx % 5 == 0:
+                        print(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter+1}, err={error_norm:.4f}m")
 
                 
                 # 只在访问MuJoCo资源时加锁
+                # 每步执行多个 mj_step 以加速收敛，同时步间释放锁让 GLFW/SimuPublisher 更新
                 with self._lock:
                     for j, joint_idx in enumerate(self._joint_indices):
                         if j < len(q):
@@ -1259,10 +1599,12 @@ class SimuInterface:
                                 clipped_val = np.clip(q[j], ctrl_range[0], ctrl_range[1])
                                 self._data.ctrl[ctrl_idx] = clipped_val
                     
-                    mujoco.mj_step(self._model, self._data)
-                    
-                    if step_idx % 10 == 0:
-                        self.sync_viewer()
+                    for _ in range(10):  # 每个轨迹点执行 10 步仿真
+                        mujoco.mj_step(self._model, self._data)
+                    self.sync_viewer()
+                
+                # 每个轨迹点后短暂让出，给 GLFW viewer 和 SimuPublisher 获取锁的机会
+                time.sleep(0.001)
                 
                 if step_callback is not None:
                     try:
@@ -1319,10 +1661,10 @@ class SimuInterface:
     
     def get_tcp_pose(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """获取末端执行器 (TCP) 的位置和旋转矩阵"""
-        if self._model is None or self._data is None:
-            return None, None
-
         with self._lock:
+            # 在锁内检查，避免并发问题
+            if self._model is None or self._data is None:
+                return None, None
             try:
                 site_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_SITE, self._tcp_site_name)
                 if site_id < 0:
@@ -1397,15 +1739,66 @@ class SimuInterface:
         return self._use_ik and self._ik_solver is not None
 
     def disconnect(self):
-        self.stop_process_renderer()
-        if self._renderer:
-            self._renderer.close()
-            self._renderer = None
-        self._renderer_thread_id = None
-        self._renderer_thread_name = None
-        self._model = None
-        self._data = None
+        # 先关闭 GLFW 查看器（必须在清理其他资源前，它会释放 MjrContext GPU 资源）
+        self.close_glfw_viewer()
 
+        self.stop_process_renderer()
+
+        # 加锁保护，防止其他线程在 _model/_data 置空后仍访问
+        with self._lock:
+            self._ik_solver = None
+            self._sim_controller = None
+
+            # 清理所有缓存的线程渲染器（防止 GPU/CPU 内存泄漏）
+            # 注意：使用 destroy_window=False 避免跨线程销毁 GLFW 窗口
+            for tid, renderer in list(self._thread_renderers.items()):
+                self._safe_close_renderer(renderer, destroy_window=False)
+            self._thread_renderers.clear()
+
+            if self._renderer:
+                self._safe_close_renderer(self._renderer, destroy_window=False)
+                self._renderer = None
+            self._renderer_thread_id = None
+            self._renderer_thread_name = None
+            
+            # 不调用 _viewer.close()，原因同 initialize()：可能跨线程
+
+            # 显式释放 MuJoCo 模型和数据
+            self._model = None
+            self._data = None
+
+        # 强制 GC 回收所有已释放的 MuJoCo/OpenGL 资源
+        gc.collect()
+
+        # 注意：不调用 glfw.terminate()！
+        # 原因：disconnect 后可能立即创建新的 SimuInterface 并需要 GLFW，
+        # 而且 GC 可能延迟回收旧 renderer 的 GLContext，terminate 后 GLContext
+        # 析构函数调用 glfw.destroy_window → 段错误/崩溃。
+        # GLFW 全局状态在整个进程生命周期保持，程序退出时自动清理。
+
+    def __del__(self):
+        """析构函数：确保异常退出时也清理 GPU 资源"""
+        try:
+            # 显式释放 MjrContext GPU 资源
+            if hasattr(self, '_glfw_ctx') and self._glfw_ctx is not None:
+                try:
+                    del self._glfw_ctx
+                except Exception:
+                    pass
+                self._glfw_ctx = None
+            
+            if hasattr(self, '_thread_renderers') and self._thread_renderers:
+                # __del__ 可能在任意线程被 GC 触发，不能用 destroy_window=True
+                for tid, renderer in list(self._thread_renderers.items()):
+                    self._safe_close_renderer(renderer, destroy_window=False)
+                self._thread_renderers.clear()
+            if hasattr(self, '_renderer') and self._renderer:
+                # 同上，不跨线程销毁 GLFW 窗口
+                self._safe_close_renderer(self._renderer, destroy_window=False)
+            # 注意：不在 __del__ 中调用 glfw.terminate()
+            # 原因同 disconnect()：可能导致延迟 GC 的 GLContext 析构崩溃
+        except Exception:
+            pass
 
 
 class MockSimuInterface:
@@ -1455,6 +1848,22 @@ class MockSimuInterface:
 
     def set_display_cameras(self, camera_names: List[str]):
         self._camera_names = camera_names
+
+    def set_collecting_active(self, active: bool):
+        """设置数据采集状态标志。
+        
+        采集期间（active=True）：
+          - GLFW viewer 渲染循环暂停，避免与 Renderer 的 offscreen GL context 竞争
+          - Qt GUI 的 get_camera_images() 返回空帧，不干扰采集线程的渲染
+          
+        非采集期间（active=False）：
+          - GLFW viewer 恢复正常渲染
+          - Qt GUI 可以正常获取预览图像
+        """
+        self._collecting_active = active
+
+    def is_collecting_active(self) -> bool:
+        return self._collecting_active
 
     def start_process_renderer(self, camera_names: Optional[List[str]] = None):
         pass

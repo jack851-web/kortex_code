@@ -15,12 +15,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from gui import MainWindow, MockTaskTunerWindow
 from PyQt5.QtWidgets import QApplication
-from scripts.real_interface import RealInterface
-from scripts.simu_interface import SimuInterface
-from scripts.sync_controller import SyncController
-from scripts.grasp_executor import GraspExecutor
-from scripts.real_data_collector import RealDataCollector
-from scripts.simu_data_collector import SimuDataCollector
+from scripts import (
+    RealInterface, MockRealInterface,
+    SimuInterface, MockSimuInterface,
+    SyncController, GraspExecutor,
+    RealDataCollector, SimuDataCollector,
+    MessageBroker,
+    SimuManager, SimuPublisher, RealPublisher,
+)
 
 
 class DataCollectionSystem:
@@ -37,11 +39,21 @@ class DataCollectionSystem:
         self._show_simu_viewer = bool(show_simu_viewer)
         self._config = None
         
+        # 消息总线（全局单例）
+        self._broker = MessageBroker.instance()
+        
         # 接口
         self._real: Optional[RealInterface] = None
         self._simu: Optional[SimuInterface] = None
         self._sync_controller: Optional[SyncController] = None
         self._grasp_executor: Optional[GraspExecutor] = None
+        
+        # 仿真管理器（接管 SimuInterface 的生命周期）
+        self._simu_manager = SimuManager(self._broker)
+        
+        # 数据发布者
+        self._simu_publisher: Optional[SimuPublisher] = None
+        self._real_publisher: Optional[RealPublisher] = None
         
         # 数据收集器
         self._real_data_collector: Optional[RealDataCollector] = None
@@ -61,6 +73,9 @@ class DataCollectionSystem:
         
         # 任务线程
         self._task_thread: Optional[threading.Thread] = None
+
+        # tqdm 进度重定向（LeRobot 内部使用 tqdm，重定向到 Qt 日志）
+        self._redirect_tqdm_to_log()
         
         # 坐标变换参数
         self._coord_rotation_z: float = 0.0  # 绕Z轴旋转角度（度）
@@ -125,12 +140,17 @@ class DataCollectionSystem:
         # 获取配置
         robot_config = self._config.get('robot', {})
         real_camera_config = self._config.get('cameras', {}).get('real', {})
-        simu_camera_config = self._config.get('cameras', {}).get('simu', {})
+        _simu_cam_cfg = self._config.get('cameras', {}).get('simu', [])
+        # cameras.simu 支持列表 [name, ...] 或字典 {name: {...}} 格式
+        if isinstance(_simu_cam_cfg, list):
+            self._simu_camera_names = _simu_cam_cfg if _simu_cam_cfg else ['agentview']
+        else:
+            self._simu_camera_names = list(_simu_cam_cfg.keys()) if _simu_cam_cfg else ['agentview']
         simu_config = self._config.get('simulation', {})
         grasp_config = self._config.get('grasp', {})
         dataset_config = self._config.get('dataset', {})
 
-        self._simu_base_xml_path = simu_config.get('scene_base_xml_path', simu_config.get('xml_path', ''))
+        self._simu_base_xml_path = simu_config.get('xml_path', '')
         self._object_library = simu_config.get('object_library', {})
 
         # 仿真初始关节（可在 config 里设置，支持 rad/deg）
@@ -155,11 +175,23 @@ class DataCollectionSystem:
                 return False
             self._log("真实机器人已连接", "SUCCESS")
 
-            # 创建仿真接口（禁用 IK，用于同步）
-            self._simu = SimuInterface(simu_config.get('xml_path', ''), use_ik=False)
-            if not self._simu.initialize(show_viewer=self._show_simu_viewer):
+            # 启动真实机器人发布者
+            self._real_publisher = RealPublisher(self._real, self._broker, fps=20)
+            self._real_publisher.start()
+
+            # 使用 SimuManager 管理仿真（禁用 IK，用于同步）
+            if not self._simu_manager.start_simulation(
+                simu_config.get('xml_path', ''),
+                camera_names=self._simu_camera_names,
+                use_ik=False,
+                fps=20,
+                show_viewer=self._show_simu_viewer,
+                use_process_renderer=True,
+            ):
                 self._log("初始化仿真失败", "ERROR")
                 return False
+            # SimuManager 内部已启动 SimuPublisher
+            self._simu = self._simu_manager.simu
             self._log("仿真已初始化", "SUCCESS")
         else:
             # 仿真独立模式: 启用 IK，不依赖实机同步
@@ -168,13 +200,18 @@ class DataCollectionSystem:
             self._real = MockRealInterface()
             self._real.connect("mock")
 
-            self._simu = SimuInterface(simu_config.get('xml_path', ''), use_ik=True)
-            # Mock 模式下不自动启动 GLFW 查看器，而是在执行任务时按需启动
-            if not self._simu.initialize(show_viewer=False):
+            # 使用 SimuManager 管理仿真（启用 IK）
+            if not self._simu_manager.start_simulation(
+                simu_config.get('xml_path', ''),
+                camera_names=self._simu_camera_names,
+                use_ik=True,
+                fps=20,
+                show_viewer=False,
+            ):
                 self._log("初始化仿真失败", "ERROR")
                 return False
+            self._simu = self._simu_manager.simu
             self._log(f"仿真已初始化，IK可用: {self._simu.is_ik_available()}", "SUCCESS")
-            # GLFW 查看器将在执行任务时按需启动，结束时关闭
 
         self._apply_sim_initial_joints()
         
@@ -183,15 +220,11 @@ class DataCollectionSystem:
         self._log(f"坐标变换: 绕Z轴旋转 {self._coord_rotation_z}°", "INFO")
         
         # 设置相机
-        simu_camera_names = list(simu_camera_config.keys()) if simu_camera_config else ['agentview']
-        self._simu.set_display_cameras(simu_camera_names)
+        self._simu.set_display_cameras(self._simu_camera_names)
 
         if self._use_real:
-            try:
-                self._simu.start_render_process(simu_camera_names)
-                self._log("使用独立渲染进程", "INFO")
-            except Exception as e:
-                self._log(f"独立渲染进程启动失败，回退主仿真渲染: {e}", "WARNING")
+            # 进程渲染器已在 SimuManager.start_simulation 中启动
+            self._log("使用独立渲染进程（由 SimuManager 管理）", "INFO")
         
         # 创建数据收集器
         video_fps = 30
@@ -207,13 +240,15 @@ class DataCollectionSystem:
                 data_root=real_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
+                broker=self._broker,  # 通过 broker 获取数据
             )
             self._simu_data_collector = SimuDataCollector(
-                self._simu,
+                self._simu_manager.simu,  # 使用 SimuManager 的 simu
                 data_root=simu_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
                 run_in_thread=False,
+                broker=self._broker,  # 通过 broker 获取数据
             )
             self._sync_controller = SyncController(
                 self._real,
@@ -223,12 +258,14 @@ class DataCollectionSystem:
         else:
             simu_data_root = dataset_config.get('mock_simu_data_root', dataset_config.get('simu_data_root', './data/Simu/simu_data'))
             self._real_data_collector = None
+            # Mock 模式：启用独立线程收集帧，确保整个任务期间（从 start_recording 到 stop_recording）持续收集数据
             self._simu_data_collector = SimuDataCollector(
-                self._simu,
+                self._simu_manager.simu,  # 使用 SimuManager 的 simu
                 data_root=simu_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
-                run_in_thread=False,
+                run_in_thread=True,  # 启用独立线程，确保键盘控制期间也收集帧
+                broker=self._broker,  # 通过 broker 获取数据
             )
             self._sync_controller = None
         
@@ -260,11 +297,12 @@ class DataCollectionSystem:
         if (not self._use_real) and self._simu_data_collector is not None:
             self._grasp_executor.set_frame_callback(self._simu_data_collector.collect_frame)
         
-        # 加载进度
+        # 加载进度（恢复上次收集到的 episode 编号）
         progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
         saved_count = progress_collector.load_progress() if progress_collector is not None else 0
         if saved_count > 0:
-            self._log(f"从 Episode {saved_count} 恢复", "INFO")
+            self._current_episode = saved_count + 1  # 下一个 episode 从已保存数+1 开始
+            self._log(f"从进度恢复，下一个 Episode 将为 {self._current_episode} (已有 {saved_count} 条)", "INFO")
         
         return True
     
@@ -273,6 +311,43 @@ class DataCollectionSystem:
         self._log_callback = log_callback
         self._status_callback = status_callback
         self._task_callback = task_callback
+
+    def _redirect_tqdm_to_log(self):
+        """将 tqdm 进度条（LeRobot 内部使用）重定向到 Qt 日志面板"""
+        from tqdm import tqdm as _tqdm_original
+        import tqdm as _tqdm_module
+
+        # 闭包捕获 self，避免全局变量
+        _self = self
+
+        class _TqdmToLog(_tqdm_original):
+            """自定义 tqdm：进度更新时通过 _log 输出到 Qt 面板"""
+            def __init__(self, *args, **kwargs):
+                kwargs.setdefault('file', None)  # 禁用默认文件输出
+                super().__init__(*args, **kwargs)
+                self._last_log_time = 0
+
+            def display(self, msg=None, pos=None):
+                """覆盖显示方法：将进度信息转发到日志面板"""
+                import time
+                now = time.time()
+                # 限流：最多每 0.3s 输出一次，避免刷屏
+                if now - self._last_log_time < 0.3 and not (msg and '100%' in str(msg)):
+                    return
+                self._last_log_time = now
+
+                try:
+                    # 构造简短的进度描述
+                    desc = self.desc or "Progress"
+                    pct = self.n / self.total * 100 if self.total else 0
+                    info = f"{desc}: {pct:.0f}% ({self.n}/{self.total})"
+                    if len(info) > 100:
+                        info = info[:97] + "..."
+                    _self._log(info, "INFO")
+                except Exception:
+                    pass  # 静默失败，不干扰正常流程
+
+        _tqdm_module.tqdm = _TqdmToLog
     
     def _log(self, message: str, level: str = "INFO"):
         """输出日志"""
@@ -299,8 +374,7 @@ class DataCollectionSystem:
     
     def get_simu_camera_names(self) -> list:
         """获取仿真相机名称列表"""
-        simu_camera_config = self._config.get('cameras', {}).get('simu', {})
-        return list(simu_camera_config.keys()) if simu_camera_config else ['agentview']
+        return self._simu_camera_names
 
     def get_real_camera_config(self) -> dict:
         """获取真实相机配置"""
@@ -309,7 +383,8 @@ class DataCollectionSystem:
         return self._config.get('cameras', {}).get('real', {}) or {}
 
     def get_simu_camera_config(self) -> dict:
-        """获取仿真相机配置"""
+        """获取仿真相机配置（仅返回名称列表的兼容结构）"""
+        return {name: {} for name in self._simu_camera_names}
         return self._config.get('cameras', {}).get('simu', {}) or {}
 
     def _apply_sim_initial_joints(self):
@@ -468,13 +543,17 @@ class DataCollectionSystem:
             target_pos = pose[:3]
             target_ori = None
             if len(pose) >= 6:
-                target_ori = self._grasp_executor._euler_xyz_deg_to_rotmat(np.asarray(pose[3:6], dtype=float))
+                # 限制欧拉角范围，避免姿态突变
+                euler = np.asarray(pose[3:6], dtype=float)
+                # 将欧拉角归一化到 [-180, 180]
+                euler = np.mod(euler + 180, 360) - 180
+                target_ori = self._grasp_executor._euler_xyz_deg_to_rotmat(euler)
             
             success = self._simu.move_to_cartesian(
                 target_pos,
                 orientation=target_ori,
-                duration=0.3,
-                steps=15,
+                duration=0.15,  # 缩短时间，加快响应
+                steps=8,       # 减少步数，加速 IK 求解
             )
             return success
         
@@ -517,9 +596,13 @@ class DataCollectionSystem:
             return {}
 
         try:
+            # 不在这里调用 step()，避免干扰正在进行的 IK 运动
+            # 只同步控制状态（如果需要）
             if hasattr(self._simu, 'sync_control_to_current_state'):
-                self._simu.sync_control_to_current_state()
-            self._simu.step(1)
+                try:
+                    self._simu.sync_control_to_current_state()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -538,9 +621,12 @@ class DataCollectionSystem:
 
         obj_pos = np.asarray(self._tuning_object_center, dtype=float)
         if self._tuning_object_body_name:
-            body_pos = np.asarray(self._simu.get_object_position(self._tuning_object_body_name), dtype=float)
-            if float(np.linalg.norm(body_pos)) > 1e-9:
-                obj_pos = body_pos
+            try:
+                body_pos = np.asarray(self._simu.get_object_position(self._tuning_object_body_name), dtype=float)
+                if float(np.linalg.norm(body_pos)) > 1e-9:
+                    obj_pos = body_pos
+            except Exception:
+                pass
 
         offset = tcp_pos - obj_pos
 
@@ -593,59 +679,27 @@ class DataCollectionSystem:
             self._log(f'保存标定文件失败: {e}', 'ERROR')
             return None
 
-    def start_collection(self, start_task_index: int = 0, episode: int = 1):
-        """开始数据收集 - 一个 episode 包含多个任务"""
+    def start_collection(self, start_task_index: int = 0, episode: int = None):
+        """开始数据收集 - 每个任务是一个独立的 episode"""
         self._current_task_index = start_task_index
-        self._current_episode = episode
+        if episode is not None:
+            self._current_episode = episode
         self._running = True
         self._paused = False
         self._waiting_for_next_task = False
         
-        self._log(f"开始任务索引设置为: {start_task_index}", "INFO")
+        self._log(f"开始收集，Episode 编号: {self._current_episode}，任务索引: {start_task_index}", "INFO")
         
-        # 先开始 episode（初始化数据结构）
-        self._start_episode()
-        
-        # 启动数据收集器
+        # 启动数据收集器（不预启动 episode，每个任务单独 start_episode）
         if self._real_data_collector is not None:
             self._real_data_collector.start_collection()
         self._simu_data_collector.start_collection()
         # 仅实机模式启动同步控制器
         if self._sync_controller is not None:
             self._sync_controller.start_sync()
-        self._log(f"Episode {self._current_episode} 已启动，准备执行任务", "SUCCESS")
+        self._log(f"数据收集已启动，当前 Episode 编号: {self._current_episode}", "SUCCESS")
         
         self._update_status("等待执行任务", "#ffa500")
-    
-    def _start_episode(self):
-        """开始一个新的 episode"""
-        # 获取所有任务信息
-        tasks = self._config.get('tasks', {})
-        task_list = list(tasks.items())
-        
-        # 收集所有任务信息
-        all_task_info = []
-        for task_id, task_config in task_list:
-            all_task_info.append({
-                'task_id': task_id,
-                'task_name': task_config.get('description', task_id),
-                'object_name': task_config.get('object_name', 'cube'),
-                'object_position': task_config.get('object_position', [0.215, -0.614, 0.17]),
-                'plate_position': task_config.get('plate_position', [0.215, -0.60, 0.17]),
-            })
-        
-        # 开始 episode
-        if self._real_data_collector is not None:
-            self._real_data_collector.start_episode(
-                self._current_episode,
-                self.get_real_camera_names(),
-                {'tasks': all_task_info}
-            )
-        self._simu_data_collector.start_episode(
-            self._current_episode,
-            self.get_simu_camera_names(),
-            {'tasks': all_task_info}
-        )
     
     def execute_next_task(self):
         """执行下一个任务（由 GUI 按钮触发）"""
@@ -658,7 +712,7 @@ class DataCollectionSystem:
             return
 
         if self._task_in_progress:
-            self._log("当前任务尚未点击“抓取任务完毕”", "WARNING")
+            self._log('当前任务尚未点击"抓取任务完毕"', "WARNING")
             return
 
         tasks = self._config.get('tasks', {})
@@ -667,8 +721,7 @@ class DataCollectionSystem:
         self._log(f"当前任务索引: {self._current_task_index}, 总任务数: {len(task_list)}", "INFO")
 
         if self._current_task_index >= len(task_list):
-            self._log("所有任务已完成", "SUCCESS")
-            self._end_episode()
+            self._log("所有任务已完成，请停止收集", "SUCCESS")
             return
 
         self._waiting_for_next_task = True
@@ -693,7 +746,7 @@ class DataCollectionSystem:
 
             if success:
                 self._task_in_progress = True
-                self._log("任务已就绪，请手动操作并点击“抓取任务完毕”", "INFO")
+                self._log('任务已就绪，请手动操作并点击"抓取任务完毕"', "INFO")
                 self._update_status("等待手动完成", "#ffa500")
             else:
                 self._task_in_progress = False
@@ -709,7 +762,7 @@ class DataCollectionSystem:
             self._update_status("错误", "#ff0000")
 
     def retry_current_task(self):
-        """重做当前任务（丢弃当前任务数据，重新准备）"""
+        """重做当前任务（作为新的 episode 重新执行）"""
         if not self._running:
             self._log("数据收集未启动", "WARNING")
             return
@@ -719,7 +772,7 @@ class DataCollectionSystem:
             return
 
         if self._task_in_progress:
-            self._log("当前任务进行中，先点击“抓取任务完毕”或停止", "WARNING")
+            self._log('当前任务进行中，先点击"抓取任务完毕"或停止', "WARNING")
             return
 
         if self._current_task_index == 0:
@@ -733,11 +786,7 @@ class DataCollectionSystem:
         task_id, task_config = task_list[self._current_task_index]
         task_name = task_config.get('description', task_id)
 
-        self._log(f"重做任务 {self._current_task_index + 1}/{len(task_list)}: {task_name}", "WARNING")
-
-        if self._real_data_collector is not None:
-            self._real_data_collector.discard_current_task()
-        self._simu_data_collector.discard_current_task()
+        self._log(f"重做任务 {self._current_task_index + 1}/{len(task_list)}: {task_name} (新 Episode {self._current_episode})", "WARNING")
 
         self._waiting_for_next_task = True
         task_thread = threading.Thread(target=self._execute_current_task, daemon=True)
@@ -753,24 +802,41 @@ class DataCollectionSystem:
             self._log("当前没有进行中的任务", "WARNING")
             return
 
+        self._update_status("等待数据处理完成", "#ffa500")
+        self._log("正在停止数据记录...", "INFO")
         if self._real_data_collector is not None:
             self._real_data_collector.stop_recording()
         if self._simu_data_collector is not None:
             self._simu_data_collector.stop_recording()
+        self._log("数据记录已停止，正在保存 Episode...", "INFO")
 
         success = self._evaluate_task_success()
         self._log(f"任务完成: {'成功' if success else '失败'}", "SUCCESS" if success else "WARNING")
 
+        # 结束当前 episode（每个任务 = 一个 episode）
+        if self._real_data_collector is not None:
+            self._real_data_collector.end_episode(self._current_episode, success)
+        self._simu_data_collector.end_episode(self._current_episode, success)
+        self._log(f"Episode {self._current_episode} 数据已保存完毕", "SUCCESS")
+        self._current_episode += 1
+
+        # 保存进度（每次完成一个 episode 都持久化）
+        progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
+        if progress_collector is not None:
+            progress_collector._save_progress()
+
         if self._sync_controller is not None and hasattr(self._sync_controller, 'clear_adhesion_targets'):
             self._sync_controller.clear_adhesion_targets()
 
-        # Mock 模式：关闭 GLFW 查看器
-        if not self._use_real and self._show_simu_viewer:
+        # 任务结束：通过 SimuManager 彻底重建仿真（方案B）
+        if not self._use_real and self._simu_manager.is_running:
             try:
-                self._simu.close_glfw_viewer()
-                self._log("GLFW 查看器已关闭", "INFO")
+                self._log("正在关闭仿真窗口...", "INFO")
+                self._simu_manager.stop_simulation()
+                self._simu = None
+                self._log("仿真窗口已关闭", "SUCCESS")
             except Exception as e:
-                self._log(f"关闭 GLFW 查看器失败: {e}", "WARNING")
+                self._log(f"关闭仿真失败: {e}", "WARNING")
 
         self._task_in_progress = False
         self._active_task_info = {}
@@ -779,35 +845,61 @@ class DataCollectionSystem:
         tasks = self._config.get('tasks', {})
         task_total = len(list(tasks.items()))
         if self._current_task_index >= task_total:
-            self._log("所有任务已完成，请结束 Episode", "SUCCESS")
+            self._log(f"所有任务已完成！共收集 {self._current_episode - 1} 个 episode", "SUCCESS")
             self._update_status("任务完成", "#00aa00")
         else:
+            self._log("等待下一个任务...", "INFO")
             self._update_status("等待执行任务", "#ffa500")
     
-    def _end_episode(self):
-        """结束当前 episode"""
-        if not self._running:
-            return
-        
-        # 结束 episode
-        if self._real_data_collector is not None:
-            self._real_data_collector.end_episode(self._current_episode, True)
-        self._simu_data_collector.end_episode(self._current_episode, True)
-
-        self._log(f"Episode {self._current_episode} 已结束", "SUCCESS")
-        if self._real_data_collector is not None:
-            self._real_data_collector._save_progress()
-        else:
-            self._simu_data_collector._save_progress()
-        
-        self._current_episode += 1
-        self._current_task_index = 0
+    def stop(self):
+        """停止数据收集"""
+        self._log("正在停止数据收集...", "WARNING")
         self._running = False
+        self._paused = False
+        
+        if self._sync_controller:
+            self._sync_controller.stop_sync()
+        
+        # 如果当前有任务正在进行，保存该 episode
+        if self._task_in_progress:
+            if self._real_data_collector is not None:
+                self._real_data_collector.stop_recording()
+            self._simu_data_collector.stop_recording()
+            
+            if self._real_data_collector is not None:
+                self._real_data_collector.end_episode(self._current_episode, True)
+            self._simu_data_collector.end_episode(self._current_episode, True)
+            self._log(f"Episode {self._current_episode} 已保存（部分数据）", "WARNING")
+            self._current_episode += 1
+        
+        if self._real_data_collector:
+            self._real_data_collector.stop_collection()
+        
+        if self._simu_data_collector:
+            self._simu_data_collector.stop_collection()
+        
+        # 保存进度
+        progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
+        if progress_collector is not None:
+            progress_collector._save_progress()
+        
+        # 停止仿真
+        if not self._use_real and self._simu_manager.is_running:
+            try:
+                self._log("正在关闭仿真窗口...", "INFO")
+                self._simu_manager.stop_simulation()
+                self._simu = None
+                self._log("仿真窗口已关闭", "SUCCESS")
+            except Exception as e:
+                self._log(f"关闭仿真失败: {e}", "WARNING")
+        
+        self._log(f"数据收集已停止 (共 {self._current_episode - 1} 个 episode)", "WARNING")
         self._update_status("已停止", "#ff4444")
     
     def _execute_task(self, task_id: str, task_config: dict) -> bool:
         """准备单个任务（新模式：不自动完成抓放）"""
         try:
+            task_name = task_config.get('description', task_id)
             object_pos = np.array(task_config.get('object_position', [0.215, -0.614, 0.17]))
             plate_pos = np.array(task_config.get('plate_position', [0.215, -0.60, 0.17]))
 
@@ -839,47 +931,69 @@ class DataCollectionSystem:
             self._log(f"DEBUG: plate_body_name={plate_body_name}", "INFO")
 
             if object_model_xml and self._simu_base_xml_path:
+                # 方案B：每个任务彻底重建仿真
+                self._log(f"重建仿真场景: object={object_name}", "INFO")
+                simu_camera_names = self.get_simu_camera_names()
+
+                # 使用 SimuManager 的任务仿真模式
+                task_simu_config = {
+                    'base_scene_xml': self._simu_base_xml_path,
+                    'object_model_xml': object_model_xml,
+                    'object_body_name': object_body_name,
+                    'camera_names': simu_camera_names,
+                    'use_ik': not self._use_real,  # Mock 模式启用 IK
+                    'fps': 20,
+                    'show_viewer': False,
+                    'use_process_renderer': self._use_real,
+                }
+
                 if plate_model_xml:
-                    reloaded = self._simu.reload_scene_with_objects(
-                        self._simu_base_xml_path,
-                        object_model_xml,
-                        object_body_name=object_body_name,
-                        plate_model_xml=plate_model_xml,
-                        plate_body_name=plate_body_name,
-                        show_viewer=False,
-                    )
-                else:
-                    reloaded = self._simu.reload_scene_with_object(
-                        self._simu_base_xml_path,
-                        object_model_xml,
-                        object_body_name=object_body_name,
-                        show_viewer=False,
-                    )
-                if not reloaded:
+                    task_simu_config['plate_model_xml'] = plate_model_xml
+                    task_simu_config['plate_body_name'] = plate_body_name
+
+                # 添加物体位置和初始关节
+                simu_object_pos = self._transform_position(object_pos)
+                task_simu_config['object_position'] = simu_object_pos.tolist()
+
+                if self._sim_initial_joints_deg is not None:
+                    task_simu_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
+
+                simu_plate_pos = self._transform_position(plate_pos)
+                if plate_model_xml and plate_body_name:
+                    task_simu_config['plate_position'] = simu_plate_pos.tolist()
+
+                if not self._simu_manager.start_task_simulation(task_simu_config):
                     self._log(f"动态加载物体失败: {object_name}", "ERROR")
                     return False
-                self._apply_sim_initial_joints()
+
+                # 更新 SimuInterface 引用
+                self._simu = self._simu_manager.simu
                 self._log(f"已加载任务物体模型: {object_name}", "INFO")
 
+            # 确保 GraspExecutor / SimuDataCollector 持有最新的 SimuInterface 引用（任务切换时 SimuInterface 会被重建）
+            if self._grasp_executor is not None and self._simu is not None:
+                self._grasp_executor.set_simu_interface(self._simu)
+            if self._simu_data_collector is not None and self._simu is not None:
+                self._simu_data_collector.set_simu_interface(self._simu)
+
             self._grasp_executor.set_sim_object_body_name(object_body_name)
-            self._simu.set_active_object_body_name(object_body_name)
+            # SimuManager 已设置 active_object_body_name，此处确保同步
+            if self._simu is not None:
+                self._simu.set_active_object_body_name(object_body_name)
 
             simu_object_pos = self._transform_position(object_pos)
             simu_plate_pos = self._transform_position(plate_pos)
             self._log(f"坐标变换: {object_pos} -> {simu_object_pos}", "INFO")
             self._log(f"放置目标变换: {plate_pos} -> {simu_plate_pos}", "INFO")
 
-            self._simu.set_object_position(object_body_name, simu_object_pos, reset_z=True)
-            self._log(f"物块位置已重置: {simu_object_pos} (body={object_body_name})", "INFO")
-
-            if plate_model_xml and plate_body_name:
-                self._simu.set_object_position(plate_body_name, simu_plate_pos, reset_z=True)
-                self._log(f"放置目标位置已重置: {simu_plate_pos} (body={plate_body_name})", "INFO")
-
-            for _ in range(3):
-                self._simu.get_camera_images(self.get_simu_camera_names())
-                time.sleep(0.03)
-            self._log("渲染已预热，首任务物体应已加载到相机帧", "INFO")
+            # 如果没有 object_model_xml（没有场景重建），需要手动设置物体位置
+            if not (object_model_xml and self._simu_base_xml_path):
+                if self._simu is not None:
+                    self._simu.set_object_position(object_body_name, simu_object_pos, reset_z=True)
+                    self._log(f"物块位置已重置: {simu_object_pos} (body={object_body_name})", "INFO")
+                    if plate_model_xml and plate_body_name:
+                        self._simu.set_object_position(plate_body_name, simu_plate_pos, reset_z=True)
+                        self._log(f"放置目标位置已重置: {simu_plate_pos} (body={plate_body_name})", "INFO")
 
             self._grasp_executor.set_target(
                 object_position=object_pos.tolist(),
@@ -896,9 +1010,29 @@ class DataCollectionSystem:
                 'target_pos_user': np.asarray(plate_pos, dtype=float),
             }
 
+            # 每个任务是一个独立的 episode
+            single_task_info = {
+                'task_id': task_id,
+                'task_name': task_config.get('description', task_id),
+                'description': task_config.get('description', task_id),
+            }
+            if self._real_data_collector is not None:
+                self._real_data_collector.start_episode(
+                    self._current_episode,
+                    self.get_real_camera_names(),
+                    single_task_info,
+                )
+            self._simu_data_collector.start_episode(
+                self._current_episode,
+                self.get_simu_camera_names(),
+                single_task_info,
+            )
+            self._log(f"Episode {self._current_episode} 已启动 (任务: {task_name})", "INFO")
+
             if self._real_data_collector is not None:
                 self._real_data_collector.start_recording()
             self._simu_data_collector.start_recording()
+            self._log("数据记录已开始，等待操作...", "INFO")
 
             if self._use_real:
                 if self._sync_controller is not None and hasattr(self._sync_controller, 'set_adhesion_targets'):
@@ -909,11 +1043,9 @@ class DataCollectionSystem:
                     )
                 self._log("实机模式: 已启动关节同步+吸附机制，请手动抓放", "INFO")
             else:
-                # mock 模式：启动 GLFW 查看器显示场景
-                self._log("Mock模式: 启动仿真窗口", "INFO")
-                # 检查模型是否已加载
-                self._log(f"DEBUG: _simu._model={self._simu._model is not None}, _simu._data={self._simu._data is not None}", "INFO")
-                if self._show_simu_viewer:
+                # mock 模式：通过 SimuManager 启动 GLFW 查看器
+                self._log("Mock模式: 仿真已在运行", "INFO")
+                if self._show_simu_viewer and self._simu is not None:
                     self._log(f"DEBUG: 调用 start_glfw_viewer, _show_simu_viewer={self._show_simu_viewer}", "INFO")
                     viewer_started = self._simu.start_glfw_viewer(
                         width=1200,
@@ -925,7 +1057,7 @@ class DataCollectionSystem:
                     else:
                         self._log("GLFW 查看器启动失败", "WARNING")
                 else:
-                    self._log(f"DEBUG: _show_simu_viewer=False, 跳过查看器启动", "INFO")
+                    self._log(f"DEBUG: _show_simu_viewer=False 或 _simu=None, 跳过查看器启动", "INFO")
                 # 自动 IK 到预抓取位点
                 self.move_current_task_to_pre_grasp()
 
@@ -1117,29 +1249,6 @@ class DataCollectionSystem:
         self._log("手动强制脱附物体", "INFO")
         return True
 
-    def stop(self):
-        """停止数据收集"""
-        self._running = False
-        self._paused = False
-        
-        if self._sync_controller:
-            self._sync_controller.stop_sync()
-        
-        # 结束并保存 episode
-        if self._real_data_collector:
-            if self._real_data_collector._current_episode_info:
-                self._real_data_collector.end_episode(self._current_episode, True)
-                self._log(f"Episode {self._current_episode} 已保存", "SUCCESS")
-            self._real_data_collector.stop_collection()
-        
-        if self._simu_data_collector:
-            if self._simu_data_collector._current_episode_info:
-                self._simu_data_collector.end_episode(self._current_episode, True)
-            self._simu_data_collector.stop_collection()
-        
-        self._log("数据收集已停止", "WARNING")
-        self._update_status("已停止", "#ff4444")
-    
     def pause(self):
         """暂停数据收集"""
         if not self._running:
@@ -1174,38 +1283,44 @@ class DataCollectionSystem:
             self._log("任务执行中，请执行完毕后再跳过", "WARNING")
             return
         
-        # 停止数据记录
+        # 停止数据记录并丢弃当前 episode（不保存）
         if self._real_data_collector is not None:
             self._real_data_collector.stop_recording()
+            self._real_data_collector.discard_current_task()
         if self._simu_data_collector is not None:
             self._simu_data_collector.stop_recording()
+            self._simu_data_collector.discard_current_task()
+        self._log("已停止数据记录（当前 episode 已丢弃）", "WARNING")
 
-        # Mock 模式：关闭 GLFW 查看器
-        if not self._use_real and self._show_simu_viewer:
+        # 任务跳过：停止仿真（下次任务时重建）
+        if self._simu_manager.is_running:
             try:
-                self._simu.close_glfw_viewer()
-                self._log("GLFW 查看器已关闭", "INFO")
+                self._log("正在关闭仿真窗口...", "INFO")
+                self._simu_manager.stop_simulation()
+                self._simu = None
+                self._log("仿真窗口已关闭", "SUCCESS")
             except Exception as e:
-                self._log(f"关闭 GLFW 查看器失败: {e}", "WARNING")
+                self._log(f"关闭仿真失败: {e}", "WARNING")
 
         self._task_in_progress = False
         self._active_task_info = {}
         self._current_task_index += 1
-        self._log("已跳过当前任务", "WARNING")
+        self._log(f"已跳过当前任务，等待下一个任务... (索引: {self._current_task_index})", "WARNING")
     
     def cleanup(self):
         """清理资源"""
         self.stop()
         
-        if self._simu:
-            # 关闭 GLFW 查看器 (Mock 模式)
-            try:
-                self._simu.close_glfw_viewer()
-            except Exception as e:
-                pass
-            self._simu.stop_render_process()
-            self._simu.disconnect()
+        # 停止发布者
+        if self._real_publisher is not None:
+            self._real_publisher.stop()
+            self._real_publisher = None
         
+        # 通过 SimuManager 清理仿真
+        self._simu_manager.stop_simulation()
+        self._simu = None
+        
+        # 清理真实机器人
         if self._real:
             self._real.disconnect()
         
@@ -1272,13 +1387,13 @@ def main():
         window.log("系统初始化失败", "ERROR")
         return 1
 
-    if use_real:
-        window.setup_cameras(
-            system.get_real_camera_names(),
-            system.get_simu_camera_names(),
-            system.get_real_camera_config(),
-            system.get_simu_camera_config(),
-        )
+    # 始终设置相机显示（模拟模式下实机相机为空列表）
+    window.setup_cameras(
+        system.get_real_camera_names(),
+        system.get_simu_camera_names(),
+        system.get_real_camera_config(),
+        system.get_simu_camera_config(),
+    )
 
     window.log("系统初始化完成", "SUCCESS")
 

@@ -1,8 +1,14 @@
+import os
+import platform
 import cv2
 import numpy as np
 import threading
 import time
 from typing import Optional, Dict
+
+# Windows MSMF 后端需要关闭硬件变换，否则某些摄像头会返回全黑帧
+if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS" not in os.environ:
+    os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 
 
 class SimpleCamera:
@@ -35,6 +41,8 @@ class SimpleCamera:
                         time.sleep(0.2)
                         ret, frame = self._cap.read()
                         if ret:
+                            if frame is not None and frame.max() == 0:
+                                print(f"[WARNING] Camera {self._index}: initial frame is all black with {backend_names[backend]} backend!")
                             print(f"Camera {self._index} connected with {backend_names[backend]} backend")
                             self._latest_frame = frame
                             self._stop_event.clear()
@@ -56,11 +64,18 @@ class SimpleCamera:
         return False
 
     def _read_loop(self):
+        _black_frame_warned = False
         while not self._stop_event.is_set():
             if self._cap is None or not self._cap.isOpened():
                 break
             ret, frame = self._cap.read()
             if ret:
+                # 检测全黑帧
+                if frame is not None and frame.max() == 0 and not _black_frame_warned:
+                    print(f"[WARNING] Camera {self._index}: frame is all black! "
+                          f"This may be caused by MSMF hardware transforms. "
+                          f"OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS={os.environ.get('OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS', 'not set')}")
+                    _black_frame_warned = True
                 with self._frame_lock:
                     self._latest_frame = frame
             time.sleep(0.001)

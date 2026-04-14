@@ -108,12 +108,13 @@ class MuJoCoIK:
         
         return position, rotation
     
-    def jacobian(self, joint_angles: Optional[np.ndarray] = None) -> np.ndarray:
+    def jacobian(self, joint_angles: Optional[np.ndarray] = None, skip_forward: bool = False) -> np.ndarray:
         """
         计算雅可比矩阵
         
         Args:
             joint_angles: 关节角度 (可选，默认使用当前状态)
+            skip_forward: 是否跳过 mj_forward（如果刚调用过 forward_kinematics 则为 True）
             
         Returns:
             雅可比矩阵 (6 x n_joints)
@@ -124,8 +125,9 @@ class MuJoCoIK:
                 if i < len(joint_angles):
                     self.data.qpos[qpos_adr] = joint_angles[i]
         
-        # 使用 mj_forward 确保完整的数据更新
-        mujoco.mj_forward(self.model, self.data)
+        # 只有在需要时才调用 mj_forward
+        if not skip_forward:
+            mujoco.mj_forward(self.model, self.data)
         
         # 计算雅可比矩阵
         jacp = np.zeros((3, self.model.nv))  # 位置雅可比
@@ -141,13 +143,13 @@ class MuJoCoIK:
         
         return jacobian
     
-    def inverse_kinematics(self, 
+    def inverse_kinematics(self,
                           target_position: np.ndarray,
                           target_orientation: Optional[np.ndarray] = None,
                           initial_guess: Optional[np.ndarray] = None,
-                          max_iterations: int = 100,
-                          tolerance: float = 1e-4,
-                          damping: float = 0.1) -> np.ndarray:
+                          max_iterations: int = 50,  # 增加默认迭代次数
+                          tolerance: float = 5e-4,   # 收紧容差到 0.5mm
+                          damping: float = 0.05) -> np.ndarray:
         """
         逆运动学：阻尼最小二乘法 (DLS)
         返回关节角；求解状态可通过 get_last_solve_info() 获取。
@@ -163,8 +165,8 @@ class MuJoCoIK:
         if q.shape[0] != self.n_joints:
             raise ValueError(f"Expected initial_guess with shape ({self.n_joints},), got {q.shape}")
 
-        step_scale = 0.5
-        max_step_norm = 0.25
+        step_scale = 0.6  # 增大步长缩放，加快收敛
+        max_step_norm = 0.2  # 减小最大步长，提高精度
         success = False
         pos_err_norm = float('inf')
         rot_err_norm = float('inf')
@@ -190,7 +192,9 @@ class MuJoCoIK:
                 success = True
                 break
 
-            J = self.jacobian(q)
+            # 关键优化：forward_kinematics_with_orientation 已调用 mj_forward
+            # 这里跳过重复调用
+            J = self.jacobian(q, skip_forward=True)
             if target_orientation is None:
                 J = J[:3, :]
 

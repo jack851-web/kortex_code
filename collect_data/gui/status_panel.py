@@ -18,33 +18,28 @@ class StatusPanel(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
-        
-        # 任务状态组
-        task_group = QGroupBox("任务状态")
-        task_layout = QVBoxLayout(task_group)
-        
+
         # 当前任务
         self._task_label = QLabel("当前任务: -")
-        task_layout.addWidget(self._task_label)
-        
+        self._task_label.setStyleSheet("font-size: 13px;")
+        layout.addWidget(self._task_label)
+
         # 进度
         progress_layout = QHBoxLayout()
         self._progress_label = QLabel("进度: 0/0")
         progress_layout.addWidget(self._progress_label)
-        
+
         self._progress_bar = QProgressBar()
         self._progress_bar.setMaximum(100)
         self._progress_bar.setValue(0)
         progress_layout.addWidget(self._progress_bar, stretch=1)
-        task_layout.addLayout(progress_layout)
-        
+        layout.addLayout(progress_layout)
+
         # 状态
         self._status_label = QLabel("就绪")
-        self._status_label.setStyleSheet("font-weight: bold; color: #666;")
-        task_layout.addWidget(self._status_label)
-        
-        layout.addWidget(task_group)
-        
+        self._status_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #666;")
+        layout.addWidget(self._status_label)
+
         # 机器人状态组
         self._robot_group = QGroupBox("机器人状态")
         robot_layout = QVBoxLayout(self._robot_group)

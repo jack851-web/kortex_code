@@ -1,3 +1,10 @@
+"""
+【已弃用】旧版数据收集器 - 仅保留向后兼容
+
+请使用:
+- scripts.real.data_collector.RealDataCollector
+- scripts.simu.data_collector.SimuDataCollector
+"""
 import json
 import os
 import time
@@ -40,6 +47,12 @@ def create_video_from_images(image_list: List[bytes], output_path: Path, fps: in
 
 
 class DataCollector:
+    """【已弃用】旧版数据收集器
+    
+    请迁移到:
+    - RealDataCollector (scripts.real.data_collector)
+    - SimuDataCollector (scripts.simu.data_collector)
+    """
     def __init__(
         self,
         real_interface,

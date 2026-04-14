@@ -13,8 +13,8 @@ from scripts import (
     SyncController,
     GraspExecutor,
 )
-from scripts.real_data_collector import RealDataCollector
-from scripts.simu_data_collector import SimuDataCollector
+from scripts.real.data_collector import RealDataCollector
+from scripts.simu.data_collector import SimuDataCollector
 
 
 class DataCollectionSystem:
@@ -64,7 +64,7 @@ class DataCollectionSystem:
         dataset_config = self._config.get("dataset", {})
         camera_config = self._config.get("cameras", {})
 
-        self._simu_base_xml_path = simu_config.get("scene_base_xml_path", simu_config.get("xml_path", ""))
+        self._simu_base_xml_path = simu_config.get("xml_path", "")
         self._object_library = simu_config.get("object_library", {})
 
         # 仿真初始关节（可在 config 里设置，支持 rad/deg）
@@ -80,11 +80,15 @@ class DataCollectionSystem:
             print(f"[Config] simulation.initial_joints loaded ({sim_init_unit}): {sim_init_joints[:6]}")
         
         real_camera_config = camera_config.get("real", {})
-        simu_camera_config = camera_config.get("simu", {})
+        _simu_cam_cfg = camera_config.get("simu", [])
+        # cameras.simu 支持列表 [name, ...] 或字典 {name: {...}} 格式
+        if isinstance(_simu_cam_cfg, list):
+            self._simu_camera_names = _simu_cam_cfg if _simu_cam_cfg else ['agentview', 'topview']
+        else:
+            self._simu_camera_names = list(_simu_cam_cfg.keys()) if _simu_cam_cfg else ['agentview', 'topview']
         
         # 保存相机名称供后续使用
         self._real_camera_names = list(real_camera_config.keys()) if real_camera_config else []
-        self._simu_camera_names = list(simu_camera_config.keys()) if simu_camera_config else ['agentview', 'topview']
 
         if self._use_mock:
             print("Using simulation-only mode (IK enabled)")
@@ -92,7 +96,7 @@ class DataCollectionSystem:
             self._real.connect("mock")
             self._simu = SimuInterface(
                 simu_config.get("xml_path", ""),
-                camera_names=list(simu_camera_config.keys()),
+                camera_names=self._simu_camera_names,
                 use_ik=True,
             )
         else:
@@ -111,7 +115,7 @@ class DataCollectionSystem:
                 return False
             self._simu = SimuInterface(
                 simu_config.get("xml_path", ""),
-                camera_names=list(simu_camera_config.keys()),
+                camera_names=self._simu_camera_names,
                 use_ik=False,
             )
 
@@ -121,7 +125,7 @@ class DataCollectionSystem:
 
         self._apply_sim_initial_joints()
 
-        simu_camera_names = list(simu_camera_config.keys()) if simu_camera_config else ['agentview', 'topview']
+        simu_camera_names = self._simu_camera_names
         self._simu.set_display_cameras(simu_camera_names)
 
         # 启动进程渲染器（提高性能且避免缓冲区共享）
