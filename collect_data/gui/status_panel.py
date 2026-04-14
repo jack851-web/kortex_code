@@ -35,6 +35,17 @@ class StatusPanel(QWidget):
         progress_layout.addWidget(self._progress_bar, stretch=1)
         layout.addLayout(progress_layout)
 
+        # 计时显示
+        timer_layout = QHBoxLayout()
+        self._timer_label_title = QLabel("任务计时:")
+        self._timer_label_title.setStyleSheet("font-size: 13px;")
+        timer_layout.addWidget(self._timer_label_title)
+        self._timer_label = QLabel("00:00")
+        self._timer_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2196F3;")
+        timer_layout.addWidget(self._timer_label)
+        timer_layout.addStretch()
+        layout.addLayout(timer_layout)
+
         # 状态
         self._status_label = QLabel("就绪")
         self._status_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #666;")
@@ -173,3 +184,18 @@ class StatusPanel(QWidget):
     def update_simu_gripper(self, position: float):
         """更新仿真夹爪状态"""
         self._simu_gripper_label.setText(f"夹爪: {position:.2f}")
+
+    def update_timer(self, elapsed_seconds: float):
+        """更新计时显示
+
+        Args:
+            elapsed_seconds: 已用时间（秒）
+        """
+        total_seconds = int(elapsed_seconds)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        self._timer_label.setText(f"{minutes:02d}:{seconds:02d}")
+
+    def reset_timer(self):
+        """重置计时显示"""
+        self._timer_label.setText("00:00")

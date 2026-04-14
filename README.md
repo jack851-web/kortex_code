@@ -1,219 +1,78 @@
 # Kortex Code - 机器人数据收集与仿真系统
 
-基于 MuJoCo 仿真的 Kinova Gen3 Lite 机械臂数据收集系统，支持实机遥操作与仿真环境，用于 Vision-Language-Action (VLA) 模型训练数据采集。
-
-## 功能特性
-
-- **双模式运行**: 支持实机模式和仿真模式
-- **MuJoCo 物理仿真**: 高精度物理引擎，支持刚体动力学和碰撞检测
-- **逆运动学求解**: 基于 MuJoCo 的实时 IK 求解器
-- **多相机支持**: 支持多视角相机渲染和数据采集
-- **键盘遥操作**: 类似 lerobot 的键盘控制方式
-- **数据集格式**: 兼容 LeRobot 数据集格式，支持 HuggingFace 上传
+基于 MuJoCo 的 Kinova Gen3 Lite 机械臂开发框架，支持数据收集、仿真控制和模型评估。
 
 ## 项目结构
 
 ```
 kortex_code/
-├── collect_data/                 # 数据收集模块
-│   ├── main_qt.py               # 主程序入口
-│   ├── config/                  # 配置文件
-│   │   └── tasks_config.yaml    # 任务和物体配置
-│   ├── gui/                     # Qt GUI 界面
-│   │   ├── main_window.py       # 主窗口
-│   │   ├── mock_task_tuner_window.py  # Mock模式调参窗口
-│   │   └── camera_widget.py     # 相机显示组件
-│   └── scripts/                 # 核心脚本
-│       ├── real_interface.py    # 真实机器人接口
-│       ├── simu_interface.py    # 仿真接口
-│       ├── grasp_executor.py    # 抓取执行器
-│       ├── sync_controller.py   # 虚实同步控制器
-│       └── data_collector.py    # 数据收集器
-│
-├── kortex_simu/                 # 仿真环境模块
-│   ├── ik/                      # 逆运动学求解
-│   │   ├── mujoco_ik.py         # MuJoCo IK 求解器
-│   │   └── simulation_controller.py  # 仿真控制器
-│   └── simu/                    # 仿真场景
-│       ├── env/                 # 环境配置
-│       │   └── task_pick_place.xml  # 抓取任务场景
-│       ├── robot/               # 机器人模型
-│       │   └── gen3_lite_gen3_lite_2f.xml  # Gen3 Lite 模型
-│       └── object/              # 物体模型库
-│           ├── cup/             # 杯子
-│           ├── mug_5/           # 马克杯
-│           ├── plate/           # 盘子
-│           └── plate_11/        # 大盘子
+├── collect_data/           # 数据收集模块 → [TASK_PLAN.md](collect_data/TASK_PLAN.md)
+├── kortex_simu/            # MuJoCo 仿真环境
+│   ├── ik/                 # 逆运动学求解
+│   └── simu/               # 场景、机器人、物体模型
+├── eval/                   # 模型评估模块 → [EVAL_DESIGN.md](eval/EVAL_DESIGN.md)
+└── environment.yml         # conda 环境配置
 ```
 
-## 环境要求
+## 环境配置
 
-- Python 3.8+
-- MuJoCo 3.0+
-- PyQt5
-- NumPy
-- OpenCV
-- PyYAML
-
-## 安装
+### 方法一：使用 conda 环境文件（推荐）
 
 ```bash
-# 克隆项目
-git clone https://github.com/your-repo/kortex_code.git
+# 1. 安装 lerobot（必须先安装）
+git clone https://github.com/huggingface/lerobot.git
+cd lerobot && pip install -e .
+
+# 2. 创建 conda 环境
 cd kortex_code
-
-# 安装依赖
-pip install mujoco PyQt5 numpy opencv-python pyyaml
-
-# 可选：安装 LeRobot 用于数据处理
-pip install lerobot
+conda env create -f environment.yml
+conda activate lerobot
 ```
+
+### 方法二：手动配置
+
+```bash
+# 1. 安装 lerobot
+git clone https://github.com/huggingface/lerobot.git
+cd lerobot && pip install -e .
+
+# 2. 创建环境
+conda create -n lerobot python=3.10
+conda activate lerobot
+
+# 3. 安装依赖
+pip install mujoco PyQt5 numpy opencv-python pyyaml torch
+pip install rerun==1.0.31 rerun-sdk==0.31.2
+```
+
+## 模块说明
+
+| 模块 | 说明 | 详细文档 |
+|------|------|----------|
+| **collect_data** | 实机/仿真数据收集，LeRobot v3.0 格式输出 | [TASK_PLAN.md](collect_data/TASK_PLAN.md) |
+| **kortex_simu** | MuJoCo 仿真场景、IK 求解、物体模型 | - |
+| **eval** | 训练模型评估（无头模式，支持远程 GPU） | [EVAL_DESIGN.md](eval/EVAL_DESIGN.md) |
 
 ## 快速开始
 
-### Mock 模式（仿真独立模式）
-
 ```bash
 cd collect_data
+
+# Mock 模式（纯仿真）
 python main_qt.py --mock
-```
 
-Mock 模式特性：
-- 独立的 GLFW MuJoCo 可视化窗口
-- 键盘控制机械臂移动
-- 多视口相机布局
-- 无需实机连接
-
-### Real 模式（实机模式）
-
-```bash
-cd collect_data
+# Real 模式（实机连接）
 python main_qt.py --real
 ```
 
-Real 模式特性：
-- 同步真实机器人和仿真环境
-- 自动吸附机制辅助抓取
-- 实时数据采集
+## 依赖说明
 
-## 键盘控制（Mock 模式）
-
-| 按键 | 功能 |
-|------|------|
-| W/S | 前后移动 (Y轴) |
-| A/D | 左右移动 (X轴) |
-| R/F | 上下移动 (Z轴) |
-| Q/E | 旋转末端执行器 |
-| Space | 切换夹爪开合 |
-| 1-6 | 预设关节位置 |
-
-## 配置说明
-
-### 任务配置 (`tasks_config.yaml`)
-
-```yaml
-robot:
-  ip: "192.168.1.10"
-  control_mode: "joint"
-  gripper_enabled: true
-
-simulation:
-  xml_path: "path/to/task_pick_place.xml"
-  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
-  
-  object_library:
-    cup:
-      model_xml_path: "path/to/cup/model.xml"
-      body_name: "body_obj_cup"
-
-tasks:
-  task1:
-    object_name: "cup"
-    object_position: [0.35, 0.15, 0.44]
-    plate_position: [0.35, -0.15, 0.44]
-    description: "grasp cup and place to right side"
-```
-
-### 物体配置
-
-每个物体需要提供：
-- `model_xml_path`: MuJoCo 模型 XML 文件路径
-- `body_name`: 物体在场景中的 body 名称
-
-## 数据集格式
-
-采集的数据遵循 LeRobot 格式：
-
-```
-data/
-├── Real/
-│   ├── realdata/           # 实机数据
-│   │   └── episode_001/
-│   │       ├── action/
-│   │       │   └── action.json
-│   │       ├── observation/
-│   │       │   └── top_image/
-│   │       │       └── frame_*.png
-│   │       ├── state.json
-│   │       └── metadata.json
-│   └── simudata/           # 同步仿真数据
-└── Simu/
-    └── simu_data/          # 纯仿真数据
-```
-
-## 核心模块
-
-### SimuInterface
-
-仿真接口类，提供：
-- MuJoCo 模型加载和管理
-- GLFW 可视化窗口
-- IK 求解和运动控制
-- 多相机渲染
-- 物体动态加载
-
-### GraspExecutor
-
-抓取任务执行器：
-- 预抓取位姿计算
-- 抓取轨迹规划
-- 物体类型适配
-- 抬升和放置动作
-
-### SyncController
-
-虚实同步控制器：
-- 实时关节状态同步
-- 物体吸附机制
-- 状态监控
-
-## 开发指南
-
-### 添加新物体
-
-1. 准备物体模型（OBJ 格式）
-2. 创建 MuJoCo XML 模型文件
-3. 在 `tasks_config.yaml` 中注册物体
-
-### 自定义任务
-
-在 `tasks_config.yaml` 的 `tasks` 部分添加新任务：
-
-```yaml
-tasks:
-  task_custom:
-    object_name: "cup"
-    object_position: [x, y, z]
-    plate_position: [x, y, z]
-    description: "custom task description"
-```
+- **MuJoCo 3.0+** - 物理仿真
+- **PyQt5** - GUI 界面
+- **LeRobot** - 数据格式、训练框架
+- **PyTorch** - 模型推理
+- **OpenCV** - 图像处理
 
 ## 许可证
 
 MIT License
-
-## 致谢
-
-- [MuJoCo](https://mujoco.org/) - 物理仿真引擎
-- [LeRobot](https://github.com/huggingface/lerobot) - 数据集格式参考
-- [Kinova Robotics](https://www.kinovarobotics.com/) - Gen3 Lite 机械臂

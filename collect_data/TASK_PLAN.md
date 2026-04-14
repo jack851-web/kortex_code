@@ -2,55 +2,73 @@
 
 ## 项目概述
 
-本项目旨在实现一个实机与仿真同步的数据收集系统，用于抓取任务的数据采集。通过实机机械臂与Mujoco仿真环境的同步控制，自动化收集LeRobot格式的数据集。
+本项目是一个实机与仿真同步的数据收集系统，支持 **Mock 模式**（纯仿真）和 **Real 模式**（实机同步），用于抓取任务的数据采集。通过 MuJoCo 仿真环境与 Kinova Gen3 Lite 机械臂的协同控制，自动化收集 LeRobot v3.0 格式的数据集。
+
+### 核心特性
+
+- **双模式运行**: Mock 模式（纯仿真 IK 控制）和 Real 模式（实机同步 + 吸附机制）
+- **MuJoCo 物理仿真**: 高精度物理引擎，支持刚体动力学和碰撞检测
+- **逆运动学求解**: 基于 MuJoCo 的实时 IK 求解器
+- **多相机支持**: 支持多视角相机渲染和数据采集
+- **键盘遥操作**: 类似 lerobot 的键盘控制方式
+- **随机位置生成**: 支持 `random` 关键字自动生成物体位置
+- **LeRobot v3.0 格式**: 兼容 HuggingFace 数据集格式
 
 ---
 
-## 功能需求详细描述
+## 功能模块
 
-### 1. 实机数据采集模块
+### 1. 实机数据采集模块 (`scripts/real/`)
+
 **功能**：获取实机机械臂关节状态和相机图像数据
-- 通过网络连接获取Gen3 Lite机械臂的实时关节角度
-- 从多个相机（top、wrist等）获取RGB图像
+- 通过网络连接获取 Gen3 Lite 机械臂的实时关节角度
+- 从多个相机（top、side、hand）获取 RGB 图像
 - 支持实时数据流输出到仿真环境
+- 发布数据到消息总线供其他模块订阅
 
-### 2. 仿真跟随模块
-**功能**：将实机关节状态映射到Mujoco仿真环境
-- 接收实机关节角度
-- 同步控制仿真机械臂跟随实机运动
-- 保持实机与仿真的状态一致性
+### 2. 仿真环境模块 (`scripts/simu/`)
 
-### 3. 抓取任务执行模块
+**功能**：MuJoCo 仿真环境管理
+- 加载和管理 MuJoCo 模型
+- GLFW 可视化窗口渲染
+- IK 求解和运动控制
+- 多相机渲染
+- 物体动态加载和位置控制
+- 流式视频编码
+
+### 3. 同步控制模块 (`scripts/control/`)
+
+**功能**：实机-仿真状态同步
+- 实时关节状态同步
+- 物体吸附机制（Real 模式）
+- 状态一致性检查
+- 异常处理与恢复
+
+### 4. 抓取执行模块 (`scripts/control/`)
+
 **功能**：执行预定义路径点的抓取任务
-- 读取任务配置（100个任务目标位置）
-- 按固定路径点执行抓取：
-  1. 移动到预抓取位置
-  2. 下沉接近物体
-  3. 闭合夹爪抓取
-  4. 抬起物体
-  5. 移动到放置位置
-  6. 释放夹爪
-- 记录每个动作的图像和状态数据
+- 预抓取位姿计算
+- 抓取轨迹规划
+- 物体类型适配（cup、mug、plate 等）
+- 抬升和放置动作
+- 支持键盘微调（Mock 模式）
 
-### 4. 自动化数据集构建模块
-**功能**：自动化收集LeRobot格式数据集
-- 任务列表定义（目标物体位置）
-- 自动执行完一个任务后暂停
-- 提示人工切换物品位置
-- 继续执行下一个任务
-- 支持断点续传
+### 5. 数据收集模块 (`scripts/simu/data_collector.py`, `scripts/real/data_collector.py`)
 
-### 5. 双路数据同步采集
-**功能**：同时收集实机和仿真数据
-- 实机侧：关节角度 + 相机图像
-- 仿真侧：关节角度 + 仿真图像（可选）
-- 同一时间戳存储，便于后续对齐
+**功能**：LeRobot v3.0 格式数据收集
+- LeRobot API 直录
+- 流式视频编码 (libsvtav1)
+- Episode 管理
+- 进度保存与恢复
+- Chunk/File 自动管理
 
-### 6. 仿真物体位置控制
-**功能**：每个任务执行后自动更新仿真物体位置
-- 读取下一个任务的目标物体位置
-- 在仿真环境中移动物体到指定位置
-- 无需人工干预仿真侧
+### 6. 消息总线模块 (`scripts/core/`)
+
+**功能**：模块间通信
+- 发布-订阅模式
+- 实机数据发布
+- 仿真数据发布
+- 线程安全
 
 ---
 
@@ -58,314 +76,476 @@
 
 ```
 collect_data/
-├── config/
-│   └── tasks_config.yaml      # 任务列表配置
-├── scripts/
-│   ├── __init__.py
-│   ├── real_interface.py       # 实机接口封装
-│   ├── simu_interface.py      # 仿真接口封装
-│   ├── sync_controller.py     # 同步控制器
-│   ├── grasp_executor.py       # 抓取任务执行器
-│   └── data_collector.py      # 数据收集器
-├── main.py                     # 主程序入口
-└── README.md
+├── main_qt.py                   # 主程序入口（Qt GUI）
+├── config/                      # 配置文件
+│   ├── tasks_config.yaml        # 任务和物体配置（实机模式）
+│   ├── real_config.yaml         # 实机模式配置
+│   ├── simu_config.yaml         # 仿真模式配置
+│   └── object/                  # 物体特定配置
+│       └── cup.yaml
+├── gui/                         # Qt GUI 界面
+│   ├── main_window.py           # 主窗口
+│   ├── mock_task_tuner_window.py # Mock模式调参窗口
+│   └── camera_widget.py         # 相机显示组件
+├── scripts/                     # 核心脚本
+│   ├── control/                 # 控制模块
+│   │   ├── grasp_executor.py    # 抓取执行器
+│   │   └── sync_controller.py   # 虚实同步控制器
+│   ├── core/                    # 核心模块
+│   │   ├── message_bus.py       # 消息总线
+│   │   └── topic_defs.py        # 主题定义
+│   ├── real/                    # 实机模块
+│   │   ├── interface.py         # 真实机器人接口
+│   │   ├── data_collector.py    # 实机数据收集器
+│   │   ├── publisher.py         # 实机数据发布者
+│   │   └── camera.py            # 相机接口
+│   ├── simu/                    # 仿真模块
+│   │   ├── interface.py         # 仿真接口
+│   │   ├── data_collector.py    # 仿真数据收集器
+│   │   ├── manager.py           # 仿真管理器
+│   │   ├── publisher.py         # 仿真数据发布者
+│   │   └── render_process.py    # 渲染进程
+│   └── _legacy/                 # 旧版代码（已弃用）
+└── TASK_PLAN.md                 # 本文档
 ```
 
 ---
 
-## 实施计划
+## 工作流程
 
-### 阶段1：环境搭建与接口封装（1-2天）
+### Mock 模式工作流程
 
-**任务1.1**：创建项目目录结构
 ```
-collect_data/
-├── config/
-├── scripts/
-├── data/          # 收集的数据存放
-└── logs/          # 日志存放
-```
-
-**任务1.2**：实现实机接口（`real_interface.py`）
-- 封装Gen3Lite类连接
-- 实现关节状态读取
-- 实现夹爪控制
-- 实现相机图像读取
-
-**任务1.3**：实现仿真接口（`simu_interface.py`）
-- 封装SimpleEnv环境
-- 实现关节状态设置与读取
-- 实现物体位置控制
-- 实现图像渲染
-
-### 阶段2：同步控制器开发（1-2天）
-
-**任务2.1**：实现同步控制（`sync_controller.py`）
-- 创建实机-仿真状态同步线程
-- 实现关节角度映射
-- 添加状态一致性检查
-- 处理异常情况
-
-**任务2.2**：实现仿真跟随模式
-- 实机运动时仿真实时跟随
-- 支持平滑插值
-- 添加延迟补偿
-
-### 阶段3：抓取执行器开发（2-3天）
-
-**任务3.1**：设计抓取路径点
-```python
-# 标准抓取路径
-HOME_POSITION = [0°, 0°, 0°, 0°, 0°, 0°]
-PRE_GRASP = [x, y, z_above, roll, pitch, yaw]
-GRASP = [x, y, z_on_object, roll, pitch, yaw]
-LIFT = [x, y, z_above, roll, pitch, yaw]
-PLACE = [x_target, y_target, z_above, roll, pitch, yaw]
+┌─────────────────────────────────────────────────────────────┐
+│                     Mock 模式工作流程                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 启动程序                                                 │
+│     python main_qt.py --mock                                │
+│            │                                                │
+│            ▼                                                │
+│  2. 初始化仿真环境                                           │
+│     - 加载 MuJoCo 模型                                       │
+│     - 启动 GLFW 可视化窗口                                   │
+│     - 初始化 IK 求解器                                       │
+│            │                                                │
+│            ▼                                                │
+│  3. 加载任务配置                                             │
+│     - 从 simu_config.yaml 读取任务列表                       │
+│     - 支持 object_position: "random" 随机生成               │
+│            │                                                │
+│            ▼                                                │
+│  4. 执行任务                                                 │
+│     ┌─────────────────────────────────────────┐             │
+│     │  a. IK 解算到预抓取位置                  │             │
+│     │  b. 键盘微调位置                         │             │
+│     │  c. 下降到抓取位置                       │             │
+│     │  d. 闭合夹爪                            │             │
+│     │  e. 抬升物体                            │             │
+│     │  f. IK 解算到放置位置                   │             │
+│     │  g. 下降放置                            │             │
+│     │  h. 松开夹爪                            │             │
+│     │  i. 返回初始位置                        │             │
+│     └─────────────────────────────────────────┘             │
+│            │                                                │
+│            ▼                                                │
+│  5. 保存数据集                                               │
+│     - LeRobot v3.0 格式                                      │
+│     - 视频流式编码 (libsvtav1)                               │
+│            │                                                │
+│            ▼                                                │
+│  6. 下一个任务或结束                                         │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**任务3.2**：实现抓取流程（`grasp_executor.py`）
-- 路径点插值平滑移动
-- 夹爪开闭时序控制
-- 抓取成功检测
-- 异常处理与恢复
+### Real 模式工作流程
 
-### 阶段4：数据收集器开发（2-3天）
-
-**任务4.1**：配置任务列表（`config/tasks_config.yaml`）
-```yaml
-tasks:
-  - task_id: 1
-    object_position: [0.3, 0.0, 0.05]
-    target_position: [0.4, 0.2, 0.05]
-    description: "抓取红色方块放到蓝色目标"
-  - task_id: 2
-    object_position: [0.25, -0.1, 0.05]
-    target_position: [0.35, 0.15, 0.05]
-  # ... 共100个任务
 ```
-
-**任务4.2**：实现数据收集（`data_collector.py`）
-- LeRobot数据集格式封装
-- 图像+状态同步存储
-- 任务进度保存与加载
-- 统计信息记录
-
-### 阶段5：主程序集成（1-2天）
-
-**任务5.1**：实现主程序（`main.py`）
-- 启动实机连接
-- 启动仿真环境
-- 启动同步控制
-- 加载任务配置
-- 执行数据收集主循环
-
-**任务5.2**：添加交互功能
-- 任务完成后暂停提示
-- 人工确认继续
-- 进度显示
-- 中断保存
-
-### 阶段6：测试与优化（2-3天）
-
-**任务6.1**：单元测试
-- 实机接口测试
-- 仿真接口测试
-- 同步控制测试
-
-**任务6.2**：集成测试
-- 端到端流程测试
-- 100个任务连续执行测试
-- 数据质量检查
-
-**任务6.3**：优化
-- 同步延迟优化
-- 数据存储效率优化
-- 异常处理完善
+┌─────────────────────────────────────────────────────────────┐
+│                     Real 模式工作流程                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 启动程序                                                 │
+│     python main_qt.py --real                                │
+│            │                                                │
+│            ▼                                                │
+│  2. 连接实机                                                 │
+│     - 连接 Kinova 机械臂                                     │
+│     - 连接实机相机                                           │
+│     - 初始化仿真环境（同步用）                               │
+│            │                                                │
+│            ▼                                                │
+│  3. 同步控制                                                 │
+│     ┌─────────────────────────────────────────┐             │
+│     │  实机关节状态 ──→ 仿真关节状态           │             │
+│     │        │                                │             │
+│     │        ▼                                │             │
+│     │  吸附机制：夹爪接近物体时自动吸附        │             │
+│     │        │                                │             │
+│     │        ▼                                │             │
+│     │  仿真物体跟随夹爪移动                    │             │
+│     └─────────────────────────────────────────┘             │
+│            │                                                │
+│            ▼                                                │
+│  4. 执行任务                                                 │
+│     - 遥操作控制实机                                         │
+│     - 仿真同步显示                                           │
+│     - 自动吸附辅助抓取                                       │
+│            │                                                │
+│            ▼                                                │
+│  5. 保存双数据流                                             │
+│     ┌─────────────────────────────────────────┐             │
+│     │  realdata/  - 实机相机数据              │             │
+│     │  simudata/  - 同步仿真数据              │             │
+│     └─────────────────────────────────────────┘             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 接口定义
 
-### RealInterface
+### RealInterface (`scripts/real/interface.py`)
+
 ```python
 class RealInterface:
     def connect(self, ip: str) -> bool
-    def get_joint_state(self) -> np.ndarray  # 返回6个关节角度
-    def set_joint_target(self, joints: np.ndarray) -> bool
-    def get_gripper_state(self) -> float  # 0.0-1.0
-    def set_gripper(self, position: float) -> bool
-    def get_camera_images(self) -> dict  # {"top": image, "wrist": image}
     def disconnect(self)
+    def get_joint_state(self) -> np.ndarray      # 返回6个关节角度（度）
+    def get_gripper_state(self) -> float         # 0.0-1.0
+    def get_camera_images(self) -> dict          # {"top": image, ...}
+    def get_full_state(self) -> Tuple[np.ndarray, np.ndarray, float]
+    def is_connected(self) -> bool
 ```
 
-### SimuInterface
+### SimuInterface (`scripts/simu/interface.py`)
+
 ```python
 class SimuInterface:
-    def __init__(self, xml_path: str)
+    def __init__(self, xml_path: str, use_ik: bool = False)
+    
+    # 关节控制
     def set_joint_state(self, joints: np.ndarray) -> bool
     def get_joint_state(self) -> np.ndarray
+    
+    # IK 控制
+    def set_end_effector_pose(self, position: np.ndarray, orientation: np.ndarray) -> bool
+    def get_end_effector_pose(self) -> Tuple[np.ndarray, np.ndarray]
+    
+    # 物体控制
     def set_object_position(self, name: str, position: np.ndarray) -> bool
     def get_object_position(self, name: str) -> np.ndarray
+    def attach_object(self, object_body: str) -> bool
+    def detach_object(self) -> bool
+    
+    # 相机渲染
+    def get_camera_images(self, camera_names: List[str]) -> dict
     def render(self) -> np.ndarray
-    def step(self)
-    def close(self)
+    
+    # 仿真步进
+    def step(self, n_steps: int = 1)
+    
+    # GLFW 可视化
+    def start_glfw_viewer(self)
+    def close_glfw_viewer(self)
 ```
 
-### SyncController
+### GraspExecutor (`scripts/control/grasp_executor.py`)
+
+```python
+class GraspExecutor:
+    def __init__(self, real_interface, simu_interface, home_position: List[float], ...)
+    
+    def set_task(self, object_position: np.ndarray, plate_position: np.ndarray, 
+                 object_type: str = "cube")
+    def set_object_type(self, object_type: str)
+    
+    def move_to_home(self) -> bool
+    def move_to_pre_grasp(self) -> bool
+    def move_to_grasp(self) -> bool
+    def close_gripper(self) -> bool
+    def lift_object(self) -> bool
+    def move_to_place(self) -> bool
+    def release_object(self) -> bool
+    
+    def execute_full_task(self, callback: Callable = None) -> bool
+```
+
+### SyncController (`scripts/control/sync_controller.py`)
+
 ```python
 class SyncController:
-    def __init__(self, real: RealInterface, simu: SimuInterface)
+    def __init__(self, real_interface, simu_interface)
+    
     def start_sync(self)
     def stop_sync(self)
     def is_synced(self) -> bool
+    
+    # 吸附机制
+    def enable_adhesion(self, object_body: str, threshold: float = 0.05)
+    def disable_adhesion(self)
+    def check_and_attach(self) -> bool
+```
+
+### DataCollector (`scripts/simu/data_collector.py`)
+
+```python
+class SimuDataCollector:
+    def __init__(self, simu_interface, data_root: str, fps: int = 20, ...)
+    
+    def start_collection(self)
+    def stop_collection(self)
+    
+    def start_episode(self, episode_id: int, camera_names: list, task_info: dict)
+    def end_episode(self, episode_id: int, success: bool = True) -> bool
+    
+    def start_recording(self)
+    def stop_recording(self)
+    def discard_current_task()
+    
+    def collect_frame(self)
+    def finalize(self)
 ```
 
 ---
 
 ## 数据格式
 
-### 收集的数据结构
+### LeRobot v3.0 数据集结构
+
 ```
 data/
-├── episode_001/
-│   ├── observation/
-│   │   ├── top_image/          # 顶部相机图像序列
-│   │   ├── wrist_image/       # 手腕相机图像序列
-│   │   └── state.json         # 关节状态序列
-│   ├── action/
-│   │   └── action.json        # 动作序列
-│   └── metadata.json           # 任务元信息
-├── episode_002/
-│   └── ...
-└── dataset_info.json           # 数据集总体信息
+├── Real/
+│   ├── realdata/                    # 实机数据
+│   │   ├── meta/
+│   │   │   ├── info.json            # 数据集元信息
+│   │   │   ├── stats.json           # 统计信息
+│   │   │   ├── tasks.parquet        # 任务描述
+│   │   │   └── episodes/            # Episode 元数据
+│   │   │       └── chunk-000/
+│   │   │           └── file-000.parquet
+│   │   ├── videos/                  # 视频数据
+│   │   │   └── observation.images.top/
+│   │   │       └── chunk-000/
+│   │   │           └── file-000.mp4
+│   │   └── data/                    # 状态/动作数据
+│   │       └── chunk-000/
+│   │           └── file-000.parquet
+│   └── simudata/                    # 同步仿真数据（结构相同）
+│
+└── Simu/
+    └── simu_data/                   # 纯仿真数据（结构相同）
 ```
 
-### metadata.json 格式
+### 数据特征
+
+| 特征 | 形状 | 说明 |
+|------|------|------|
+| `observation.state` | (7,) | [6关节角(度), 1夹爪] |
+| `action` | (7,) | [6关节增量(度), 1夹爪增量] |
+| `observation.images.top` | (480, 640, 3) | 顶部相机图像 |
+| `observation.images.side` | (480, 640, 3) | 侧面相机图像 |
+| `observation.images.hand` | (480, 640, 3) | 手眼相机图像 |
+
+### meta/info.json 格式
+
 ```json
 {
-    "task_id": 1,
-    "object_position": [0.3, 0.0, 0.05],
-    "target_position": [0.4, 0.2, 0.05],
-    "start_time": "2024-01-01T10:00:00",
-    "end_time": "2024-01-01T10:01:00",
-    "success": true,
-    "real_joints": [[...], [...], ...],
-    "simu_joints": [[...], [...], ...]
+  "codebase_version": "v3.0",
+  "robot_type": "kortex",
+  "total_episodes": 13,
+  "total_frames": 19700,
+  "total_videos": 39,
+  "total_chunks": 1,
+  "chunks_size": 1000,
+  "data_files_size_in_mb": 100,
+  "video_files_size_in_mb": 200,
+  "fps": 30,
+  "splits": {
+    "train": "0:13"
+  }
 }
 ```
 
 ---
 
-## 任务配置示例
+## 配置说明
 
-### tasks_config.yaml
+### 任务配置 (`config/simu_config.yaml`)
+
 ```yaml
-robot:
-  ip: "192.168.1.10"
-  control_mode: "joint"
-  gripper_enabled: true
-
-cameras:
-  top:
-    type: "opencv"
-    index: 0
-    width: 640
-    height: 480
-  wrist:
-    type: "opencv"
-    index: 1
-    width: 640
-    height: 480
+# 工作空间约束（用于 random 位置生成）
+workspace:
+  table_bounds: [0.25, 0.50, -0.25, 0.25, 0.44]
+  safety_margin: 0.05
+  min_object_plate_distance: 0.15
 
 simulation:
-  xml_path: "./kortex_simu/simu/env/task_pick_place.xml"
-  object_name: "ball"
-  target_name: "place_target"
+  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
+  
+  object_library:
+    cup:
+      model_xml_path: "path/to/cup/model.xml"
+      body_name: "body_obj_cup"
+    mug:
+      model_xml_path: "path/to/mug/model.xml"
+      body_name: "body_obj_mug_5"
 
 grasp:
-  home_position: [0, 0, 0, 0, 0, 0]
-  pre_grasp_offset: [0, 0, 0.1, 0, 0, 0]  # 相对于物体的偏移
-  lift_height: 0.15
-  approach_height: 0.05
-
-dataset:
-  repo_name: "kortex_grasp_data"
-  root: "./collected_data"
-  fps: 20
+  lift_height: 0.1
+  micro_lift_height: 0.02
+  release_lift_height: 0.08
+  
+  object_profiles:
+    default:
+      orientation: [180, 0, 0]
+      pre_grasp_offset: [0, 0, 0.05]
+      grasp_offset: [0.0, 0.0, 0.0]
+      gripper: {open: 0.0, close: 0.65}
+    cup:
+      orientation: [176.02, 5.81, -83.23]
+      pre_grasp_offset: [0, 0, 0.01]
+      grasp_offset: [0.0, 0.012, 0]
+      gripper: {open: 0.80, close: 0.80}
 
 tasks:
-  total: 100
-  positions:
-    - object: [0.3, 0.0, 0.05]
-      target: [0.4, 0.2, 0.05]
-    - object: [0.25, -0.1, 0.05]
-      target: [0.35, 0.15, 0.05]
-    # ... 更多任务
+  task1:
+    object_name: "mug"
+    object_position: [0.35, 0.15, 0.44]  # 固定位置
+    plate_position: [0.35, -0.15, 0.44]
+    description: "grasp mug and place to right side"
+  
+  task2:
+    object_name: "mug"
+    object_position: "random"  # 随机位置
+    plate_position: [0.35, -0.15, 0.44]
+    description: "random grasp and place task"
 ```
 
 ---
 
 ## 使用流程
 
-1. **启动准备**
-   ```bash
-   cd D:\VLA\kortex_code\collect_data
-   python main.py --config config/tasks_config.yaml
-   ```
+### 1. Mock 模式（纯仿真）
 
-2. **系统初始化**
-   - 连接实机机械臂
-   - 启动仿真环境
-   - 建立同步连接
-   - 加载第一个任务
+```bash
+cd D:\VLA\kortex_code\collect_data
+python main_qt.py --mock
+```
 
-3. **数据收集循环**
-   ```
-   for task in tasks:
-       1. 显示任务信息（物体位置、目标位置）
-       2. 提示人工放置物体
-       3. 等待确认开始
-       4. 执行抓取任务
-       5. 保存Episode数据
-       6. 更新仿真物体位置
-       7. 提示切换下一个物体
-       8. 继续下一个任务
-   ```
+**操作步骤**：
+1. 系统自动初始化仿真环境
+2. 加载任务配置
+3. 点击"执行任务"开始
+4. 使用键盘微调位置
+5. 任务完成后自动保存数据
 
-4. **完成**
-   - 显示收集统计
-   - 保存最终数据集
-   - 断开连接
+### 2. Real 模式（实机同步）
+
+```bash
+cd D:\VLA\kortex_code\collect_data
+python main_qt.py --real
+```
+
+**操作步骤**：
+1. 系统连接实机机械臂
+2. 初始化仿真环境
+3. 建立同步连接
+4. 遥操作控制实机执行任务
+5. 系统自动保存双数据流
 
 ---
 
-## 注意事项
+## 键盘控制（Mock 模式）
 
-1. **安全检查**
-   - 实机运动前确认环境安全
-   - 设置关节角度限制
-   - 监控异常情况
-
-2. **数据备份**
-   - 定期保存进度
-   - 支持中断恢复
-   - 验证数据完整性
-
-3. **性能优化**
-   - 图像压缩存储
-   - 多线程数据写入
-   - 内存管理
+| 按键 | 功能 |
+|------|------|
+| W/S | 前后移动 (Y轴) |
+| A/D | 左右移动 (X轴) |
+| R/F | 上下移动 (Z轴) |
+| Q/E | 旋转末端执行器 |
+| Space | 切换夹爪开合 |
+| 1-6 | 预设关节位置 |
+| Enter | 确认当前位置 |
+| Esc | 取消当前操作 |
 
 ---
 
-## 预计开发时间
+## 开发状态
 
-| 阶段 | 内容 | 预计时间 |
-|------|------|----------|
-| 1 | 环境搭建与接口封装 | 1-2天 |
-| 2 | 同步控制器开发 | 1-2天 |
-| 3 | 抓取执行器开发 | 2-3天 |
-| 4 | 数据收集器开发 | 2-3天 |
-| 5 | 主程序集成 | 1-2天 |
-| 6 | 测试与优化 | 2-3天 |
-| **总计** | | **9-15天** |
+### 已完成 ✅
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 1.1 | 项目目录结构 | ✅ 完成 |
+| 1.2 | 实机接口封装 | ✅ 完成 |
+| 1.3 | 仿真接口封装 | ✅ 完成 |
+| 2.1 | 同步控制器 | ✅ 完成 |
+| 2.2 | 仿真跟随模式 | ✅ 完成 |
+| 3.1 | 抓取路径点设计 | ✅ 完成 |
+| 3.2 | 抓取执行器 | ✅ 完成 |
+| 4.1 | 任务配置 | ✅ 完成 |
+| 4.2 | 数据收集器 | ✅ 完成 |
+| 5.1 | 主程序集成 | ✅ 完成 |
+| 5.2 | Qt GUI 界面 | ✅ 完成 |
+| 6.1 | LeRobot v3.0 格式支持 | ✅ 完成 |
+| 6.2 | 随机位置生成 | ✅ 完成 |
+| 6.3 | 键盘遥操作 | ✅ 完成 |
+| 6.4 | GLFW 可视化窗口 | ✅ 完成 |
+
+### 待优化 🔧
+
+| 内容 | 说明 |
+|------|------|
+| 单元测试 | 添加完整的单元测试覆盖 |
+| 性能优化 | 渲染线程优化 |
+| 异常处理 | 完善异常恢复机制 |
+
+---
+
+## 常见问题
+
+### 1. rerun 可视化报错 `missing field 'total_chunks'`
+
+**解决方案**:
+```bash
+pip install --upgrade rerun==1.0.31 rerun-sdk==0.31.2
+```
+
+### 2. 第二次启动数据保存位置
+
+LeRobot 会自动管理数据文件：
+- 每个 episode 保存后检查文件大小
+- 文件大小接近限制时自动创建新文件
+- 文件数量达到 `chunks_size` 时自动创建新 chunk
+
+### 3. GLFW 窗口黑屏
+
+**原因**: OpenGL 上下文冲突或渲染线程问题
+
+**解决方案**: 确保渲染在主线程执行，或使用独立的渲染进程。
+
+### 4. 可视化数据集
+
+```bash
+# 使用 rerun 可视化
+rerun data/Simu/simu_data
+
+# 使用 LeRobot 可视化
+python -m lerobot.common.datasets.visualize_dataset --repo-id local/simu_data --root data/Simu
+```
+
+---
+
+## 许可证
+
+MIT License
+
+## 致谢
+
+- [MuJoCo](https://mujoco.org/) - 物理仿真引擎
+- [LeRobot](https://github.com/huggingface/lerobot) - 数据集格式参考
+- [Kinova Robotics](https://www.kinovarobotics.com/) - Gen3 Lite 机械臂

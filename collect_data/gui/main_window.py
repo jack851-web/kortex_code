@@ -8,6 +8,7 @@
   订阅回调在发布者线程执行，通过 pyqtSignal 安全转到 GUI 线程。
 """
 import sys
+import time
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict
@@ -132,6 +133,11 @@ class MainWindow(QMainWindow):
         self._keys_pressed = set()
         self._teleop_step_size = 0.04
         self._rot_step_size = 12.0
+
+        # 任务计时相关
+        self._task_start_time: float = 0.0  # 任务开始时间
+        self._task_elapsed_paused: float = 0.0  # 暂停时累计的时间
+        self._task_timer_running: bool = False  # 计时器是否运行中
 
         self._init_ui()
         self._init_timer()
@@ -263,6 +269,7 @@ class MainWindow(QMainWindow):
         """
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._update_display_from_cache)
+        self._update_timer.timeout.connect(self._update_task_timer)
         if self._mock_mode:
             self._update_timer.timeout.connect(self._process_keyboard_teleop)
         self._update_timer.start(50)  # 20 FPS 刷新 GUI
@@ -479,6 +486,48 @@ class MainWindow(QMainWindow):
         self._pose_label.setText(f"TCP: x={tcp_pos[0]:.3f} y={tcp_pos[1]:.3f} z={tcp_pos[2]:.3f}")
         self._gripper_label.setText(f"夹爪: {gripper:.3f}")
 
+    # ================================================================
+    # 任务计时功能
+    # ================================================================
+
+    def _start_task_timer(self):
+        """开始任务计时"""
+        self._task_start_time = time.time()
+        self._task_elapsed_paused = 0.0
+        self._task_timer_running = True
+        self._status_panel.reset_timer()
+
+    def _pause_task_timer(self):
+        """暂停任务计时"""
+        if self._task_timer_running:
+            # 记录当前累计时间
+            self._task_elapsed_paused += time.time() - self._task_start_time
+            self._task_timer_running = False
+
+    def _resume_task_timer(self):
+        """继续任务计时"""
+        if not self._task_timer_running:
+            # 重置开始时间，继续计时
+            self._task_start_time = time.time()
+            self._task_timer_running = True
+
+    def _stop_task_timer(self):
+        """停止任务计时"""
+        self._task_timer_running = False
+
+    def _reset_task_timer(self):
+        """重置任务计时"""
+        self._task_start_time = 0.0
+        self._task_elapsed_paused = 0.0
+        self._task_timer_running = False
+        self._status_panel.reset_timer()
+
+    def _update_task_timer(self):
+        """更新任务计时显示（由定时器调用）"""
+        if self._task_timer_running:
+            elapsed = self._task_elapsed_paused + (time.time() - self._task_start_time)
+            self._status_panel.update_timer(elapsed)
+
     def _connect_signals(self):
         """连接控制面板信号"""
         self._control_panel.start_clicked.connect(self._on_start)
@@ -637,6 +686,7 @@ class MainWindow(QMainWindow):
 
         self._log_panel.info("开始数据收集...")
         self._control_panel.set_running(True)
+        self._reset_task_timer()  # 重置计时器
 
         try:
             self._data_system.start_collection(
@@ -656,6 +706,7 @@ class MainWindow(QMainWindow):
         self._log_panel.warning("停止数据收集...")
         self._control_panel.set_busy("停止中...")
         self._status_panel.update_status("停止中", "#ff4444")
+        self._stop_task_timer()  # 停止计时器
         if self._data_system:
             self._run_in_background(self._data_system.stop)
 
@@ -666,6 +717,7 @@ class MainWindow(QMainWindow):
             return
         self._log_panel.info("暂停数据收集")
         self._status_panel.update_status("已暂停", "#ffa500")
+        self._pause_task_timer()  # 暂停计时器
 
         if self._data_system:
             self._data_system.pause()
@@ -677,6 +729,7 @@ class MainWindow(QMainWindow):
             return
         self._log_panel.info("继续数据收集")
         self._status_panel.update_status("运行中", "#44ff44")
+        self._resume_task_timer()  # 继续计时器
 
         if self._data_system:
             self._data_system.resume()
@@ -688,6 +741,7 @@ class MainWindow(QMainWindow):
             return
         self._log_panel.info("跳过当前任务")
         self._control_panel.set_busy("跳过中...")
+        self._stop_task_timer()  # 停止计时器
         if self._data_system:
             self._run_in_background(self._data_system.skip_current_task)
 
@@ -708,6 +762,7 @@ class MainWindow(QMainWindow):
             return
         self._log_panel.warning("重做当前任务")
         self._control_panel.set_busy("重试中...")
+        self._reset_task_timer()  # 重置计时器（重试会重新启动）
         if self._data_system:
             self._run_in_background(self._data_system.retry_current_task)
 
@@ -718,6 +773,7 @@ class MainWindow(QMainWindow):
             return
         self._log_panel.info("手动确认任务完毕")
         self._control_panel.set_busy("完成任务中...")
+        self._stop_task_timer()  # 停止计时器
         if self._data_system:
             self._run_in_background(self._data_system.finish_current_task)
 
@@ -767,6 +823,10 @@ class MainWindow(QMainWindow):
     def _on_update_task_info(self, task_name: str, current: int, total: int):
         """任务信息信号槽（在 GUI 线程执行）"""
         self._status_panel.update_task_info(task_name, current, total)
+        # 当新任务开始时，重置并启动计时器
+        if current > 0:
+            self._reset_task_timer()
+            self._start_task_timer()
 
     def closeEvent(self, event):
         """关闭事件"""

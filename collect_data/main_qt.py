@@ -65,6 +65,7 @@ class DataCollectionSystem:
         self._current_task_index = 0
         self._current_episode = 1
         self._waiting_for_next_task = False  # 等待用户按键执行下一个任务
+        self._real_connected = False  # 真实机器人连接状态
         
         # GUI 回调
         self._log_callback = None
@@ -119,7 +120,84 @@ class DataCollectionSystem:
         new_y = sin_a * x + cos_a * y
         
         return np.array([new_x, new_y, z])
+
+    def _generate_random_position(
+        self,
+        existing_position: Optional[np.ndarray] = None,
+        min_distance: float = 0.15,
+        seed: Optional[int] = None
+    ) -> np.ndarray:
+        """在工作空间内生成随机位置
+        
+        Args:
+            existing_position: 已有位置（如object_position），生成的位置需保持最小距离
+            min_distance: 与已有位置的最小距离（当existing_position不为None时生效）
+            seed: 随机种子（可选，用于调试）
+        
+        Returns:
+            [x, y, z] 随机位置数组
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        
+        # 从配置获取工作空间参数
+        workspace = self._config.get('workspace', {})
+        table_bounds = workspace.get('table_bounds', [0.25, 0.50, -0.25, 0.25, 0.44])
+        safety_margin = workspace.get('safety_margin', 0.05)
+        
+        x_min, x_max = table_bounds[0] + safety_margin, table_bounds[1] - safety_margin
+        y_min, y_max = table_bounds[2] + safety_margin, table_bounds[3] - safety_margin
+        z_surface = table_bounds[4]
+        
+        max_attempts = 100
+        for _ in range(max_attempts):
+            x = np.random.uniform(x_min, x_max)
+            y = np.random.uniform(y_min, y_max)
+            z = z_surface
+            
+            new_pos = np.array([x, y, z])
+            
+            # 如果有已有位置，检查距离
+            if existing_position is not None:
+                distance = np.linalg.norm(new_pos[:2] - existing_position[:2])  # 仅检查xy平面
+                if distance < min_distance:
+                    continue  # 距离太近，重新生成
+            
+            self._log(f"生成随机位置: [{x:.3f}, {y:.3f}, {z:.3f}]", "INFO")
+            return new_pos
+        
+        # 超过最大尝试次数，返回一个默认位置
+        self._log(f"随机位置生成失败（尝试{max_attempts}次），使用默认位置", "WARNING")
+        return np.array([0.35, 0.0, z_surface])
     
+    def _resolve_position(
+        self,
+        position_config,
+        existing_position: Optional[np.ndarray] = None,
+        min_distance: float = 0.15
+    ) -> np.ndarray:
+        """解析位置配置，支持坐标数组或"random"字符串
+        
+        Args:
+            position_config: 位置配置，可以是[x,y,z]数组或"random"字符串
+            existing_position: 已有位置（用于random时保持最小距离）
+            min_distance: 最小距离
+        
+        Returns:
+            [x, y, z] 位置数组
+        """
+        if position_config is None:
+            return np.array([0.35, 0.0, 0.44])
+        
+        if isinstance(position_config, str) and position_config.lower() == "random":
+            return self._generate_random_position(
+                existing_position=existing_position,
+                min_distance=min_distance
+            )
+        
+        # 假设是坐标数组
+        return np.array(position_config[:3], dtype=float)
+
     def load_config(self) -> bool:
         """加载配置文件"""
         try:
@@ -170,20 +248,46 @@ class DataCollectionSystem:
             # 实机模式: 同步真实机器人和仿真
             self._log("使用真实机器人接口", "INFO")
             self._real = RealInterface(camera_config=real_camera_config)
-            if not self._real.connect(robot_config.get('ip', '192.168.1.10')):
-                self._log("连接真实机器人失败", "ERROR")
-                return False
-            self._log("真实机器人已连接", "SUCCESS")
 
-            # 启动真实机器人发布者
-            self._real_publisher = RealPublisher(self._real, self._broker, fps=20)
-            self._real_publisher.start()
+            # 带超时的连接（最多等待5秒）
+            real_connected = False
+            connect_timeout = robot_config.get('connect_timeout', 5.0)
+            robot_ip = robot_config.get('ip', '192.168.1.10')
+
+            connect_result = {'done': False, 'success': False}
+
+            def _connect_thread():
+                try:
+                    connect_result['success'] = self._real.connect(robot_ip)
+                except Exception as e:
+                    self._log(f"连接异常: {e}", "WARNING")
+                    connect_result['success'] = False
+                finally:
+                    connect_result['done'] = True
+
+            t = threading.Thread(target=_connect_thread, daemon=True)
+            t.start()
+            t.join(timeout=connect_timeout)
+
+            if connect_result['done'] and connect_result['success']:
+                real_connected = True
+                self._log("真实机器人已连接", "SUCCESS")
+            else:
+                self._log(f"真实机器人连接超时或失败（等待{connect_timeout}秒），将以离线模式运行", "WARNING")
+                real_connected = False
+
+            self._real_connected = real_connected
+
+            if real_connected:
+                # 启动真实机器人发布者
+                self._real_publisher = RealPublisher(self._real, self._broker, fps=20)
+                self._real_publisher.start()
 
             # 使用 SimuManager 管理仿真（禁用 IK，用于同步）
             if not self._simu_manager.start_simulation(
                 simu_config.get('xml_path', ''),
                 camera_names=self._simu_camera_names,
-                use_ik=False,
+                use_ik=not real_connected,  # 离线时启用 IK
                 fps=20,
                 show_viewer=self._show_simu_viewer,
                 use_process_renderer=True,
@@ -231,8 +335,9 @@ class DataCollectionSystem:
         if real_camera_config:
             first_cam = list(real_camera_config.values())[0]
             video_fps = first_cam.get('fps', 30)
-        
-        if self._use_real:
+
+        if self._use_real and self._real_connected:
+            # 实机已连接：创建实机和仿真数据收集器
             real_data_root = dataset_config.get('real_data_root', './data/Real/realdata')
             simu_data_root = dataset_config.get('simu_data_root', './data/Real/simudata')
             self._real_data_collector = RealDataCollector(
@@ -256,19 +361,20 @@ class DataCollectionSystem:
                 on_sync_callback=self._simu_data_collector.collect_frame
             )
         else:
+            # 离线模式或Mock模式：仅仿真数据收集器
             simu_data_root = dataset_config.get('mock_simu_data_root', dataset_config.get('simu_data_root', './data/Simu/simu_data'))
             self._real_data_collector = None
-            # Mock 模式：启用独立线程收集帧，确保整个任务期间（从 start_recording 到 stop_recording）持续收集数据
+            # 启用独立线程收集帧，确保整个任务期间持续收集数据
             self._simu_data_collector = SimuDataCollector(
-                self._simu_manager.simu,  # 使用 SimuManager 的 simu
+                self._simu_manager.simu,
                 data_root=simu_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
-                run_in_thread=True,  # 启用独立线程，确保键盘控制期间也收集帧
-                broker=self._broker,  # 通过 broker 获取数据
+                run_in_thread=True,
+                broker=self._broker,
             )
             self._sync_controller = None
-        
+
         # 创建抓取执行器
         self._grasp_executor = GraspExecutor(
             self._real,
@@ -277,7 +383,7 @@ class DataCollectionSystem:
             pre_grasp_offset=grasp_config.get('pre_grasp_offset', [0, 0, 0.15]),
             lift_height=grasp_config.get('lift_height', 0.20),
             approach_height=grasp_config.get('approach_height', 0.05),
-            use_simulation=(not self._use_real),
+            use_simulation=(not self._real_connected),  # 离线时使用仿真
         )
         
         if 'default_orientation' in grasp_config:
@@ -294,7 +400,7 @@ class DataCollectionSystem:
         release_lift = grasp_config.get('release_lift_height', 0.08)
         self._grasp_executor.set_release_lift_heights(micro_lift, release_lift)
 
-        if (not self._use_real) and self._simu_data_collector is not None:
+        if (not self._real_connected) and self._simu_data_collector is not None:
             self._grasp_executor.set_frame_callback(self._simu_data_collector.collect_frame)
         
         # 加载进度（恢复上次收集到的 episode 编号）
@@ -364,10 +470,14 @@ class DataCollectionSystem:
         """更新任务信息"""
         if self._task_callback:
             self._task_callback(task_name, current, total)
+
+    def is_real_connected(self) -> bool:
+        """检查真实机器人是否已连接"""
+        return self._real_connected
     
     def get_real_camera_names(self) -> list:
         """获取真实相机名称列表"""
-        if not self._use_real:
+        if not self._real_connected:
             return []
         real_camera_config = self._config.get('cameras', {}).get('real', {})
         return list(real_camera_config.keys()) if real_camera_config else []
@@ -378,14 +488,13 @@ class DataCollectionSystem:
 
     def get_real_camera_config(self) -> dict:
         """获取真实相机配置"""
-        if not self._use_real:
+        if not self._real_connected:
             return {}
         return self._config.get('cameras', {}).get('real', {}) or {}
 
     def get_simu_camera_config(self) -> dict:
         """获取仿真相机配置（仅返回名称列表的兼容结构）"""
         return {name: {} for name in self._simu_camera_names}
-        return self._config.get('cameras', {}).get('simu', {}) or {}
 
     def _apply_sim_initial_joints(self):
         if self._simu is None or self._sim_initial_joints_deg is None:
@@ -578,13 +687,13 @@ class DataCollectionSystem:
                     pass
             
             # 按需启动查看器
-            if self._use_real:
-                # 实机模式：启动被动查看器
+            if self._real_connected:
+                # 实机已连接：启动被动查看器
                 if hasattr(self._simu, 'start_viewer'):
                     self._simu.start_viewer()
                     return True
             else:
-                # Mock 模式：启动 GLFW 查看器
+                # 离线模式：启动 GLFW 查看器
                 if self._show_simu_viewer and hasattr(self._simu, 'start_glfw_viewer'):
                     return self._simu.start_glfw_viewer()
             return False
@@ -829,7 +938,7 @@ class DataCollectionSystem:
             self._sync_controller.clear_adhesion_targets()
 
         # 任务结束：通过 SimuManager 彻底重建仿真（方案B）
-        if not self._use_real and self._simu_manager.is_running:
+        if not self._real_connected and self._simu_manager.is_running:
             try:
                 self._log("正在关闭仿真窗口...", "INFO")
                 self._simu_manager.stop_simulation()
@@ -884,7 +993,7 @@ class DataCollectionSystem:
             progress_collector._save_progress()
         
         # 停止仿真
-        if not self._use_real and self._simu_manager.is_running:
+        if not self._real_connected and self._simu_manager.is_running:
             try:
                 self._log("正在关闭仿真窗口...", "INFO")
                 self._simu_manager.stop_simulation()
@@ -900,8 +1009,15 @@ class DataCollectionSystem:
         """准备单个任务（新模式：不自动完成抓放）"""
         try:
             task_name = task_config.get('description', task_id)
-            object_pos = np.array(task_config.get('object_position', [0.215, -0.614, 0.17]))
-            plate_pos = np.array(task_config.get('plate_position', [0.215, -0.60, 0.17]))
+            
+            # 解析位置配置（支持坐标数组或"random"）
+            object_pos_config = task_config.get('object_position', [0.215, -0.614, 0.17])
+            object_pos = self._resolve_position(object_pos_config)
+            
+            # plate位置需与object保持最小距离
+            min_dist = self._config.get('workspace', {}).get('min_object_plate_distance', 0.15)
+            plate_pos_config = task_config.get('plate_position', [0.215, -0.60, 0.17])
+            plate_pos = self._resolve_position(plate_pos_config, existing_position=object_pos, min_distance=min_dist)
 
             object_name = task_config.get('object_name', 'cube')
             self._grasp_executor.set_object_type(object_name)
@@ -941,10 +1057,10 @@ class DataCollectionSystem:
                     'object_model_xml': object_model_xml,
                     'object_body_name': object_body_name,
                     'camera_names': simu_camera_names,
-                    'use_ik': not self._use_real,  # Mock 模式启用 IK
+                    'use_ik': not self._real_connected,  # 离线模式启用 IK
                     'fps': 20,
                     'show_viewer': False,
-                    'use_process_renderer': self._use_real,
+                    'use_process_renderer': self._real_connected,  # 实机模式使用进程渲染
                 }
 
                 if plate_model_xml:
@@ -1034,7 +1150,8 @@ class DataCollectionSystem:
             self._simu_data_collector.start_recording()
             self._log("数据记录已开始，等待操作...", "INFO")
 
-            if self._use_real:
+            if self._real_connected:
+                # 实机已连接：启动同步控制器
                 if self._sync_controller is not None and hasattr(self._sync_controller, 'set_adhesion_targets'):
                     self._sync_controller.set_adhesion_targets(
                         object_body_name=object_body_name,
@@ -1043,14 +1160,14 @@ class DataCollectionSystem:
                     )
                 self._log("实机模式: 已启动关节同步+吸附机制，请手动抓放", "INFO")
             else:
-                # mock 模式：通过 SimuManager 启动 GLFW 查看器
-                self._log("Mock模式: 仿真已在运行", "INFO")
+                # 离线模式或Mock模式
+                self._log("离线模式: 使用仿真进行操作", "INFO")
                 if self._show_simu_viewer and self._simu is not None:
                     self._log(f"DEBUG: 调用 start_glfw_viewer, _show_simu_viewer={self._show_simu_viewer}", "INFO")
                     viewer_started = self._simu.start_glfw_viewer(
                         width=1200,
                         height=900,
-                        title=f"Mock Mode - {task_config.get('description', task_id)}"
+                        title=f"Offline Mode - {task_config.get('description', task_id)}"
                     )
                     if viewer_started:
                         self._log("GLFW 查看器已启动", "SUCCESS")
@@ -1329,47 +1446,61 @@ class DataCollectionSystem:
 
 def main():
     script_dir = Path(__file__).parent
-    default_config = str(script_dir / "config" / "tasks_config.yaml")
+    real_config = str(script_dir / "config" / "real_config.yaml")
+    simu_config = str(script_dir / "config" / "simu_config.yaml")
+    default_config = str(script_dir / "config" / "tasks_config.yaml")  # 兼容旧配置
     
     parser = argparse.ArgumentParser(description="Kortex 数据收集系统 - Qt GUI")
     parser.add_argument(
         "--config",
         type=str,
-        default=default_config,
-        help="配置文件路径"
+        default=None,
+        help="配置文件路径（不指定则根据模式自动选择）"
     )
     parser.add_argument(
         "--real",
         action="store_true",
-        help="使用真实机器人（实机同步模式）"
+        help="使用真实机器人（实机同步模式），自动使用 real_config.yaml"
     )
     parser.add_argument(
         "--mock",
         action="store_true",
         help="使用模拟接口（测试用）"
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="离线模式：跳过实机连接，仅使用仿真（调试用），自动使用 simu_config.yaml"
+    )
     args = parser.parse_args()
 
     if args.real:
         use_real = True
         mode_name = "实机同步模式"
-    elif args.mock:
+        default_config = real_config
+    elif args.mock or args.offline:
         use_real = False
         mode_name = "模拟模式"
+        default_config = simu_config
     else:
         use_real = False
         mode_name = "模拟模式 (默认)"
+        default_config = simu_config
+    
+    # 如果用户指定了配置文件，优先使用
+    config_path = args.config if args.config else default_config
 
     print(f"启动模式: {mode_name}")
+    print(f"配置文件: {config_path}")
 
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 
-    window = MainWindow(args.config, mock_mode=not use_real)
+    window = MainWindow(config_path, mock_mode=not use_real)
     window.show()
 
     system = DataCollectionSystem(
-        args.config,
+        config_path,
         use_real=use_real,
         show_simu_viewer=not use_real
     )
@@ -1386,6 +1517,11 @@ def main():
     if not system.initialize():
         window.log("系统初始化失败", "ERROR")
         return 1
+
+    # 检查实机连接状态
+    if use_real and not system.is_real_connected():
+        window.log("⚠️ 实机未连接，以离线模式运行（仅仿真）", "WARNING")
+        window.update_status("离线模式（实机未连接）", "#ffa500")
 
     # 始终设置相机显示（模拟模式下实机相机为空列表）
     window.setup_cameras(

@@ -1,0 +1,106 @@
+# ============================================================
+#  虚拟模式配置（仿真环境）
+#  - object_position 和 plate_position 支持：
+#    1. 具体坐标：[x, y, z]
+#    2. "random"：随机生成位置（在工作空间范围内）
+# ============================================================
+
+# 工作空间约束（用于random位置生成）
+workspace:
+  # 机械臂基座位置
+  base_position: [0.0, 0.0, 0.0]
+  # 桌面区域范围 [x_min, x_max, y_min, y_max, z_surface]
+  table_bounds: [0.25, 0.50, -0.25, 0.25, 0.44]
+  # 安全边界（距离边缘的最小距离）
+  safety_margin: 0.05
+  # 物体和plate之间的最小距离
+  min_object_plate_distance: 0.15
+
+cameras:
+  simu: [top, side, hand]
+
+simulation:
+  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  coord_rotation_z: 0
+  initial_joints_unit: rad
+  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
+
+  object_library:
+    cup:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/cup/model_new.xml"
+      body_name: "body_obj_cup"
+    mug:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/mug_5/model_new.xml"
+      body_name: "body_obj_mug_5"
+    plate:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate/model_new.xml"
+      body_name: "body_obj_plate"
+    plate_11:
+      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+      body_name: "body_obj_plate_11"
+  plate_target:
+    model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+    body_name: "body_obj_plate_11"
+
+grasp:
+  lift_height: 0.1
+  micro_lift_height: 0.02
+  release_lift_height: 0.08
+  object_profiles:
+    default:
+      orientation: [180, 0, 0]
+      pre_grasp_offset: [0, 0, 0.05]
+      grasp_offset: [0.0, 0.0, 0.0]
+      gripper: {open: 0.0, close: 0.65}
+    cup:
+      orientation: [176.02, 5.81, -83.23]
+      pre_grasp_offset: [0, 0, 0.01]
+      grasp_offset: [0.0, 0.012, 0]
+      gripper: {open: 0.80, close: 0.80}
+    mug:
+      orientation: [180, 0, 0]
+      pre_grasp_offset: [0, 0, 0.08]
+      grasp_offset: [-0.022, 0.0, 0]
+      gripper: {open: 0.80, close: 0.80}
+
+dataset:
+  mock_simu_data_root: "D:/VLA/data/Simu/simu_data"
+  fps: 30
+
+tasks:
+  task1:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, -0.15, 0.44]
+    description: "grasp mug and place to right side"
+  task2:
+    object_name: "mug"
+    object_position: random
+    plate_position:  [0.35, -0.15, 0.44]
+    description: "grasp mug and place to left side"
+  task3:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, 0.15, 0.44]
+    description: "grasp mug and place closer"
+  task4:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, 0.15, 0.44]
+    description: "grasp mug and place diagonally"
+  task5:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, 0.15, 0.44]
+    description: "grasp mug and place to right front"
+  task6:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, 0.15, 0.44]
+    description: "grasp mug from center and place to front right"
+  # 示例：随机位置任务
+  task7:
+    object_name: "mug"
+    object_position: "random"
+    plate_position: [0.35, 0.15, 0.44]
+    description: "random grasp and place task"
