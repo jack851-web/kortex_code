@@ -138,7 +138,7 @@ eval:
 
 # 环境配置
 env:
-  simu_xml: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  simu_xml: "kortex_simu/simu/env/task_pick_place.xml"
   headless: true
 
 # 任务配置

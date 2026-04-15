@@ -6,10 +6,14 @@
 import sys
 import time
 import numpy as np
+from pathlib import Path
+
+# 项目根目录
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 # 添加路径
-sys.path.insert(0, 'd:/VLA/kortex_code/kortex_simu/ik')
-sys.path.insert(0, 'd:/VLA/kortex_code/collect_data')
+sys.path.insert(0, str(PROJECT_ROOT / 'kortex_simu' / 'ik'))
+sys.path.insert(0, str(PROJECT_ROOT / 'collect_data'))
 
 import mujoco
 import mujoco.viewer
@@ -31,8 +35,8 @@ def test_ik():
     print(f"物体位置: {object_position}")
     print(f"预抓取位置: {pre_grasp_position}")
     
-    # 加载模型
-    xml_path = 'd:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml'
+    # 加载模型 (使用相对路径)
+    xml_path = str(PROJECT_ROOT / 'kortex_simu' / 'simu' / 'env' / 'task_pick_place.xml')
     print(f"\n加载模型: {xml_path}")
     
     model = mujoco.MjModel.from_xml_path(xml_path)

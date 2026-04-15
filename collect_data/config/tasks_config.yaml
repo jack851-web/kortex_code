@@ -18,26 +18,26 @@ cameras:
   simu: [top, side, hand]
 
 simulation:
-  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  xml_path: "kortex_simu/simu/env/task_pick_place.xml"
   coord_rotation_z: 0
   initial_joints_unit: rad
   initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
 
   object_library:
     cup:
-      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/cup/model_new.xml"
+      model_xml_path: "kortex_simu/simu/object/cup/model_new.xml"
       body_name: "body_obj_cup"
     mug:
-      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/mug_5/model_new.xml"
+      model_xml_path: "kortex_simu/simu/object/mug_5/model_new.xml"
       body_name: "body_obj_mug_5"
     plate:
-      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate/model_new.xml"
+      model_xml_path: "kortex_simu/simu/object/plate/model_new.xml"
       body_name: "body_obj_plate"
     plate_11:
-      model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+      model_xml_path: "kortex_simu/simu/object/plate_11/model_new.xml"
       body_name: "body_obj_plate_11"
   plate_target:
-    model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
+    model_xml_path: "kortex_simu/simu/object/plate_11/model_new.xml"
     body_name: "body_obj_plate_11"
 
 grasp:
@@ -63,9 +63,9 @@ grasp:
       gripper: {open: 0.80, close: 0.80}
 
 dataset:
-  real_data_root: "D:/VLA/data/Real/realdata"
-  simu_data_root: "D:/VLA/data/Real/simudata"
-  mock_simu_data_root: "D:/VLA/data/Simu/simu_data"
+  real_data_root: "data/Real/realdata"
+  simu_data_root: "data/Real/simudata"
+  mock_simu_data_root: "data/Simu/simu_data"
   fps: 30
 
 tasks:

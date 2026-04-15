@@ -13,6 +13,73 @@ from typing import Optional, Dict, Any, Tuple
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+# 项目根目录 (kortex_code)
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def resolve_path(path_str: str, base_dir: Path = None) -> str:
+    """解析路径，支持相对路径和绝对路径
+    
+    Args:
+        path_str: 路径字符串
+        base_dir: 基准目录，默认为 PROJECT_ROOT
+    
+    Returns:
+        解析后的绝对路径字符串
+    """
+    if not path_str:
+        return path_str
+    
+    path = Path(path_str)
+    
+    # 已经是绝对路径
+    if path.is_absolute():
+        return str(path)
+    
+    # 相对路径：基于 base_dir 或 PROJECT_ROOT 解析
+    base = base_dir or PROJECT_ROOT
+    resolved = (base / path_str).resolve()
+    return str(resolved)
+
+
+def resolve_config_paths(config: dict, base_dir: Path = None) -> dict:
+    """递归解析配置中的路径字段
+    
+    自动识别以 _path, _root 结尾的字段以及 xml_path, model_xml_path 等常见路径字段
+    """
+    path_keys = {
+        'xml_path', 'model_xml_path', 'scene_base_xml_path',
+        'real_data_root', 'simu_data_root', 'mock_simu_data_root',
+        'data_root', 'output_path', 'log_path',
+    }
+    
+    def _resolve_value(key: str, value):
+        if isinstance(value, str):
+            # 检查是否是路径字段
+            is_path = (
+                key in path_keys or 
+                key.endswith('_path') or 
+                key.endswith('_root') or
+                key.endswith('_xml') or
+                key.endswith('_dir') or
+                '.xml' in value.lower() or
+                '.yaml' in value.lower() or
+                '.json' in value.lower()
+            )
+            if is_path:
+                return resolve_path(value, base_dir)
+            return value
+        elif isinstance(value, dict):
+            return {k: _resolve_value(k, v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_resolve_value(key, item) for item in value]
+        return value
+    
+    if config is None:
+        return config
+    
+    return {k: _resolve_value(k, v) for k, v in config.items()}
+
 from gui import MainWindow, MockTaskTunerWindow
 from PyQt5.QtWidgets import QApplication
 from scripts import (
@@ -203,6 +270,8 @@ class DataCollectionSystem:
         try:
             with open(self._config_path, 'r', encoding='utf-8') as f:
                 self._config = yaml.safe_load(f)
+            # 解析配置中的相对路径为绝对路径
+            self._config = resolve_config_paths(self._config, PROJECT_ROOT)
             return True
         except Exception as e:
             self._log(f"加载配置失败: {e}", "ERROR")

@@ -383,7 +383,7 @@ workspace:
   min_object_plate_distance: 0.15
 
 simulation:
-  xml_path: "D:/VLA/kortex_code/kortex_simu/simu/env/task_pick_place.xml"
+  xml_path: "kortex_simu/simu/env/task_pick_place.xml"
   initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
   
   object_library:

@@ -16,6 +16,54 @@ from scripts import (
 from scripts.real.data_collector import RealDataCollector
 from scripts.simu.data_collector import SimuDataCollector
 
+# 项目根目录 (kortex_code)
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def resolve_path(path_str: str, base_dir: Path = None) -> str:
+    """解析路径，支持相对路径和绝对路径"""
+    if not path_str:
+        return path_str
+    path = Path(path_str)
+    if path.is_absolute():
+        return str(path)
+    base = base_dir or PROJECT_ROOT
+    return str((base / path_str).resolve())
+
+
+def resolve_config_paths(config: dict, base_dir: Path = None) -> dict:
+    """递归解析配置中的路径字段"""
+    path_keys = {
+        'xml_path', 'model_xml_path', 'scene_base_xml_path',
+        'real_data_root', 'simu_data_root', 'mock_simu_data_root',
+        'data_root', 'output_path', 'log_path',
+    }
+    
+    def _resolve_value(key: str, value):
+        if isinstance(value, str):
+            is_path = (
+                key in path_keys or 
+                key.endswith('_path') or 
+                key.endswith('_root') or
+                key.endswith('_xml') or
+                key.endswith('_dir') or
+                '.xml' in value.lower() or
+                '.yaml' in value.lower() or
+                '.json' in value.lower()
+            )
+            if is_path:
+                return resolve_path(value, base_dir)
+            return value
+        elif isinstance(value, dict):
+            return {k: _resolve_value(k, v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_resolve_value(key, item) for item in value]
+        return value
+    
+    if config is None:
+        return config
+    return {k: _resolve_value(k, v) for k, v in config.items()}
+
 
 class DataCollectionSystem:
     def __init__(self, config_path: str, use_mock: bool = True):
@@ -40,6 +88,9 @@ class DataCollectionSystem:
         try:
             with open(self._config_path, "r", encoding="utf-8") as f:
                 self._config = yaml.safe_load(f)
+            
+            # 解析配置中的相对路径为绝对路径
+            self._config = resolve_config_paths(self._config, PROJECT_ROOT)
             
             tasks_dict = self._config.get("tasks", {})
             self._tasks = []
