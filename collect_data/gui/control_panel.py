@@ -3,9 +3,9 @@
 """
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QLabel, QGroupBox, QSpinBox
+    QGroupBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import pyqtSignal
 
 
 class ControlPanel(QWidget):
@@ -20,7 +20,6 @@ class ControlPanel(QWidget):
     next_task_clicked = pyqtSignal()
     retry_clicked = pyqtSignal()
     complete_task_clicked = pyqtSignal()
-    episode_changed = pyqtSignal(int)
     
     def __init__(self):
         super().__init__()
@@ -59,8 +58,8 @@ class ControlPanel(QWidget):
         self._next_task_btn.setEnabled(False)
         task_layout.addWidget(self._next_task_btn)
         
-        # 重做任务按钮
-        self._retry_btn = QPushButton("重做当前任务")
+        # 重做任务按钮（任务执行中可直接点击，丢弃当前数据重新执行）
+        self._retry_btn = QPushButton("重做任务")
         self._retry_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
         self._retry_btn.clicked.connect(self.retry_clicked.emit)
         self._retry_btn.setEnabled(False)
@@ -97,23 +96,6 @@ class ControlPanel(QWidget):
         
         layout.addWidget(task_group)
         
-        # 任务设置组
-        episode_group = QGroupBox("任务设置")
-        episode_layout = QVBoxLayout(episode_group)
-        
-        # 开始任务索引
-        start_layout = QHBoxLayout()
-        start_layout.addWidget(QLabel("开始任务索引:"))
-        self._task_index_spin = QSpinBox()
-        self._task_index_spin.setMinimum(0)
-        self._task_index_spin.setMaximum(9999)
-        self._task_index_spin.setValue(0)
-        self._task_index_spin.valueChanged.connect(self.episode_changed.emit)
-        start_layout.addWidget(self._task_index_spin)
-        episode_layout.addLayout(start_layout)
-        
-        layout.addWidget(episode_group)
-        
         # 添加弹性空间
         layout.addStretch()
     
@@ -136,23 +118,15 @@ class ControlPanel(QWidget):
         self._next_task_btn.setEnabled(running)
         self._retry_btn.setEnabled(running)
         self._complete_task_btn.setEnabled(running)
-        self._task_index_spin.setEnabled(not running)
-
+    
     def set_mock_mode(self, enabled: bool):
         """设置 mock 模式 UI"""
         self._complete_task_btn.setVisible(enabled)
-    
-    def get_start_task_index(self) -> int:
-        return self._task_index_spin.value()
-    
-    def set_current_task_index(self, index: int):
-        self._task_index_spin.setValue(index)
 
     def set_busy(self, label: str = "处理中..."):
         """禁用所有按钮并显示处理状态（点击后立即调用，防止重复操作）"""
         # 保存当前每个按钮的启用状态
         self._btn_original_states = {id(btn): btn.isEnabled() for btn in self._all_task_btns}
-        self._task_index_spin.setEnabled(False)
 
         # 全部禁用
         for btn in self._all_task_btns:
@@ -168,13 +142,12 @@ class ControlPanel(QWidget):
         """恢复按钮到 set_busy 之前的状态"""
         for btn in self._all_task_btns:
             btn.setEnabled(self._btn_original_states.get(id(btn), btn.isEnabled()))
-        self._task_index_spin.setEnabled(not self._is_running)
 
         # 恢复按钮文字
         self._complete_task_btn.setText("抓取任务完毕")
         self._stop_btn.setText("停止收集")
         self._start_btn.setText("开始收集")
         self._next_task_btn.setText("执行下一个任务")
-        self._retry_btn.setText("重做当前任务")
+        self._retry_btn.setText("重做任务")
         self._skip_btn.setText("跳过当前")
         self._btn_original_states = {}

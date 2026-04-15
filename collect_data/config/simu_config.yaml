@@ -41,6 +41,7 @@ simulation:
   plate_target:
     model_xml_path: "D:/VLA/kortex_code/kortex_simu/simu/object/plate_11/model_new.xml"
     body_name: "body_obj_plate_11"
+    radius: 0.09  # 盘子半径（米），用于任务成功判定
 
 grasp:
   lift_height: 0.1
@@ -72,35 +73,50 @@ tasks:
     object_name: "mug"
     object_position: random
     plate_position: [0.35, -0.15, 0.44]
-    description: "grasp mug and place to right side"
+    description: "Pick up the red mug and put it on the white plate"
   task2:
     object_name: "mug"
     object_position: random
     plate_position:  [0.35, -0.15, 0.44]
-    description: "grasp mug and place to left side"
+    description: "Pick up the red mug and put it on the white plate"
   task3:
     object_name: "mug"
     object_position: random
     plate_position: [0.35, 0.15, 0.44]
-    description: "grasp mug and place closer"
+    description: "Pick up the red mug and put it on the white plate"
   task4:
     object_name: "mug"
     object_position: random
     plate_position: [0.35, 0.15, 0.44]
-    description: "grasp mug and place diagonally"
+    description: "Pick up the red mug and put it on the white plate"
   task5:
     object_name: "mug"
     object_position: random
     plate_position: [0.35, 0.15, 0.44]
-    description: "grasp mug and place to right front"
+    description: "Pick up the red mug and put it on the white plate"
   task6:
     object_name: "mug"
     object_position: random
     plate_position: [0.35, 0.15, 0.44]
-    description: "grasp mug from center and place to front right"
+    description: "Pick up the red mug and put it on the white plate"
   # 示例：随机位置任务
   task7:
     object_name: "mug"
     object_position: "random"
     plate_position: [0.35, 0.15, 0.44]
-    description: "random grasp and place task"
+    description: "Pick up the red mug and put it on the white plate"
+  task8:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, -0.15, 0.44]
+    description: "Pick up the red mug and put it on the white plate"
+  task9:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, -0.15, 0.44]
+    description: "Pick up the red mug and put it on the white plate"
+  task10:
+    object_name: "mug"
+    object_position: random
+    plate_position: [0.35, -0.15, 0.44]
+    description: "Pick up the red mug and put it on the white plate"

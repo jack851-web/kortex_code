@@ -16,34 +16,21 @@ kortex_code/
 
 ## 环境配置
 
-### 方法一：使用 conda 环境文件（推荐）
+### 方法：使用 conda 环境文件
 
 ```bash
-# 1. 安装 lerobot（必须先安装）
-git clone https://github.com/huggingface/lerobot.git
-cd lerobot && pip install -e .
 
-# 2. 创建 conda 环境
+# 1. 创建 conda 环境
 cd kortex_code
 conda env create -f environment.yml
 conda activate lerobot
-```
 
-### 方法二：手动配置
-
-```bash
-# 1. 安装 lerobot
+# 2. 安装 lerobot
 git clone https://github.com/huggingface/lerobot.git
 cd lerobot && pip install -e .
-
-# 2. 创建环境
-conda create -n lerobot python=3.10
-conda activate lerobot
-
-# 3. 安装依赖
-pip install mujoco PyQt5 numpy opencv-python pyyaml torch
-pip install rerun==1.0.31 rerun-sdk==0.31.2
 ```
+
+
 
 ## 模块说明
 

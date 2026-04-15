@@ -689,9 +689,7 @@ class MainWindow(QMainWindow):
         self._reset_task_timer()  # 重置计时器
 
         try:
-            self._data_system.start_collection(
-                start_task_index=self._control_panel.get_start_task_index()
-            )
+            self._data_system.start_collection()
         except Exception as e:
             self._log_panel.error(f"启动失败: {e}")
             import traceback

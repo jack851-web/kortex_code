@@ -408,6 +408,216 @@ class SimuDataCollector:
             self._last_task_end_point = self._frame_count
         print("[SimuDataCollector] Recording stopped")
 
+    def delete_last_episode(self) -> bool:
+        """删除最后一个已保存的 episode（用于重做任务时清理旧数据）
+
+        注意：此方法会重新编码视频文件，确保数据一致性。
+
+        Returns:
+            bool: 是否成功删除
+        """
+        import pandas as pd
+        import av
+        import shutil
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        with self._data_lock:
+            if self._dataset is None:
+                print("[SimuDataCollector] No dataset to delete from")
+                return False
+
+            # 获取当前 episode 数量
+            total_episodes = self._dataset.meta.total_episodes
+            if total_episodes == 0:
+                print("[SimuDataCollector] No episodes to delete")
+                return False
+
+            last_episode_idx = total_episodes - 1
+            print(f"[SimuDataCollector] Deleting episode {last_episode_idx} (with video re-encoding)...")
+
+            try:
+                # 1. 从 parquet 数据中删除该 episode 的行
+                data_dir = self._data_root / "data" / "chunk-000"
+                if data_dir.exists():
+                    for parquet_file in data_dir.glob("*.parquet"):
+                        try:
+                            df = pd.read_parquet(parquet_file)
+                        except Exception as e:
+                            print(f"[SimuDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
+                            # 如果文件损坏，尝试删除它
+                            try:
+                                parquet_file.unlink()
+                                print(f"[SimuDataCollector] Deleted corrupted file: {parquet_file.name}")
+                            except Exception:
+                                pass
+                            continue
+                        if "episode_index" in df.columns:
+                            original_len = len(df)
+                            df = df[df["episode_index"] != last_episode_idx]
+                            if len(df) < original_len:
+                                df.to_parquet(parquet_file, index=False)
+                                print(f"[SimuDataCollector] Removed episode {last_episode_idx} from {parquet_file.name}")
+
+                # 2. 重新编码视频（移除被删除episode的帧）
+                self._reencode_videos_without_episode(last_episode_idx)
+
+                # 3. 更新 meta/info.json
+                info_path = self._data_root / "meta" / "info.json"
+                if info_path.exists():
+                    with open(info_path, "r") as f:
+                        info = json.load(f)
+                    info["total_episodes"] = total_episodes - 1
+                    # 重新计算 total_frames
+                    total_frames = 0
+                    if data_dir.exists():
+                        for pf in data_dir.glob("*.parquet"):
+                            try:
+                                pdf = pd.read_parquet(pf)
+                                total_frames += len(pdf)
+                            except Exception:
+                                pass  # 跳过损坏的文件
+                    info["total_frames"] = total_frames
+                    with open(info_path, "w") as f:
+                        json.dump(info, f, indent=2)
+                    print(f"[SimuDataCollector] Updated info.json: total_episodes = {total_episodes - 1}")
+
+                # 4. 更新 meta/tasks.parquet
+                tasks_path = self._data_root / "meta" / "tasks.parquet"
+                if tasks_path.exists():
+                    try:
+                        tasks_df = pd.read_parquet(tasks_path)
+                        if "episode" in tasks_df.columns:
+                            tasks_df = tasks_df[tasks_df["episode"] != last_episode_idx]
+                            tasks_df.to_parquet(tasks_path, index=False)
+                            print(f"[SimuDataCollector] Removed episode {last_episode_idx} from tasks.parquet")
+                    except Exception as e:
+                        print(f"[SimuDataCollector] Warning: Failed to update tasks.parquet: {e}")
+
+                # 5. 更新 meta/episodes parquet
+                self._update_episodes_parquet_after_delete(last_episode_idx)
+
+                # 6. 更新 dataset 元数据
+                self._dataset.meta.total_episodes = total_episodes - 1
+
+                print(f"[SimuDataCollector] Episode {last_episode_idx} deleted successfully")
+                return True
+
+            except Exception as e:
+                print(f"[SimuDataCollector] Failed to delete episode: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+
+    def _reencode_videos_without_episode(self, episode_to_delete: int):
+        """重新编码视频，移除指定episode的帧"""
+        import av
+        import shutil
+        import pandas as pd
+
+        # 获取所有视频目录
+        videos_dir = self._data_root / "videos"
+        if not videos_dir.exists():
+            return
+
+        # 读取parquet获取每个episode的帧范围
+        data_dir = self._data_root / "data" / "chunk-000"
+        if not data_dir.exists():
+            return
+
+        # 收集所有episode的帧范围
+        episode_frames = {}  # episode_index -> list of frame indices
+        for parquet_file in sorted(data_dir.glob("*.parquet")):
+            try:
+                df = pd.read_parquet(parquet_file)
+            except Exception:
+                continue  # 跳过损坏的文件
+            if "episode_index" in df.columns and "frame_index" in df.columns:
+                for ep_idx in df["episode_index"].unique():
+                    if ep_idx not in episode_frames:
+                        episode_frames[ep_idx] = []
+                    ep_df = df[df["episode_index"] == ep_idx]
+                    episode_frames[ep_idx].extend(ep_df["frame_index"].tolist())
+
+        if not episode_frames:
+            return
+
+        # 确定要保留的帧索引（全局）
+        frames_to_keep = set()
+        for ep_idx, frames in episode_frames.items():
+            if ep_idx != episode_to_delete:
+                frames_to_keep.update(frames)
+
+        # 对每个视频key进行处理
+        for video_key_dir in videos_dir.iterdir():
+            if not video_key_dir.is_dir():
+                continue
+            video_key = video_key_dir.name
+
+            # 处理每个视频文件
+            for chunk_dir in video_key_dir.glob("chunk-*"):
+                for video_file in sorted(chunk_dir.glob("*.mp4")):
+                    print(f"[SimuDataCollector] Re-encoding {video_file}...")
+
+                    # 创建临时文件
+                    temp_video = video_file.with_suffix(".temp.mp4")
+
+                    try:
+                        # 使用PyAV解码和重新编码
+                        with av.open(str(video_file)) as input_container:
+                            input_stream = input_container.streams.video[0]
+
+                            # 创建输出容器
+                            with av.open(str(temp_video), 'w') as output_container:
+                                output_stream = output_container.add_stream('libx264', rate=30)
+                                output_stream.width = input_stream.width
+                                output_stream.height = input_stream.height
+                                output_stream.pix_fmt = 'yuv420p'
+                                output_stream.options = {'crf': '23'}
+
+                                frame_idx = 0
+                                for packet in input_container.demux(input_stream):
+                                    for frame in packet.decode():
+                                        if frame_idx in frames_to_keep:
+                                            # 重新编码这帧
+                                            frame.pict_type = None  # 重置帧类型让编码器决定
+                                            output_container.mux(output_stream.encode(frame))
+                                        frame_idx += 1
+
+                                # 刷新编码器
+                                for packet in output_stream.encode():
+                                    output_container.mux(packet)
+
+                        # 替换原文件
+                        temp_video.replace(video_file)
+                        print(f"[SimuDataCollector] Re-encoded {video_file.name} ({frame_idx} frames, kept {len(frames_to_keep)})")
+
+                    except Exception as e:
+                        print(f"[SimuDataCollector] Failed to re-encode {video_file}: {e}")
+                        if temp_video.exists():
+                            temp_video.unlink()
+
+    def _update_episodes_parquet_after_delete(self, deleted_episode_idx: int):
+        """删除episode后更新meta/episodes parquet文件"""
+        import pandas as pd
+
+        episodes_dir = self._data_root / "meta" / "episodes"
+        if not episodes_dir.exists():
+            return
+
+        for chunk_dir in episodes_dir.glob("chunk-*"):
+            for parquet_file in sorted(chunk_dir.glob("*.parquet")):
+                try:
+                    df = pd.read_parquet(parquet_file)
+                except Exception as e:
+                    print(f"[SimuDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
+                    continue
+                if "episode_index" in df.columns:
+                    original_len = len(df)
+                    df = df[df["episode_index"] != deleted_episode_idx]
+                    if len(df) < original_len:
+                        df.to_parquet(parquet_file, index=False)
+                        print(f"[SimuDataCollector] Updated {parquet_file.name}")
+
     def discard_current_task(self):
         """丢弃当前任务的数据（用于重做任务）
 

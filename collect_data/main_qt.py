@@ -871,7 +871,10 @@ class DataCollectionSystem:
             self._update_status("错误", "#ff0000")
 
     def retry_current_task(self):
-        """重做当前任务（作为新的 episode 重新执行）"""
+        """重做当前任务（仅任务执行中可用）
+
+        丢弃当前数据并重新执行，避免文件写入后再删除的复杂性。
+        """
         if not self._running:
             self._log("数据收集未启动", "WARNING")
             return
@@ -880,22 +883,53 @@ class DataCollectionSystem:
             self._log("任务准备中，请稍后再重做", "WARNING")
             return
 
-        if self._task_in_progress:
-            self._log('当前任务进行中，先点击"抓取任务完毕"或停止', "WARNING")
+        if not self._task_in_progress:
+            self._log("当前没有进行中的任务，无法重做", "WARNING")
             return
 
-        if self._current_task_index == 0:
-            self._log("当前没有任务需要重做", "WARNING")
-            return
+        self._log("丢弃当前数据并重新执行...", "WARNING")
+        self._update_status("重做任务中", "#ffa500")
 
-        self._current_task_index -= 1
+        # 停止数据记录
+        if self._real_data_collector is not None:
+            self._real_data_collector.stop_recording()
+        if self._simu_data_collector is not None:
+            self._simu_data_collector.stop_recording()
 
+        # 丢弃当前任务数据
+        if self._real_data_collector is not None:
+            self._real_data_collector.discard_current_task()
+        else:
+            self._simu_data_collector.discard_current_task()
+        self._log("当前任务数据已丢弃", "SUCCESS")
+
+        # 清理同步控制器状态
+        if self._sync_controller is not None and hasattr(self._sync_controller, 'clear_adhesion_targets'):
+            self._sync_controller.clear_adhesion_targets()
+
+        # 关闭仿真窗口（如果需要重建）
+        if not self._real_connected and self._simu_manager.is_running:
+            try:
+                self._log("正在关闭仿真窗口...", "INFO")
+                self._simu_manager.stop_simulation()
+                self._simu = None
+                self._log("仿真窗口已关闭", "SUCCESS")
+            except Exception as e:
+                self._log(f"关闭仿真失败: {e}", "WARNING")
+
+        # 重置任务状态
+        self._task_in_progress = False
+        self._active_task_info = {}
+
+        # 重新执行当前任务
         tasks = self._config.get('tasks', {})
         task_list = list(tasks.items())
+        if self._current_task_index >= len(task_list):
+            self._current_task_index = max(0, len(task_list) - 1)
+
         task_id, task_config = task_list[self._current_task_index]
         task_name = task_config.get('description', task_id)
-
-        self._log(f"重做任务 {self._current_task_index + 1}/{len(task_list)}: {task_name} (新 Episode {self._current_episode})", "WARNING")
+        self._log(f"重新执行任务 {self._current_task_index + 1}/{len(task_list)}: {task_name} (Episode {self._current_episode})", "WARNING")
 
         self._waiting_for_next_task = True
         task_thread = threading.Thread(target=self._execute_current_task, daemon=True)
@@ -1011,13 +1045,14 @@ class DataCollectionSystem:
             task_name = task_config.get('description', task_id)
             
             # 解析位置配置（支持坐标数组或"random"）
-            object_pos_config = task_config.get('object_position', [0.215, -0.614, 0.17])
-            object_pos = self._resolve_position(object_pos_config)
+            # 注意顺序：先获取plate位置（通常是固定的），再生成object位置时避开plate
+            plate_pos_config = task_config.get('plate_position', [0.35, -0.15, 0.44])
+            plate_pos = self._resolve_position(plate_pos_config)
             
-            # plate位置需与object保持最小距离
+            # object位置需与plate保持最小距离（当object为random时生效）
             min_dist = self._config.get('workspace', {}).get('min_object_plate_distance', 0.15)
-            plate_pos_config = task_config.get('plate_position', [0.215, -0.60, 0.17])
-            plate_pos = self._resolve_position(plate_pos_config, existing_position=object_pos, min_distance=min_dist)
+            object_pos_config = task_config.get('object_position', [0.35, 0.15, 0.44])
+            object_pos = self._resolve_position(object_pos_config, existing_position=plate_pos, min_distance=min_dist)
 
             object_name = task_config.get('object_name', 'cube')
             self._grasp_executor.set_object_type(object_name)
@@ -1190,24 +1225,36 @@ class DataCollectionSystem:
             return False
 
     def _evaluate_task_success(self) -> bool:
+        """判定任务是否成功：物体是否在盘子半径范围内"""
         if not self._active_task_info:
             return False
         if not hasattr(self._simu, 'get_object_position'):
             return True
 
-        body_name = self._active_task_info.get('object_body_name', 'cube')
-        target_pos = np.asarray(self._active_task_info.get('target_pos', np.zeros(3)), dtype=float)
-        object_pos = np.asarray(self._simu.get_object_position(body_name), dtype=float)
+        # 获取物体当前位置
+        object_body_name = self._active_task_info.get('object_body_name', 'cube')
+        object_pos = np.asarray(self._simu.get_object_position(object_body_name), dtype=float)
 
-        distance_xy = np.linalg.norm(object_pos[:2] - target_pos[:2])
-        z_diff = abs(object_pos[2] - target_pos[2])
-        xy_threshold = 0.08
-        z_threshold = 0.05
+        # 获取盘子位置（target_pos 是仿真坐标系中的盘子位置）
+        plate_pos = np.asarray(self._active_task_info.get('target_pos', np.zeros(3)), dtype=float)
 
-        self._log(f"任务判定: body={body_name}, object={object_pos}, target={target_pos}", "INFO")
-        self._log(f"任务判定距离: xy={distance_xy:.4f}m, z={z_diff:.4f}m", "INFO")
+        # 计算物体到盘子中心的 XY 平面距离
+        distance_xy = np.linalg.norm(object_pos[:2] - plate_pos[:2])
 
-        return bool(distance_xy < xy_threshold and z_diff < z_threshold)
+        # 从配置获取盘子半径，默认 0.09m
+        plate_target_cfg = self._config.get('simulation', {}).get('plate_target', {})
+        if not plate_target_cfg:
+            plate_target_cfg = self._config.get('plate_target', {})
+        plate_radius = plate_target_cfg.get('radius', 0.09)
+
+        self._log(f"任务判定: object_pos={object_pos}, plate_pos={plate_pos}", "INFO")
+        self._log(f"任务判定: distance_xy={distance_xy:.4f}m, plate_radius={plate_radius:.2f}m", "INFO")
+
+        # 成功条件：物体在盘子半径范围内
+        success = bool(distance_xy < plate_radius)
+        self._log(f"任务判定结果: {'成功' if success else '失败'}", "SUCCESS" if success else "WARNING")
+
+        return success
 
     def get_current_task_runtime_info(self) -> Dict[str, Any]:
         info = dict(self._active_task_info) if isinstance(self._active_task_info, dict) else {}
