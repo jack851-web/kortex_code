@@ -22,8 +22,9 @@ cameras:
 simulation:
   xml_path: "kortex_simu/simu/env/task_pick_place.xml"
   coord_rotation_z: 0
-  initial_joints_unit: rad
-  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
+  initial_joints_unit: deg
+  initial_joints: [13.60, -33.43, 38.65, -90.29, -109.65, -76.49]
+  initial_gripper: 0.5
 
   object_library:
     cup:
@@ -61,7 +62,7 @@ grasp:
     mug:
       orientation: [180, 0, 0]
       pre_grasp_offset: [0, 0, 0.08]
-      grasp_offset: [-0.022, 0.0, 0]
+      grasp_offset: [0, 0.06, 0]
       gripper: {open: 0.80, close: 0.80}
 
 dataset:

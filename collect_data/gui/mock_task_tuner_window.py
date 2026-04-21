@@ -98,10 +98,6 @@ class MockTaskTunerWindow(QWidget):
         root.addWidget(state_group)
 
         btn_layout = QHBoxLayout()
-        self._to_home_btn = QPushButton("回初始位 (Z)")
-        self._to_home_btn.clicked.connect(self._move_home)
-        btn_layout.addWidget(self._to_home_btn)
-
         self._finish_btn = QPushButton("任务完毕")
         self._finish_btn.setStyleSheet("background-color: #E91E63; color: white;")
         self._finish_btn.clicked.connect(self._finish_task)
@@ -116,10 +112,7 @@ class MockTaskTunerWindow(QWidget):
     def keyPressEvent(self, event: QKeyEvent):
         self._keys_pressed.add(event.key())
         
-        if event.key() == Qt.Key_Z:
-            self._move_home()
-            event.accept()
-        elif event.key() == Qt.Key_BracketLeft:
+        if event.key() == Qt.Key_BracketLeft:
             self._close_gripper_more()
         elif event.key() == Qt.Key_BracketRight:
             self._open_gripper_more()
@@ -173,9 +166,6 @@ class MockTaskTunerWindow(QWidget):
 
         self._data_system.tuning_move_to_pose(target_pose)
 
-    def _move_home(self):
-        if self._data_system.move_to_home_pose():
-            self._status_label.setText("已回到初始位置")
 
     def _close_gripper_more(self):
         new_gripper = min(1.0, self._gripper_state + 0.05)

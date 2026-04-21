@@ -304,12 +304,11 @@
          hand: 手眼相机，跟踪末端执行器
     -->
     <!-- top: 桌面正上方俯视，覆盖整个工作区域 -->
-    <camera name="top" pos="0.35 0 1.3" xyaxes="0 -1 0 1 0 0" fovy="55"/>
+   <camera name="top" pos="0.35 0 1.8" xyaxes="0 1 0 -1 0 0" fovy="55"/>
 
     <!-- side: 右侧斜上方，观察机械臂侧面操作 -->
-    <camera name="side" pos="0.35 -0.7 0.8" xyaxes="1 0 0 0 0.5 0.87" fovy="50"/>
+    <camera name="side" pos="0.35 -1.3 1.4" xyaxes="1 0 0 0 0.5 0.87" fovy="50"/>
 
-    <!-- hand: 手眼视角，位于末端执行器附近俯视工作点 -->
-    <camera name="hand" pos="0.5 0 0.8" xyaxes="0 1 0 -0.3 0 0.95" fovy="45"/>
+   
   </worldbody>
 </mujoco>

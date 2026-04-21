@@ -129,6 +129,9 @@ class DataCollectionSystem:
             else:
                 self._sim_initial_joints_deg = arr
             print(f"[Config] simulation.initial_joints loaded ({sim_init_unit}): {sim_init_joints[:6]}")
+
+        # 仿真初始夹爪 (0=张开, 1=闭合)
+        self._sim_initial_gripper = float(simu_config.get("initial_gripper", 0.0))
         
         real_camera_config = camera_config.get("real", {})
         _simu_cam_cfg = camera_config.get("simu", [])
@@ -390,10 +393,8 @@ class DataCollectionSystem:
     def _apply_sim_initial_joints(self):
         if self._simu is None or self._sim_initial_joints_deg is None:
             return
-        ok = self._simu.set_joint_target(self._sim_initial_joints_deg)
+        ok = self._simu.set_joint_positions(self._sim_initial_joints_deg, gripper=self._sim_initial_gripper)
         if ok:
-            # 推进仿真使控制量真正生效
-            self._simu.step(300)
             print(f"[Config] Applied simulation initial joints (deg): {self._sim_initial_joints_deg.tolist()}")
 
     def _on_waypoint_progress(self, waypoint_name: str, current: int, total: int):

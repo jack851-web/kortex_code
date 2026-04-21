@@ -967,6 +967,52 @@ class SimuInterface:
                 print(f"[SimuInterface] get_joint_state error: {e}")
                 return np.zeros(6)
 
+    def set_joint_positions(self, positions: np.ndarray, gripper: float = None) -> bool:
+        """直接设置关节位置（qpos），不通过 PD 控制器，瞬间到位。
+
+        Args:
+            positions: 关节角度，单位度（与 set_joint_target 保持一致）
+            gripper: 夹爪开合度 (0=张开, 1=闭合)，None 则不修改
+        """
+        with self._lock:
+            if self._model is None or self._data is None:
+                return False
+            try:
+                positions_normalized = np.mod(positions + 180, 360) - 180
+                positions_rad = np.deg2rad(positions_normalized)
+                for i, joint_idx in enumerate(self._joint_indices):
+                    if i >= len(positions_rad):
+                        break
+                    qpos_idx = self._model.jnt_qposadr[joint_idx]
+                    ctrl_idx = self._get_ctrl_idx_for_joint(joint_idx)
+                    self._data.qpos[qpos_idx] = positions_rad[i]
+                    self._data.qvel[self._model.jnt_dofadr[joint_idx]] = 0.0
+                    if ctrl_idx >= 0:
+                        ctrl_range = self._model.actuator_ctrlrange[ctrl_idx]
+                        self._data.ctrl[ctrl_idx] = np.clip(positions_rad[i], ctrl_range[0], ctrl_range[1])
+
+                # 直接设置夹爪 qpos + ctrl（瞬间到位）
+                if gripper is not None:
+                    gripper = float(np.clip(gripper, 0.0, 1.0))
+                    for joint_idx in self._gripper_indices:
+                        ctrl_idx = self._get_ctrl_idx_for_joint(joint_idx)
+                        qpos_idx = self._model.jnt_qposadr[joint_idx]
+                        if ctrl_idx >= 0:
+                            joint_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint_idx)
+                            if 'RIGHT' in joint_name:
+                                ctrl_val = 0.8 * (1 - gripper)
+                            else:
+                                ctrl_val = -0.8 * (1 - gripper)
+                            self._data.ctrl[ctrl_idx] = ctrl_val
+                            self._data.qpos[qpos_idx] = ctrl_val
+                        self._data.qvel[self._model.jnt_dofadr[joint_idx]] = 0.0
+
+                mujoco.mj_forward(self._model, self._data)
+                return True
+            except Exception as e:
+                print(f"[SimuInterface] set_joint_positions error: {e}")
+                return False
+
     def set_joint_target(self, positions: np.ndarray) -> bool:
         """设置关节目标位置"""
         with self._lock:

@@ -35,6 +35,7 @@
                   <joint name="J5" axis="0 0 1" range="-2.67 2.67" damping="100.0"/>
                   <geom type="mesh" mesh="GRIPPER_FRAME"/>
                   <site name="tcp" pos="0 0 0.13" size="0.005" rgba="0 1 0 1"/>
+                  <camera name="hand" pos="0.1 -0.04 -0.1" xyaxes="-1 0 0  0 1 -0.5" fovy="60"/>
                   <body name="RIGHT_FINGER_PROX" pos="0 -0.030501 0.070003" quat="0.707105 0 0.707108 0">
                     <joint name="RIGHT_BOTTOM" axis="0 0 1" range="-0.09 0.96" damping="20.0" armature="0.02"/>
                     <!-- 视觉模型 -->

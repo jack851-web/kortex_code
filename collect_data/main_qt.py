@@ -311,6 +311,9 @@ class DataCollectionSystem:
             else:
                 self._sim_initial_joints_deg = arr
             self._log(f"已加载仿真初始关节({sim_init_unit}): {sim_init_joints[:6]}", "INFO")
+
+        # 仿真初始夹爪 (0=张开, 1=闭合)
+        self._sim_initial_gripper = float(simu_config.get('initial_gripper', 0.0))
         
         # 创建接口
         if self._use_real:
@@ -568,9 +571,8 @@ class DataCollectionSystem:
     def _apply_sim_initial_joints(self):
         if self._simu is None or self._sim_initial_joints_deg is None:
             return
-        ok = self._simu.set_joint_target(self._sim_initial_joints_deg)
+        ok = self._simu.set_joint_positions(self._sim_initial_joints_deg, gripper=self._sim_initial_gripper)
         if ok:
-            self._simu.step(300)
             self._log(f"已应用仿真初始关节(deg): {self._sim_initial_joints_deg.tolist()}", "INFO")
 
     @staticmethod
@@ -1177,6 +1179,7 @@ class DataCollectionSystem:
 
                 if self._sim_initial_joints_deg is not None:
                     task_simu_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
+                task_simu_config['initial_gripper'] = self._sim_initial_gripper
 
                 simu_plate_pos = self._transform_position(plate_pos)
                 if plate_model_xml and plate_body_name:

@@ -178,8 +178,6 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(QLabel("旋转"), 3, 1)
         info_layout.addWidget(QLabel("[ / ]:"), 4, 0)
         info_layout.addWidget(QLabel("夹爪闭合/张开"), 4, 1)
-        info_layout.addWidget(QLabel("Z:"), 5, 0)
-        info_layout.addWidget(QLabel("回初始位"), 5, 1)
 
         main_layout.addWidget(info_group)
 
@@ -591,10 +589,7 @@ class MainWindow(QMainWindow):
 
         self._keys_pressed.add(event.key())
 
-        if event.key() == Qt.Key_Z:
-            self._move_home()
-            event.accept()
-        elif event.key() == Qt.Key_BracketLeft:
+        if event.key() == Qt.Key_BracketLeft:
             self._close_gripper_more()
         elif event.key() == Qt.Key_BracketRight:
             self._open_gripper_more()
@@ -652,9 +647,8 @@ class MainWindow(QMainWindow):
 
             self._data_system.tuning_move_to_pose(target_pose)
 
-    def _move_home(self):
-        if self._data_system and self._data_system.move_to_home_pose():
-            self._status_label.setText("已回到初始位置")
+
+
 
     def _close_gripper_more(self):
         if not self._data_system:

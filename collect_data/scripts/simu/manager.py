@@ -241,11 +241,11 @@ class SimuManager:
                 if object_position is not None:
                     self._simu.set_object_position(object_body_name, np.array(object_position), reset_z=True)
 
-                # 设置初始关节
+                # 设置初始关节（直接设 qpos，瞬间到位）
                 initial_joints = task_config.get('initial_joints_deg')
+                initial_gripper = task_config.get('initial_gripper', 0.0)
                 if initial_joints is not None:
-                    self._simu.set_joint_target(np.array(initial_joints[:6], dtype=float))
-                    self._simu.step(300)
+                    self._simu.set_joint_positions(np.array(initial_joints[:6], dtype=float), gripper=initial_gripper)
 
                 # 设置放置目标位置
                 plate_position = task_config.get('plate_position')
