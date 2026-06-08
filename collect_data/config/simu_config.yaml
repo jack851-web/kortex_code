@@ -66,7 +66,7 @@ grasp:
       gripper: {open: 0.80, close: 0.80}
 
 dataset:
-  mock_simu_data_root: "data/Simu/simu_data"
+  mock_simu_data_root: "D:/VLA/data/61_data"
   fps: 30
 
 tasks:
@@ -83,28 +83,28 @@ tasks:
   task3:
     object_name: "mug"
     object_position: random
-    plate_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
   task4:
     object_name: "mug"
     object_position: random
-    plate_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
   task5:
     object_name: "mug"
     object_position: random
-    plate_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
   task6:
     object_name: "mug"
     object_position: random
-    plate_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
   # 示例：随机位置任务
   task7:
     object_name: "mug"
     object_position: "random"
-    plate_position: [0.35, 0.15, 0.44]
+    plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
   task8:
     object_name: "mug"

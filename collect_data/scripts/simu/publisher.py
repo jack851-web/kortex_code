@@ -360,15 +360,27 @@ class SimuPublisher:
         return None
 
     def _get_gripper_raw(self, simu) -> float:
-        """获取夹爪原始状态（在锁内调用）"""
+        """获取夹爪状态（在锁内调用），返回 0~1 归一化值
+
+        0 = 张开, 1 = 闭合
+        只读取 RIGHT_BOTTOM 的 qpos，映射方式与 SimuInterface.get_gripper_state 一致：
+        gripper = 1 - qpos / 0.8
+        （RIGHT_BOTTOM 的 actuator ctrlrange 为 [0, 0.8]，0.8=张开, 0=闭合）
+        """
         try:
             if not simu._gripper_indices:
                 return 0.0
-            values = []
-            for idx in simu._gripper_indices:
-                qpos_idx = simu._model.jnt_qposadr[idx]
-                values.append(simu._data.qpos[qpos_idx])
-            return float(np.mean(values)) if values else 0.0
+            idx = simu._gripper_indices[0]
+            joint_name = mujoco.mj_id2name(simu._model, mujoco.mjtObj.mjOBJ_JOINT, idx)
+            if 'RIGHT' not in joint_name:
+                for i in simu._gripper_indices:
+                    tmp_name = mujoco.mj_id2name(simu._model, mujoco.mjtObj.mjOBJ_JOINT, i)
+                    if 'RIGHT' in tmp_name:
+                        idx = i
+                        break
+            qpos_idx = simu._model.jnt_qposadr[idx]
+            joint_pos = simu._data.qpos[qpos_idx]
+            return float(np.clip(1 - joint_pos / 0.8, 0.0, 1.0))
         except Exception:
             return 0.0
 
