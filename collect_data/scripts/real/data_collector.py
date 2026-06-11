@@ -4,8 +4,8 @@
 核心设计：
 - 使用 LeRobotDataset.create() + streaming_encoding 直接写入 LeRobot v3.0 格式
 - 每帧调用 add_frame()，视频实时流式编码为 MP4
-- observation.state: [6关节角(度), 1夹爪] = 7维 float32
-- action: [6关节增量(度), 1夹爪增量] = 7维 float32
+- observation.state: [6关节角(度, 0-360), 1夹爪(0~1), 3末端位姿(米)] = 10维 float32
+- action: [6关节增量(度), 1夹爪增量, 3末端位姿增量(米)] = 10维 float32
 - end_episode 时调用 save_episode()，停止时调用 finalize()
 - 保持外部接口与旧版完全兼容
 """
@@ -17,6 +17,9 @@ import threading
 from typing import Dict, List, Any
 from pathlib import Path
 
+# 导入关节归一化函数
+from kortex_real.gen3.gen3_lite import JOINT_NAMES as _JOINT_NAMES
+
 
 MAX_EPISODE_FRAMES = 5000
 CAMERA_KEY_PREFIX = "observation.images"
@@ -27,13 +30,13 @@ def _build_features(camera_names: List[str], image_height: int = 480, image_widt
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (7,),
-            "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper"],
+            "shape": (10,),  # 6关节角(度) + 1夹爪 + 3末端位姿(米)
+            "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper", "ee_x", "ee_y", "ee_z"],
         },
         "action": {
             "dtype": "float32",
-            "shape": (7,),
-            "names": ["dj1", "dj2", "dj3", "dj4", "dj5", "dj6", "dgripper"],
+            "shape": (10,),  # 6关节增量(度) + 1夹爪增量 + 3末端位姿增量(米)
+            "names": ["dj1", "dj2", "dj3", "dj4", "dj5", "dj6", "dgripper", "dee_x", "dee_y", "dee_z"],
         },
     }
     for cam_name in camera_names:
@@ -60,7 +63,8 @@ class RealDataCollector:
     def __init__(self, real_interface, data_root: str, fps: int = 20, video_fps: int = 30,
                  broker=None, repo_id: str = "kortex_real_dataset",
                  image_size: tuple = (480, 640),
-                 use_videos: bool = True):
+                 use_videos: bool = True,
+                 camera_names: list = None):
         self._real = real_interface
         self._data_root = Path(data_root)
         self._fps = fps
@@ -74,6 +78,7 @@ class RealDataCollector:
         self._stop_event = threading.Event()
         self._data_lock = threading.Lock()
         self._repo_id = repo_id
+        self._camera_names = camera_names or []
 
         # 任务数据保存点
         self._task_save_point = 0
@@ -82,7 +87,6 @@ class RealDataCollector:
         # 帧计数
         self._frame_count = 0
         self._current_episode_info = {}
-        self._camera_names = []
 
         # 上一帧的 state（用于计算增量 action）
         self._prev_state = None
@@ -130,8 +134,15 @@ class RealDataCollector:
             self._latest_broker_gripper = float(gripper)
 
     def _init_lerobot_dataset(self):
-        """创建或恢复 LeRobot 数据集"""
+        """创建或恢复 LeRobot 数据集（纯本地模式，不连接 HuggingFace）"""
+        import os
+        import shutil
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        # 强制离线模式：覆盖已有设置，禁止任何 HF 网络请求
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
         features = _build_features(
             self._camera_names,
@@ -144,7 +155,23 @@ class RealDataCollector:
                 key = f"{CAMERA_KEY_PREFIX}.{cam_name}"
                 features[key]["dtype"] = "image"
 
-        try:
+        # 检查目录是否有效数据集
+        info_path = self._data_root / "meta" / "info.json"
+        tasks_path = self._data_root / "meta" / "tasks.parquet"
+
+        needs_create = True
+        if self._data_root.exists() and info_path.exists() and tasks_path.exists():
+            needs_create = False
+
+        if needs_create:
+            # 清理旧目录后重新创建
+            if self._data_root.exists():
+                print(f"[RealDataCollector] Removing incomplete dataset: {self._data_root}")
+                try:
+                    shutil.rmtree(self._data_root)
+                except Exception as e:
+                    print(f"[RealDataCollector] Warning: Failed to remove: {e}")
+
             self._dataset = LeRobotDataset.create(
                 repo_id=self._repo_id,
                 fps=self._fps,
@@ -157,18 +184,38 @@ class RealDataCollector:
                 metadata_buffer_size=10,
                 encoder_queue_maxsize=30,
             )
-            print(f"[RealDataCollector] New LeRobot dataset created at {self._data_root}")
-        except FileExistsError:
+            print(f"[RealDataCollector] LeRobot dataset created at {self._data_root}")
+        else:
             print(f"[RealDataCollector] Loading existing LeRobot dataset from {self._data_root}")
             self._dataset = LeRobotDataset(
                 repo_id=self._repo_id,
                 root=self._data_root,
             )
             self._dataset.episode_buffer = self._dataset.create_episode_buffer()
+            # 修复：加载已有数据集时 _streaming_encoder 为 None，
+            # 导致 add_frame 回退到 images/ 路径写 PNG 帧，需重新初始化
+            if self._use_videos:
+                from lerobot.datasets.video_encoder import StreamingVideoEncoder
+                self._dataset._streaming_encoder = StreamingVideoEncoder(
+                    fps=self._dataset.meta.fps,
+                    vcodec=self._dataset.vcodec,
+                    pix_fmt="yuv420p",
+                    g=2,
+                    crf=30,
+                    preset=None,
+                    queue_maxsize=30,
+                )
+                print(f"[RealDataCollector] Re-initialized streaming encoder for existing dataset")
 
     def start_collection(self):
+        """开始数据收集：初始化 LeRobot 数据集 + 启动采集线程"""
         if self._is_collecting:
             return
+
+        # 一次性初始化数据集（不再在 start_episode 中懒加载）
+        if self._dataset is None:
+            self._init_lerobot_dataset()
+
         self._stop_event.clear()
         self._is_collecting = True
         self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
@@ -223,14 +270,21 @@ class RealDataCollector:
                     images = self._latest_broker_images
                     joints = self._latest_broker_joints if self._latest_broker_joints is not None else np.zeros(6)
                     gripper = self._latest_broker_gripper if self._latest_broker_gripper is not None else 0.0
+                    cartesian = self._latest_broker_cartesian  # [x, y, z] 或 None
                 else:
                     images = self._real.get_camera_images()
                     joints, cartesian, gripper = self._real.get_full_state()
 
                 with self._data_lock:
-                    # 构建 state 向量: [6关节角(度), 1夹爪]
+                    # 构建 state 向量: [6关节角(度, 0-360), 1夹爪(0~1), 3末端位姿(米)] = 10维
+                    joints_raw = np.array(joints[:6], dtype=np.float32)
+                    if cartesian is not None:
+                        ee_raw = np.array(cartesian[:3], dtype=np.float32)
+                    else:
+                        ee_raw = np.zeros(3, dtype=np.float32)
+
                     state_vec = np.array(
-                        list(joints) + [float(gripper)],
+                        list(joints_raw) + [float(gripper)] + list(ee_raw),
                         dtype=np.float32,
                     )
 
@@ -238,7 +292,7 @@ class RealDataCollector:
                     if self._prev_state is not None:
                         action_vec = (state_vec - self._prev_state).astype(np.float32)
                     else:
-                        action_vec = np.zeros(7, dtype=np.float32)
+                        action_vec = np.zeros(10, dtype=np.float32)
                     self._prev_state = state_vec.copy()
 
                     # 构建 LeRobot frame
@@ -265,6 +319,13 @@ class RealDataCollector:
                     self._dataset.add_frame(frame)
                     self._frame_count += 1
 
+                    # 诊断：前5帧打印关节值，确认是原始范围还是0-1
+                    if self._frame_count <= 5:
+                        print(f"[RealDataCollector] Frame {self._frame_count} raw state: "
+                              f"j1={state_vec[0]:.1f}° j2={state_vec[1]:.1f}° "
+                              f"j5={state_vec[4]:.1f}° j6={state_vec[5]:.1f}° "
+                              f"gripper={state_vec[6]:.3f} ee_z={state_vec[9]:.4f}m")
+
             except Exception as e:
                 print(f"[RealDataCollector] Error: {e}")
                 import traceback
@@ -276,7 +337,7 @@ class RealDataCollector:
                 time.sleep(sleep_time)
 
     def start_episode(self, episode_id: int, camera_names: list, task_info: Dict[str, Any]):
-        """开始一个新的 episode"""
+        """开始一个新的 episode（数据集在 start_collection 时已初始化）"""
         self._episode_count = episode_id
         self._camera_names = camera_names
 

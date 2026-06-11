@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, Tuple
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))  # kortex_code
 
 # 项目根目录 (kortex_code)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -96,8 +97,8 @@ class DataCollectionSystem:
     """数据收集系统 - Qt 版本
     
     支持两种模式:
-    1. 实机模式 (--real): 同步真实机器人和仿真数据
-    2. 模拟模式 (--mock): 使用模拟接口测试
+    1. 实机模式 (--real): 仅采集真实机器人数据
+    2. 模拟模式 (--mock): 使用仿真接口测试
     """
     
     def __init__(self, config_path: str, use_real: bool = True, show_simu_viewer: bool = False):
@@ -162,6 +163,7 @@ class DataCollectionSystem:
         # 新模式任务运行态
         self._task_in_progress: bool = False
         self._active_task_info: Dict[str, Any] = {}
+        self._finish_lock = threading.Lock()  # 防 finish_current_task 重入
         
         # Mock模式吸附机制
         self._mock_adhesion_enabled: bool = False
@@ -207,35 +209,55 @@ class DataCollectionSystem:
         if seed is not None:
             np.random.seed(seed)
         
-        # 从配置获取工作空间参数
+        # 从配置获取工作空间参数（支持新旧两种格式）
         workspace = self._config.get('workspace', {})
-        table_bounds = workspace.get('table_bounds', [0.25, 0.50, -0.25, 0.25, 0.44])
         safety_margin = workspace.get('safety_margin', 0.05)
-        
-        x_min, x_max = table_bounds[0] + safety_margin, table_bounds[1] - safety_margin
-        y_min, y_max = table_bounds[2] + safety_margin, table_bounds[3] - safety_margin
-        z_surface = table_bounds[4]
-        
+
+        if 'x_range' in workspace and 'y_range' in workspace and 'z_range' in workspace:
+            # 新格式：直接 xyz 坐标范围 [min, max]
+            x_range = workspace['x_range']
+            y_range = workspace['y_range']
+            z_range = workspace['z_range']
+        elif 'table_bounds' in workspace:
+            # 兼容旧格式：[x_min, x_max, y_min, y_max, z_surface]
+            tb = workspace['table_bounds']
+            x_range = [tb[0], tb[1]]
+            y_range = [tb[2], tb[3]]
+            z_range = [tb[4], tb[4]]
+        else:
+            x_range = [0.25, 0.50]
+            y_range = [-0.25, 0.25]
+            z_range = [0.44, 0.44]
+
+        x_min, x_max = x_range[0] + safety_margin, x_range[1] - safety_margin
+        y_min, y_max = y_range[0] + safety_margin, y_range[1] - safety_margin
+        z_min, z_max = z_range[0], z_range[1]
+
         max_attempts = 100
         for _ in range(max_attempts):
             x = np.random.uniform(x_min, x_max)
             y = np.random.uniform(y_min, y_max)
-            z = z_surface
-            
+            z = np.random.uniform(z_min, z_max) if z_min != z_max else z_min
+
             new_pos = np.array([x, y, z])
-            
+
             # 如果有已有位置，检查距离
             if existing_position is not None:
                 distance = np.linalg.norm(new_pos[:2] - existing_position[:2])  # 仅检查xy平面
                 if distance < min_distance:
                     continue  # 距离太近，重新生成
-            
+
             self._log(f"生成随机位置: [{x:.3f}, {y:.3f}, {z:.3f}]", "INFO")
             return new_pos
-        
+
         # 超过最大尝试次数，返回一个默认位置
+        z_default = (z_min + z_max) / 2
         self._log(f"随机位置生成失败（尝试{max_attempts}次），使用默认位置", "WARNING")
-        return np.array([0.35, 0.0, z_surface])
+        return np.array([
+            (x_min + x_max) / 2,
+            (y_min + y_max) / 2,
+            z_default
+        ])
     
     def _resolve_position(
         self,
@@ -317,8 +339,8 @@ class DataCollectionSystem:
         
         # 创建接口
         if self._use_real:
-            # 实机模式: 同步真实机器人和仿真
-            self._log("使用真实机器人接口", "INFO")
+            # 实机模式: 仅真实机器人 + 真实相机
+            self._log("使用真实机器人接口（纯实机模式）", "INFO")
             self._real = RealInterface(camera_config=real_camera_config)
 
             # 带超时的连接（最多等待5秒）
@@ -354,21 +376,13 @@ class DataCollectionSystem:
                 # 启动真实机器人发布者
                 self._real_publisher = RealPublisher(self._real, self._broker, fps=20)
                 self._real_publisher.start()
+                # 机器人连上后，再连相机（相机初始化可能较慢，不阻塞机器人连接超时）
+                self._log("连接相机...", "INFO")
+                self._real.connect_cameras()
 
-            # 使用 SimuManager 管理仿真（禁用 IK，用于同步）
-            if not self._simu_manager.start_simulation(
-                simu_config.get('xml_path', ''),
-                camera_names=self._simu_camera_names,
-                use_ik=not real_connected,  # 离线时启用 IK
-                fps=20,
-                show_viewer=self._show_simu_viewer,
-                use_process_renderer=True,
-            ):
-                self._log("初始化仿真失败", "ERROR")
-                return False
-            # SimuManager 内部已启动 SimuPublisher
-            self._simu = self._simu_manager.simu
-            self._log("仿真已初始化", "SUCCESS")
+            # 实机模式：不启动仿真
+            self._simu = None
+            self._log("实机模式：不启动仿真", "INFO")
         else:
             # 仿真独立模式: 启用 IK，不依赖实机同步
             self._log("使用仿真独立模式（IK）", "INFO")
@@ -389,54 +403,62 @@ class DataCollectionSystem:
             self._simu = self._simu_manager.simu
             self._log(f"仿真已初始化，IK可用: {self._simu.is_ik_available()}", "SUCCESS")
 
-        self._apply_sim_initial_joints()
-        
-        # 读取坐标变换参数
+        # 仅仿真模式需要
+        if self._simu is not None:
+            self._apply_sim_initial_joints()
+            self._simu.set_display_cameras(self._simu_camera_names)
+        # 读取坐标变换参数（仅仿真模式使用）
         self._coord_rotation_z = simu_config.get('coord_rotation_z', 0.0)
-        self._log(f"坐标变换: 绕Z轴旋转 {self._coord_rotation_z}°", "INFO")
-        
-        # 设置相机
-        self._simu.set_display_cameras(self._simu_camera_names)
+        if self._simu is not None:
+            self._log(f"坐标变换: 绕Z轴旋转 {self._coord_rotation_z}°", "INFO")
 
-        if self._use_real:
-            # 进程渲染器已在 SimuManager.start_simulation 中启动
-            self._log("使用独立渲染进程（由 SimuManager 管理）", "INFO")
-        
-        # 创建数据收集器
+        # 计算视频帧率
         video_fps = 30
         if real_camera_config:
             first_cam = list(real_camera_config.values())[0]
             video_fps = first_cam.get('fps', 30)
 
-        if self._use_real and self._real_connected:
-            # 实机已连接：创建实机和仿真数据收集器
+        if self._use_real:
+            # 实机模式：仅创建实机数据收集器
             real_data_root = dataset_config.get('real_data_root', './data/Real/realdata')
-            simu_data_root = dataset_config.get('simu_data_root', './data/Real/simudata')
+            real_cam_names = list(real_camera_config.keys()) if real_camera_config else ['cam_0']
             self._real_data_collector = RealDataCollector(
                 self._real,
                 data_root=real_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
-                broker=self._broker,  # 通过 broker 获取数据
+                broker=self._broker,
+                camera_names=real_cam_names,
             )
-            self._simu_data_collector = SimuDataCollector(
-                self._simu_manager.simu,  # 使用 SimuManager 的 simu
-                data_root=simu_data_root,
-                fps=dataset_config.get('fps', 20),
-                video_fps=video_fps,
-                run_in_thread=False,
-                broker=self._broker,  # 通过 broker 获取数据
-            )
-            self._sync_controller = SyncController(
+            self._simu_data_collector = None
+            self._sync_controller = None
+
+            # 读取初始关节位置
+            init_joints = robot_config.get('initial_joints', None)
+            init_gripper = robot_config.get('initial_gripper', 0.0)
+            if init_joints is not None:
+                initial_joints = np.array(init_joints[:6], dtype=float)
+                self._log(f"初始关节(deg): {initial_joints.tolist()}, 夹爪: {init_gripper}", "INFO")
+            else:
+                initial_joints = np.zeros(6, dtype=float)
+
+            # 创建抓取执行器（实机模式：不传 simu）
+            pre_grasp_offs = [0, 0, float(grasp_config.get('pre_grasp_height', 0.05))]
+            self._grasp_executor = GraspExecutor(
                 self._real,
-                self._simu,
-                on_sync_callback=self._simu_data_collector.collect_frame
+                None,
+                home_position=[0, 0, 0, 0, 0, 0],
+                pre_grasp_offset=pre_grasp_offs,
+                lift_height=grasp_config.get('lift_height', 0.20),
+                approach_height=grasp_config.get('approach_height', 0.05),
+                use_simulation=False,
+                initial_joints=initial_joints,
+                initial_gripper=init_gripper,
             )
         else:
-            # 离线模式或Mock模式：仅仿真数据收集器
+            # 仿真模式：仅仿真数据收集器
             simu_data_root = dataset_config.get('mock_simu_data_root', dataset_config.get('simu_data_root', './data/Simu/simu_data'))
             self._real_data_collector = None
-            # 启用独立线程收集帧，确保整个任务期间持续收集数据
             self._simu_data_collector = SimuDataCollector(
                 self._simu_manager.simu,
                 data_root=simu_data_root,
@@ -447,39 +469,36 @@ class DataCollectionSystem:
             )
             self._sync_controller = None
 
-        # 创建抓取执行器
-        self._grasp_executor = GraspExecutor(
-            self._real,
-            self._simu,
-            home_position=[0, 0, 0, 0, 0, 0],
-            pre_grasp_offset=grasp_config.get('pre_grasp_offset', [0, 0, 0.15]),
-            lift_height=grasp_config.get('lift_height', 0.20),
-            approach_height=grasp_config.get('approach_height', 0.05),
-            use_simulation=(not self._real_connected),  # 离线时使用仿真
-        )
-        
-        if 'default_orientation' in grasp_config:
-            self._grasp_executor.set_default_orientation(grasp_config['default_orientation'])
-        if 'grasp_offsets' in grasp_config:
-            self._grasp_executor.set_grasp_offsets(grasp_config['grasp_offsets'])
-        if 'gripper_positions' in grasp_config:
-            self._grasp_executor.set_gripper_positions_by_object(grasp_config['gripper_positions'])
-        if 'object_profiles' in grasp_config:
-            self._grasp_executor.set_object_profiles(grasp_config['object_profiles'])
-        
+            pre_grasp_offs = [0, 0, float(grasp_config.get('pre_grasp_height', 0.05))]
+            # 创建抓取执行器（仿真模式：使用 IK）
+            self._grasp_executor = GraspExecutor(
+                self._real,
+                self._simu,
+                home_position=[0, 0, 0, 0, 0, 0],
+                pre_grasp_offset=pre_grasp_offs,
+                lift_height=grasp_config.get('lift_height', 0.20),
+                approach_height=grasp_config.get('approach_height', 0.05),
+                use_simulation=(not self._real_connected),
+            )
+
+        # 设置每物体抓取参数
+        object_profiles = grasp_config.get('object_profiles', {})
+        if object_profiles:
+            self._grasp_executor.set_object_profiles(object_profiles)
+
         # 设置放置时的抬升高度
         micro_lift = grasp_config.get('micro_lift_height', 0.02)
         release_lift = grasp_config.get('release_lift_height', 0.08)
         self._grasp_executor.set_release_lift_heights(micro_lift, release_lift)
 
-        if (not self._real_connected) and self._simu_data_collector is not None:
+        if self._simu_data_collector is not None:
             self._grasp_executor.set_frame_callback(self._simu_data_collector.collect_frame)
         
         # 加载进度（恢复上次收集到的 episode 编号）
         progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
         saved_count = progress_collector.load_progress() if progress_collector is not None else 0
         if saved_count > 0:
-            self._current_episode = saved_count + 1  # 下一个 episode 从已保存数+1 开始
+            self._current_episode = saved_count + 1
             self._log(f"从进度恢复，下一个 Episode 将为 {self._current_episode} (已有 {saved_count} 条)", "INFO")
         
         return True
@@ -608,6 +627,33 @@ class DataCollectionSystem:
             return first_body.attrib.get("name", fallback) or fallback
         except Exception:
             return fallback
+
+    def _infer_object_body_name(self, object_name: str, task_config: dict) -> str:
+        """推断仿真物体 body name"""
+        object_cfg = self._object_library.get(object_name, {}) if isinstance(self._object_library, dict) else {}
+        object_model_xml = object_cfg.get('model_xml_path', '') if isinstance(object_cfg, dict) else ''
+        cfg_body_name = object_cfg.get('body_name', '') if isinstance(object_cfg, dict) else ''
+        inferred = self._infer_object_body_name_from_xml(object_model_xml, fallback='cube')
+        return task_config.get('sim_body_name', cfg_body_name or inferred)
+
+    def _infer_plate_body_name(self) -> str:
+        """推断仿真盘子 body name"""
+        plate_target_cfg = self._config.get('simulation', {}).get('plate_target', {}) if isinstance(self._config, dict) else {}
+        if not plate_target_cfg:
+            plate_target_cfg = self._config.get('plate_target', {}) if isinstance(self._config, dict) else {}
+        return plate_target_cfg.get('body_name', 'body_obj_plate') if isinstance(plate_target_cfg, dict) else 'body_obj_plate'
+
+    def _get_object_model_xml(self, object_name: str) -> str:
+        """获取物体模型 XML 路径"""
+        object_cfg = self._object_library.get(object_name, {}) if isinstance(self._object_library, dict) else {}
+        return object_cfg.get('model_xml_path', '') if isinstance(object_cfg, dict) else ''
+
+    def _get_plate_model_xml(self) -> str:
+        """获取盘子模型 XML 路径"""
+        plate_target_cfg = self._config.get('simulation', {}).get('plate_target', {}) if isinstance(self._config, dict) else {}
+        if not plate_target_cfg:
+            plate_target_cfg = self._config.get('plate_target', {}) if isinstance(self._config, dict) else {}
+        return plate_target_cfg.get('model_xml_path', '') if isinstance(plate_target_cfg, dict) else ''
 
     def _resolve_tuning_task(self, task_id: Optional[str], object_name: Optional[str], object_position: Optional[np.ndarray]) -> Tuple[str, str, np.ndarray]:
         tasks = self._config.get('tasks', {}) if isinstance(self._config, dict) else {}
@@ -867,16 +913,24 @@ class DataCollectionSystem:
         self._running = True
         self._paused = False
         self._waiting_for_next_task = False
+
+        # 开始收集前，机械臂先复位到初始关节位置（后台线程）
+        if self._real_connected and self._grasp_executor is not None:
+            self._log("机械臂复位到初始关节位置...", "INFO")
+            _gs = self._grasp_executor
+            _ls = self._log
+            def _reset():
+                _gs.move_to_initial_joints()
+                _ls("机械臂已复位", "SUCCESS")
+            threading.Thread(target=_reset, daemon=True).start()
         
         self._log(f"开始收集，Episode 编号: {self._current_episode}，任务索引: {start_task_index}", "INFO")
         
         # 启动数据收集器（不预启动 episode，每个任务单独 start_episode）
         if self._real_data_collector is not None:
             self._real_data_collector.start_collection()
-        self._simu_data_collector.start_collection()
-        # 仅实机模式启动同步控制器
-        if self._sync_controller is not None:
-            self._sync_controller.start_sync()
+        if self._simu_data_collector is not None:
+            self._simu_data_collector.start_collection()
         self._log(f"数据收集已启动，当前 Episode 编号: {self._current_episode}", "SUCCESS")
         
         self._update_status("等待执行任务", "#ffa500")
@@ -909,7 +963,7 @@ class DataCollectionSystem:
         task_thread.start()
 
     def _execute_current_task(self):
-        """准备当前任务（新模式：准备后等待人工完成）"""
+        """准备并自动执行当前任务"""
         try:
             tasks = self._config.get('tasks', {})
             task_list = list(tasks.items())
@@ -926,8 +980,8 @@ class DataCollectionSystem:
 
             if success:
                 self._task_in_progress = True
-                self._log('任务已就绪，请手动操作并点击"抓取任务完毕"', "INFO")
-                self._update_status("等待手动完成", "#ffa500")
+                self._log('任务已启动，自动执行中...', "INFO")
+                self._update_status("自动执行中", "#44ff44")
             else:
                 self._task_in_progress = False
                 self._log("任务准备失败", "WARNING")
@@ -970,16 +1024,12 @@ class DataCollectionSystem:
         # 丢弃当前任务数据
         if self._real_data_collector is not None:
             self._real_data_collector.discard_current_task()
-        else:
+        if self._simu_data_collector is not None:
             self._simu_data_collector.discard_current_task()
         self._log("当前任务数据已丢弃", "SUCCESS")
 
-        # 清理同步控制器状态
-        if self._sync_controller is not None and hasattr(self._sync_controller, 'clear_adhesion_targets'):
-            self._sync_controller.clear_adhesion_targets()
-
-        # 关闭仿真窗口（如果需要重建）
-        if not self._real_connected and self._simu_manager.is_running:
+        # 关闭仿真窗口（仅仿真模式需要重建）
+        if self._simu is not None and self._simu_manager.is_running:
             try:
                 self._log("正在关闭仿真窗口...", "INFO")
                 self._simu_manager.stop_simulation()
@@ -1007,63 +1057,76 @@ class DataCollectionSystem:
         task_thread.start()
 
     def finish_current_task(self):
-        """手动确认当前任务完成，并进行成功判定"""
-        if not self._running:
-            self._log("数据收集未启动", "WARNING")
+        """确认当前任务完成（防重入，自动线程和手动按钮均安全）"""
+        if not self._finish_lock.acquire(blocking=False):
+            self._log("任务正在提交中，请稍候", "WARNING")
             return
 
-        if not self._task_in_progress:
-            self._log("当前没有进行中的任务", "WARNING")
-            return
+        try:
+            if not self._running:
+                self._log("数据收集未启动", "WARNING")
+                return
 
-        self._update_status("等待数据处理完成", "#ffa500")
-        self._log("正在停止数据记录...", "INFO")
-        if self._real_data_collector is not None:
-            self._real_data_collector.stop_recording()
-        if self._simu_data_collector is not None:
-            self._simu_data_collector.stop_recording()
-        self._log("数据记录已停止，正在保存 Episode...", "INFO")
+            if not self._task_in_progress:
+                self._log("当前没有进行中的任务", "WARNING")
+                return
 
-        success = self._evaluate_task_success()
-        self._log(f"任务完成: {'成功' if success else '失败'}", "SUCCESS" if success else "WARNING")
+            self._task_in_progress = False  # 先标记，防止状态混乱
+            self._update_status("等待数据处理完成", "#ffa500")
+            self._log("正在停止数据记录...", "INFO")
+            if self._real_data_collector is not None:
+                self._real_data_collector.stop_recording()
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.stop_recording()
+            self._log("数据记录已停止，正在保存 Episode...", "INFO")
 
-        # 结束当前 episode（每个任务 = 一个 episode）
-        if self._real_data_collector is not None:
-            self._real_data_collector.end_episode(self._current_episode, success)
-        self._simu_data_collector.end_episode(self._current_episode, success)
-        self._log(f"Episode {self._current_episode} 数据已保存完毕", "SUCCESS")
-        self._current_episode += 1
+            success = self._evaluate_task_success()
+            self._log(f"任务完成: {'成功' if success else '失败'}", "SUCCESS" if success else "WARNING")
 
-        # 保存进度（每次完成一个 episode 都持久化）
-        progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
-        if progress_collector is not None:
-            progress_collector._save_progress()
+            if self._real_data_collector is not None:
+                self._real_data_collector.end_episode(self._current_episode, success)
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.end_episode(self._current_episode, success)
+            self._log(f"Episode {self._current_episode} 数据已保存完毕", "SUCCESS")
+            self._current_episode += 1
 
-        if self._sync_controller is not None and hasattr(self._sync_controller, 'clear_adhesion_targets'):
-            self._sync_controller.clear_adhesion_targets()
+            progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
+            if progress_collector is not None:
+                progress_collector._save_progress()
 
-        # 任务结束：通过 SimuManager 彻底重建仿真（方案B）
-        if not self._real_connected and self._simu_manager.is_running:
-            try:
-                self._log("正在关闭仿真窗口...", "INFO")
-                self._simu_manager.stop_simulation()
-                self._simu = None
-                self._log("仿真窗口已关闭", "SUCCESS")
-            except Exception as e:
-                self._log(f"关闭仿真失败: {e}", "WARNING")
+            # 机械臂复位到初始位置（后台线程，不阻塞）
+            if self._real_connected and self._grasp_executor is not None:
+                self._log("机械臂复位到初始关节位置...", "INFO")
+                _gs = self._grasp_executor
+                _ls = self._log
+                def _reset():
+                    _gs.move_to_initial_joints()
+                    _ls("机械臂已复位", "SUCCESS")
+                threading.Thread(target=_reset, daemon=True).start()
 
-        self._task_in_progress = False
-        self._active_task_info = {}
-        self._current_task_index += 1
+            # 任务结束：仅在仿真模式下重建仿真
+            if self._simu is not None and self._simu_manager.is_running:
+                try:
+                    self._log("正在关闭仿真窗口...", "INFO")
+                    self._simu_manager.stop_simulation()
+                    self._simu = None
+                    self._log("仿真窗口已关闭", "SUCCESS")
+                except Exception as e:
+                    self._log(f"关闭仿真失败: {e}", "WARNING")
 
-        tasks = self._config.get('tasks', {})
-        task_total = len(list(tasks.items()))
-        if self._current_task_index >= task_total:
-            self._log(f"所有任务已完成！共收集 {self._current_episode - 1} 个 episode", "SUCCESS")
-            self._update_status("任务完成", "#00aa00")
-        else:
-            self._log("等待下一个任务...", "INFO")
-            self._update_status("等待执行任务", "#ffa500")
+            self._active_task_info = {}
+            self._current_task_index += 1
+
+            tasks = self._config.get('tasks', {})
+            task_total = len(list(tasks.items()))
+            if self._current_task_index >= task_total:
+                self._log(f"所有任务已完成！共收集 {self._current_episode - 1} 个 episode", "SUCCESS")
+                self._update_status("任务完成", "#00aa00")
+            else:
+                self._log("等待下一个任务...", "INFO")
+                self._update_status("等待执行任务", "#ffa500")
+        finally:
+            self._finish_lock.release()
     
     def stop(self):
         """停止数据收集"""
@@ -1071,18 +1134,17 @@ class DataCollectionSystem:
         self._running = False
         self._paused = False
         
-        if self._sync_controller:
-            self._sync_controller.stop_sync()
-        
         # 如果当前有任务正在进行，保存该 episode
         if self._task_in_progress:
             if self._real_data_collector is not None:
                 self._real_data_collector.stop_recording()
-            self._simu_data_collector.stop_recording()
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.stop_recording()
             
             if self._real_data_collector is not None:
                 self._real_data_collector.end_episode(self._current_episode, True)
-            self._simu_data_collector.end_episode(self._current_episode, True)
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.end_episode(self._current_episode, True)
             self._log(f"Episode {self._current_episode} 已保存（部分数据）", "WARNING")
             self._current_episode += 1
         
@@ -1097,8 +1159,8 @@ class DataCollectionSystem:
         if progress_collector is not None:
             progress_collector._save_progress()
         
-        # 停止仿真
-        if not self._real_connected and self._simu_manager.is_running:
+        # 停止仿真（仅仿真模式）
+        if self._simu is not None and self._simu_manager.is_running:
             try:
                 self._log("正在关闭仿真窗口...", "INFO")
                 self._simu_manager.stop_simulation()
@@ -1111,75 +1173,54 @@ class DataCollectionSystem:
         self._update_status("已停止", "#ff4444")
     
     def _execute_task(self, task_id: str, task_config: dict) -> bool:
-        """准备单个任务（新模式：不自动完成抓放）"""
+        """准备并执行单个任务"""
         try:
             task_name = task_config.get('description', task_id)
-            
-            # 解析位置配置（支持坐标数组或"random"）
-            # 注意顺序：先获取plate位置（通常是固定的），再生成object位置时避开plate
+            object_name = task_config.get('object_name', 'cube')
+
+            # 解析位置
             plate_pos_config = task_config.get('plate_position', [0.35, -0.15, 0.44])
             plate_pos = self._resolve_position(plate_pos_config)
-            
-            # object位置需与plate保持最小距离（当object为random时生效）
             min_dist = self._config.get('workspace', {}).get('min_object_plate_distance', 0.15)
             object_pos_config = task_config.get('object_position', [0.35, 0.15, 0.44])
             object_pos = self._resolve_position(object_pos_config, existing_position=plate_pos, min_distance=min_dist)
 
-            object_name = task_config.get('object_name', 'cube')
             self._grasp_executor.set_object_type(object_name)
             self._log(f"物体类型: {object_name}", "INFO")
 
-            # 调试：打印 object_library 内容
-            self._log(f"DEBUG: _object_library keys: {list(self._object_library.keys()) if self._object_library else 'None'}", "INFO")
-            
-            object_cfg = self._object_library.get(object_name, {}) if isinstance(self._object_library, dict) else {}
-            self._log(f"DEBUG: object_cfg for '{object_name}': {object_cfg}", "INFO")
-            
-            object_model_xml = object_cfg.get('model_xml_path', '')
-            cfg_body_name = object_cfg.get('body_name', '') if isinstance(object_cfg, dict) else ''
-            inferred_body_name = self._infer_object_body_name_from_xml(object_model_xml, fallback='cube')
-            object_body_name = task_config.get('sim_body_name', cfg_body_name or inferred_body_name)
-            
-            self._log(f"DEBUG: object_model_xml={object_model_xml}", "INFO")
-            self._log(f"DEBUG: object_body_name={object_body_name}", "INFO")
+            # 设定抓取目标（实机和仿真共用）
+            self._grasp_executor.set_target(
+                object_position=object_pos.tolist(),
+                place_position=plate_pos.tolist(),
+            )
 
-            plate_target_cfg = self._config.get('simulation', {}).get('plate_target', {})
-            if not plate_target_cfg:
-                plate_target_cfg = self._config.get('plate_target', {})
-            plate_model_xml = plate_target_cfg.get('model_xml_path', '')
-            plate_body_name = plate_target_cfg.get('body_name', 'body_obj_plate')
-            self._log(f"DEBUG: plate_target_cfg={plate_target_cfg}", "INFO")
-            self._log(f"DEBUG: plate_model_xml={plate_model_xml}", "INFO")
-            self._log(f"DEBUG: plate_body_name={plate_body_name}", "INFO")
+            # ── 仿真模式：重建场景、加载模型 ──
+            if self._simu is not None and self._simu_base_xml_path:
+                object_body_name = self._infer_object_body_name(object_name, task_config)
+                plate_body_name = self._infer_plate_body_name()
 
-            if object_model_xml and self._simu_base_xml_path:
-                # 方案B：每个任务彻底重建仿真
                 self._log(f"重建仿真场景: object={object_name}", "INFO")
-                simu_camera_names = self.get_simu_camera_names()
-
-                # 使用 SimuManager 的任务仿真模式
                 task_simu_config = {
                     'base_scene_xml': self._simu_base_xml_path,
-                    'object_model_xml': object_model_xml,
+                    'object_model_xml': self._get_object_model_xml(object_name),
                     'object_body_name': object_body_name,
-                    'camera_names': simu_camera_names,
-                    'use_ik': not self._real_connected,  # 离线模式启用 IK
+                    'camera_names': self.get_simu_camera_names(),
+                    'use_ik': not self._real_connected,
                     'fps': 20,
                     'show_viewer': False,
-                    'use_process_renderer': self._real_connected,  # 实机模式使用进程渲染
+                    'use_process_renderer': self._real_connected,
                 }
 
+                plate_model_xml = self._get_plate_model_xml()
                 if plate_model_xml:
                     task_simu_config['plate_model_xml'] = plate_model_xml
                     task_simu_config['plate_body_name'] = plate_body_name
 
-                # 添加物体位置和初始关节
                 simu_object_pos = self._transform_position(object_pos)
                 task_simu_config['object_position'] = simu_object_pos.tolist()
-
                 if self._sim_initial_joints_deg is not None:
                     task_simu_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
-                task_simu_config['initial_gripper'] = self._sim_initial_gripper
+                task_simu_config['initial_gripper'] = getattr(self, '_sim_initial_gripper', 0.0)
 
                 simu_plate_pos = self._transform_position(plate_pos)
                 if plate_model_xml and plate_body_name:
@@ -1188,50 +1229,32 @@ class DataCollectionSystem:
                 if not self._simu_manager.start_task_simulation(task_simu_config):
                     self._log(f"动态加载物体失败: {object_name}", "ERROR")
                     return False
-
-                # 更新 SimuInterface 引用
                 self._simu = self._simu_manager.simu
-                self._log(f"已加载任务物体模型: {object_name}", "INFO")
 
-            # 确保 GraspExecutor / SimuDataCollector 持有最新的 SimuInterface 引用（任务切换时 SimuInterface 会被重建）
-            if self._grasp_executor is not None and self._simu is not None:
+                # 同步 SimuInterface 引用到使用方
                 self._grasp_executor.set_simu_interface(self._simu)
-            if self._simu_data_collector is not None and self._simu is not None:
-                self._simu_data_collector.set_simu_interface(self._simu)
-
-            self._grasp_executor.set_sim_object_body_name(object_body_name)
-            # SimuManager 已设置 active_object_body_name，此处确保同步
-            if self._simu is not None:
+                if self._simu_data_collector is not None:
+                    self._simu_data_collector.set_simu_interface(self._simu)
+                self._grasp_executor.set_sim_object_body_name(object_body_name)
                 self._simu.set_active_object_body_name(object_body_name)
 
-            simu_object_pos = self._transform_position(object_pos)
-            simu_plate_pos = self._transform_position(plate_pos)
-            self._log(f"坐标变换: {object_pos} -> {simu_object_pos}", "INFO")
-            self._log(f"放置目标变换: {plate_pos} -> {simu_plate_pos}", "INFO")
-
-            # 如果没有 object_model_xml（没有场景重建），需要手动设置物体位置
-            if not (object_model_xml and self._simu_base_xml_path):
-                if self._simu is not None:
-                    self._simu.set_object_position(object_body_name, simu_object_pos, reset_z=True)
-                    self._log(f"物块位置已重置: {simu_object_pos} (body={object_body_name})", "INFO")
-                    if plate_model_xml and plate_body_name:
-                        self._simu.set_object_position(plate_body_name, simu_plate_pos, reset_z=True)
-                        self._log(f"放置目标位置已重置: {simu_plate_pos} (body={plate_body_name})", "INFO")
-
-            self._grasp_executor.set_target(
-                object_position=object_pos.tolist(),
-                place_position=plate_pos.tolist(),
-            )
-
-            self._active_task_info = {
-                'task_id': task_id,
-                'task_name': task_config.get('description', task_id),
-                'object_name': object_name,
-                'object_body_name': object_body_name,
-                'object_pos': np.asarray(simu_object_pos, dtype=float),
-                'target_pos': np.asarray(simu_plate_pos, dtype=float),
-                'target_pos_user': np.asarray(plate_pos, dtype=float),
-            }
+                self._active_task_info = {
+                    'task_id': task_id,
+                    'task_name': task_name,
+                    'object_name': object_name,
+                    'object_body_name': object_body_name,
+                    'object_pos': np.asarray(simu_object_pos, dtype=float),
+                    'target_pos': np.asarray(simu_plate_pos, dtype=float),
+                    'target_pos_user': np.asarray(plate_pos, dtype=float),
+                }
+            else:
+                # 实机模式：轻量 task_info
+                self._active_task_info = {
+                    'task_id': task_id,
+                    'task_name': task_name,
+                    'object_name': object_name,
+                    'description': task_config.get('description', task_id),
+                }
 
             # 每个任务是一个独立的 episode
             single_task_info = {
@@ -1245,32 +1268,40 @@ class DataCollectionSystem:
                     self.get_real_camera_names(),
                     single_task_info,
                 )
-            self._simu_data_collector.start_episode(
-                self._current_episode,
-                self.get_simu_camera_names(),
-                single_task_info,
-            )
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.start_episode(
+                    self._current_episode,
+                    self.get_simu_camera_names(),
+                    single_task_info,
+                )
             self._log(f"Episode {self._current_episode} 已启动 (任务: {task_name})", "INFO")
 
             if self._real_data_collector is not None:
                 self._real_data_collector.start_recording()
-            self._simu_data_collector.start_recording()
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.start_recording()
             self._log("数据记录已开始，等待操作...", "INFO")
 
             if self._real_connected:
-                # 实机已连接：启动同步控制器
-                if self._sync_controller is not None and hasattr(self._sync_controller, 'set_adhesion_targets'):
-                    self._sync_controller.set_adhesion_targets(
-                        object_body_name=object_body_name,
-                        object_pos=simu_object_pos,
-                        plate_pos=simu_plate_pos,
-                    )
-                self._log("实机模式: 已启动关节同步+吸附机制，请手动抓放", "INFO")
-            else:
-                # 离线模式或Mock模式
-                self._log("离线模式: 使用仿真进行操作", "INFO")
-                if self._show_simu_viewer and self._simu is not None:
-                    self._log(f"DEBUG: 调用 start_glfw_viewer, _show_simu_viewer={self._show_simu_viewer}", "INFO")
+                # 实机已连接：自动执行抓取流程
+                self._log("实机模式: 自动执行抓取流程...", "INFO")
+                self._update_status("自动抓取中", "#44ff44")
+                # 在新线程中执行抓取，避免阻塞 GUI
+                import threading as _th
+                _self = self  # 闭包捕获
+                def _auto_execute():
+                    success = _self._grasp_executor.execute()
+                    _self._log(f"自动抓取流程{'完成' if success else '未完全成功'}", "SUCCESS" if success else "WARNING")
+                    # 抓取完成后自动提交任务
+                    _self._log("正在保存 Episode...", "INFO")
+                    _self.finish_current_task()
+                _th.Thread(target=_auto_execute, daemon=True).start()
+                self._log("抓取流程已启动，等待完成...", "INFO")
+            elif self._simu is not None:
+                # 仿真模式
+                self._log("仿真模式: 使用仿真进行操作", "INFO")
+                if self._show_simu_viewer:
+                    self._log(f"调用 start_glfw_viewer", "INFO")
                     viewer_started = self._simu.start_glfw_viewer(
                         width=1200,
                         height=900,
@@ -1280,8 +1311,6 @@ class DataCollectionSystem:
                         self._log("GLFW 查看器已启动", "SUCCESS")
                     else:
                         self._log("GLFW 查看器启动失败", "WARNING")
-                else:
-                    self._log(f"DEBUG: _show_simu_viewer=False 或 _simu=None, 跳过查看器启动", "INFO")
                 # 自动 IK 到预抓取位点
                 self.move_current_task_to_pre_grasp()
 
@@ -1297,11 +1326,11 @@ class DataCollectionSystem:
             return False
 
     def _evaluate_task_success(self) -> bool:
-        """判定任务是否成功：物体是否在盘子半径范围内"""
+        """判定任务是否成功：物体是否在盘子半径范围内（仅仿真模式下可验证）"""
         if not self._active_task_info:
             return False
-        if not hasattr(self._simu, 'get_object_position'):
-            return True
+        if self._simu is None or not hasattr(self._simu, 'get_object_position'):
+            return True  # 实机模式无法自动验证，默认成功
 
         # 获取物体当前位置
         object_body_name = self._active_task_info.get('object_body_name', 'cube')
@@ -1388,8 +1417,8 @@ class DataCollectionSystem:
     def move_to_home_pose(self) -> bool:
         if self._grasp_executor is None:
             return False
-        home_pose = np.zeros(6)
-        return bool(self._grasp_executor._move_to_position(home_pose))
+        self._grasp_executor.move_to_initial_joints()
+        return True
 
     def get_gripper_close_position(self) -> float:
         if self._grasp_executor is None:

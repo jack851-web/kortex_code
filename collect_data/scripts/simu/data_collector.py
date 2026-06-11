@@ -4,8 +4,8 @@
 核心设计：
 - 使用 LeRobotDataset.create() + streaming_encoding 直接写入 LeRobot v3.0 格式
 - 每帧调用 add_frame()，视频实时流式编码为 MP4（libsvtav1/h264）
-- observation.state: [6关节角(度), 1夹爪] = 7维 float32
-- action: [6关节增量(度), 1夹爪增量] = 7维 float32（= 下一帧state - 当前帧state）
+- observation.state: [6关节角(归一化[-1,1]), 1夹爪(0~1), 3末端位姿(归一化[-1,1])] = 10维 float32
+- action: [6关节归一化增量, 1夹爪增量, 3末端位姿增量] = 10维 float32（= 下一帧state - 当前帧state）
 - end_episode 时调用 save_episode()，停止时调用 finalize()
 - 保持外部接口与旧版完全兼容
 """
@@ -16,6 +16,9 @@ import numpy as np
 import threading
 from typing import Dict, List, Any
 from pathlib import Path
+
+# 导入关节归一化函数
+from kortex_real.gen3.gen3_lite import normalize_joints, normalize_ee_pose, JOINT_NAMES as _JOINT_NAMES
 
 
 # 单个 Episode 最大帧数限制
@@ -31,13 +34,13 @@ def _build_features(camera_names: List[str], image_height: int = 480, image_widt
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (7,),  # 6关节角(度) + 1夹爪
-            "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper"],
+            "shape": (10,),  # 6关节角(归一化[-1,1]) + 1夹爪[0,1] + 3末端位姿(归一化[-1,1])
+            "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper", "ee_x", "ee_y", "ee_z"],
         },
         "action": {
             "dtype": "float32",
-            "shape": (7,),  # 6关节增量(度) + 1夹爪增量
-            "names": ["dj1", "dj2", "dj3", "dj4", "dj5", "dj6", "dgripper"],
+            "shape": (10,),  # 6关节归一化增量 + 1夹爪增量 + 3末端位姿增量
+            "names": ["dj1", "dj2", "dj3", "dj4", "dj5", "dj6", "dgripper", "dee_x", "dee_y", "dee_z"],
         },
     }
     for cam_name in camera_names:
@@ -181,6 +184,20 @@ class SimuDataCollector:
                 )
                 # 创建新的 episode buffer
                 self._dataset.episode_buffer = self._dataset.create_episode_buffer()
+                # 修复：加载已有数据集时 _streaming_encoder 为 None，
+                # 导致 add_frame 回退到 images/ 路径写 PNG 帧，需重新初始化
+                if self._use_videos:
+                    from lerobot.datasets.video_encoder import StreamingVideoEncoder
+                    self._dataset._streaming_encoder = StreamingVideoEncoder(
+                        fps=self._dataset.meta.fps,
+                        vcodec=self._dataset.vcodec,
+                        pix_fmt="yuv420p",
+                        g=2,
+                        crf=30,
+                        preset=None,
+                        queue_maxsize=30,
+                    )
+                    print(f"[SimuDataCollector] Re-initialized streaming encoder for existing dataset")
             except Exception as e:
                 print(f"[SimuDataCollector] Failed to load existing dataset: {e}")
                 # 如果加载失败，删除并重新创建
@@ -299,16 +316,27 @@ class SimuDataCollector:
                 images = self._latest_broker_images
                 joints_rad = self._latest_broker_joints
                 gripper = self._latest_broker_gripper if self._latest_broker_gripper is not None else 0.0
-                joints = np.rad2deg(joints_rad) if joints_rad is not None else np.zeros(6)
+                tcp_pos = self._latest_broker_tcp  # [x, y, z] 或 None
             else:
                 images = self._simu.get_camera_images(self._camera_names)
-                joints = self._simu.get_joint_state()
+                joints_rad = self._simu.get_joint_state()
                 gripper = self._simu.get_gripper_state()
+                tcp_pos = self._simu.get_tcp_position()  # 获取末端位置 [x, y, z]
 
             with self._data_lock:
-                # 构建 state 向量: [6关节角(度), 1夹爪]
+                # 构建 state 向量: [6关节角(归一化), 1夹爪, 3末端位姿(归一化)] = 10维
+                # 仿真输出的是弧度，先转度数再归一化
+                joints_deg = np.rad2deg(joints_rad) if joints_rad is not None else np.zeros(6)
+                normalized_joints = normalize_joints(joints_deg)
+
+                # 末端位姿归一化
+                if tcp_pos is not None:
+                    normalized_ee = normalize_ee_pose(tcp_pos[0], tcp_pos[1], tcp_pos[2])
+                else:
+                    normalized_ee = np.zeros(3, dtype=np.float32)
+
                 state_vec = np.array(
-                    list(joints) + [float(gripper)],
+                    list(normalized_joints) + [float(gripper)] + list(normalized_ee),
                     dtype=np.float32,
                 )
 
@@ -316,7 +344,7 @@ class SimuDataCollector:
                 if self._prev_state is not None:
                     action_vec = (state_vec - self._prev_state).astype(np.float32)
                 else:
-                    action_vec = np.zeros(7, dtype=np.float32)
+                    action_vec = np.zeros(10, dtype=np.float32)
                 self._prev_state = state_vec.copy()
 
                 # 构建 LeRobot frame

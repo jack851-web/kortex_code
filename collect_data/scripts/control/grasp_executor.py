@@ -62,9 +62,10 @@ class GraspExecutor:
         home_position: List[float],
         pre_grasp_offset: Union[List[float], Dict[str, Any]],
         lift_height: float,
-
         approach_height: float,
-        use_simulation: bool = False,  # 纯仿真模式标志
+        use_simulation: bool = False,
+        initial_joints: np.ndarray = None,
+        initial_gripper: float = 0.0,
     ):
         self._real = real_interface
         self._simu = simu_interface
@@ -78,6 +79,13 @@ class GraspExecutor:
         self._current_task_id = 0
         self._is_executing = False
         self._waypoint_delay = 0.1
+
+        # 初始关节位置（任务完成后回到此位置）
+        if initial_joints is not None:
+            self._initial_joints = np.array(initial_joints[:6], dtype=float)
+        else:
+            self._initial_joints = np.zeros(6, dtype=float)
+        self._initial_gripper = float(initial_gripper)
         
         # 放置时的抬升参数
         self._micro_lift_height = 0.02  # 松开前微抬高度（默认 2cm）
@@ -93,6 +101,10 @@ class GraspExecutor:
         self._default_grasp_offset: Optional[np.ndarray] = None
         self._object_grasp_offsets: Dict[str, np.ndarray] = {}
         self._object_type = self.OBJECT_TYPE_CUBE  # 默认方块类型
+
+        # 每物体 lift 高度
+        self._default_lift_height = lift_height
+        self._object_lift_heights: Dict[str, float] = {}
 
 
 
@@ -134,15 +146,15 @@ class GraspExecutor:
 
     
     def _get_object_z_from_xml(self) -> float:
-        """从仿真接口获取物体的z坐标"""
+        """从仿真接口获取物体的z坐标（仅仿真模式下可用）"""
+        if self._simu is None:
+            return 0.02
         try:
             if hasattr(self._simu, 'get_object_position'):
                 pos = self._simu.get_object_position(self._sim_object_body_name)
                 return pos[2]
-
         except Exception as e:
             print(f"[GraspExecutor] Warning: Could not get object z from XML: {e}")
-        # 默认返回一个安全高度
         return 0.02
 
     def _get_orientation_for_object(self, object_type: Optional[str] = None) -> np.ndarray:
@@ -205,34 +217,27 @@ class GraspExecutor:
             object_pos = self._object_position.copy()
             print(f"[GraspExecutor] 回退使用配置位置作为抓取目标: {object_pos}")
         
-        # 获取当前物体类型的抓取偏移（仅影响抓取x/y）
-        grasp_offset = self._get_grasp_offset()
         pre_grasp_offset = self._get_pre_grasp_offset_for_object()
 
-        # 预抓取位置：在物体上方
-        pre_grasp = object_pos + grasp_offset + pre_grasp_offset
-
-
+        # 预抓取位置：物体 XY + 上方 pre_grasp_height
+        pre_grasp = object_pos + pre_grasp_offset
         pre_grasp[2] = max(pre_grasp[2], MIN_HEIGHT)
 
-        # 抓取位置：物体位置 + 抓取偏移
-        grasp_pos = object_pos.copy() + grasp_offset
+        # 抓取位置：物体位置（直接用config坐标）
+        grasp_pos = object_pos.copy()
         grasp_pos[2] = max(object_pos[2], MIN_HEIGHT)
         
-        # 抬起位置
+        # 抬起位置（每物体可不同）
+        obj_lift = self._get_lift_height()
         lift_pos = object_pos.copy()
-        lift_pos[2] = max(object_pos[2], self._lift_height, MIN_HEIGHT)
+        lift_pos[2] = max(object_pos[2], obj_lift, MIN_HEIGHT)
         
         target_lift_pos = self._target_position.copy()
-        target_lift_pos[2] = max(self._target_position[2], self._lift_height, MIN_HEIGHT)
+        target_lift_pos[2] = max(self._target_position[2], obj_lift, MIN_HEIGHT)
         
         # 使用用户设置的放置高度，但不低于最小安全高度
         target_place_pos = self._target_position.copy()
         target_place_pos[2] = max(target_place_pos[2], MIN_HEIGHT)
-        
-        # 放下后抬起位置（避免碰到物体）
-        lift_after_place = self._target_position.copy()
-        lift_after_place[2] = max(self._target_position[2] + 0.1, MIN_HEIGHT)
         
         waypoints = [
             (self._make_cartesian_pose(pre_grasp), "pre_grasp"),
@@ -292,48 +297,18 @@ class GraspExecutor:
                     self._open_gripper(gradual=True)
                     print(f"[GraspExecutor] Gripper opened for place (gradual)")
 
-                    # 松开后先水平后退，再垂直抬升，避免碰到物体
+                    # 松开后垂直抬升
                     time.sleep(0.2)  # 等夹爪完全松开
-                    current_pose = self._simu.get_tcp_position() if self._use_simulation else self._real.get_cartesian_pose()
-                    retreat_pose = np.array(current_pose[:6]) if len(current_pose) >= 6 else np.zeros(6)
-
-                    # 先水平后退（沿抓取偏移的反方向移动）
-                    grasp_offset = self._get_grasp_offset()
-                    retreat_distance = max(0.08, np.linalg.norm(grasp_offset[:2]) + 0.04)  # 至少后退8cm或抓取偏移+4cm
-                    if np.linalg.norm(grasp_offset[:2]) > 0.001:
-                        # 沿抓取偏移的反方向后退
-                        retreat_direction = -grasp_offset[:2] / np.linalg.norm(grasp_offset[:2])
-                    else:
-                        # 默认向x负方向后退
-                        retreat_direction = np.array([-1.0, 0.0])
-                    retreat_pose[0] += retreat_direction[0] * retreat_distance
-                    retreat_pose[1] += retreat_direction[1] * retreat_distance
-
-                    print(f"[GraspExecutor] Retreating {retreat_distance*100:.1f}cm horizontally before lift...")
-                    self._move_to_position(retreat_pose, tolerance=0.08)
-
-                    # 然后垂直抬升
                     current_pose = self._simu.get_tcp_position() if self._use_simulation else self._real.get_cartesian_pose()
                     lift_after_release = np.array(current_pose[:6]) if len(current_pose) >= 6 else np.zeros(6)
                     lift_after_release[2] += self._release_lift_height
-                    print(f"[GraspExecutor] Lifting {self._release_lift_height*100:.1f}cm after retreat...")
+                    print(f"[GraspExecutor] Lifting {self._release_lift_height*100:.1f}cm after release...")
                     self._move_to_position(lift_after_release)
 
                 time.sleep(self._waypoint_delay)
 
-            # 任务完成后回到 home 位置
-            print(f"[GraspExecutor] Task completed, returning to home position...")
-            home_pose = np.zeros(6)
-            home_pose[:3] = self._home_position[:3]
-            if len(self._home_position) >= 6:
-                home_pose[3:6] = self._home_position[3:6]
-            self._move_to_position(home_pose)
-            print(f"[GraspExecutor] Returned to home position")
-
-            # 判断任务是否成功：检查物体是否到达目标位置
-            print(f"[GraspExecutor] _use_simulation={self._use_simulation}, has_get_object_position={hasattr(self._simu, 'get_object_position')}")
-            
-            if hasattr(self._simu, 'get_object_position'):
+            # 判断任务是否成功：检查物体是否到达目标位置（仅仿真模式下可验证）
+            if self._simu is not None and hasattr(self._simu, 'get_object_position'):
                 time.sleep(0.5)  # 等待物理稳定
                 try:
                     object_pos = self._simu.get_object_position(self._sim_object_body_name)
@@ -440,8 +415,10 @@ class GraspExecutor:
             current_pose = self._real.get_cartesian_pose()
             pos_diff = np.linalg.norm(current_pose[:3] - pose[:3])
 
-            joint_state = self._real.get_joint_state()
-            self._simu.set_joint_target(joint_state)
+            # 如果有仿真，同步关节状态
+            if self._simu is not None:
+                joint_state = self._real.get_joint_state()
+                self._simu.set_joint_target(joint_state)
 
             if pos_diff < tolerance:
                 print(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
@@ -578,6 +555,38 @@ class GraspExecutor:
     def stop(self):
         self._is_executing = False
 
+    def move_to_initial_joints(self, timeout: float = 8.0, tolerance: float = 3.0):
+        """回到初始关节位置（用关节角度而非笛卡尔坐标）
+
+        实机模式：发送关节目标并等待到达
+        仿真模式：直接设置关节位置
+        """
+        print(f"[GraspExecutor] Moving to initial joints: {self._initial_joints.tolist()}, gripper={self._initial_gripper}")
+        use_simu_ik = self._use_simulation or (
+            hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
+        )
+
+        if use_simu_ik:
+            self._simu.set_joint_positions(self._initial_joints, gripper=self._initial_gripper)
+            self._simu.step(60)
+        else:
+            # 实机：发送关节角度目标
+            self._real.set_joint_target(self._initial_joints)
+            self._real.set_gripper(self._initial_gripper)
+
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                current_joints = self._real.get_joint_state()
+                diff = np.max(np.abs(current_joints - self._initial_joints))
+                if diff < tolerance:
+                    print(f"[GraspExecutor] ✓ Reached initial joints (diff={diff:.1f}°)")
+                    return
+                time.sleep(0.1)
+
+            final_joints = self._real.get_joint_state()
+            final_diff = np.max(np.abs(final_joints - self._initial_joints))
+            print(f"[GraspExecutor] Initial joint timeout (diff={final_diff:.1f}°, tol={tolerance}°)")
+
     def is_executing(self) -> bool:
         return self._is_executing
 
@@ -649,24 +658,19 @@ class GraspExecutor:
             builtin = np.array(self._object_grasp_offsets[self._object_type], dtype=float)
         return builtin
 
-    def set_object_profiles(self, profiles: Dict[str, Any]):
-        """统一设置物体适配参数（姿态/预抓取偏移/抓取偏移/夹爪开合）
+    def _get_lift_height(self) -> float:
+        """获取当前物体类型的 lift 高度（优先级：物体覆盖 > default覆盖 > 全局）"""
+        if self._object_type in self._object_lift_heights:
+            return self._object_lift_heights[self._object_type]
+        if 'default' in self._object_lift_heights:
+            return self._object_lift_heights['default']
+        return self._default_lift_height
 
-        支持示例：
-        {
-          default: {
-            orientation: [180, 0, 0],
-            pre_grasp_offset: [0, 0, 0.15],
-            grasp_offset: [0.0, 0.0, 0.0],
-            gripper: {open: 0.0, close: 0.65}
-          },
-          cup: {
-            orientation: [180, 0, 0],
-            pre_grasp_offset: [0, 0, 0.10],
-            grasp_offset: [0.04, 0.0, 0.0],
-            gripper: {open: 0.0, close: 0.62}
-          }
-        }
+    def set_object_profiles(self, profiles: Dict[str, Any]):
+        """统一设置物体适配参数
+
+        支持格式：
+        {mug: {gripper_open: 0.8, gripper_close: 0.8, lift_height: 0.1}}
         """
         if not isinstance(profiles, dict):
             return
@@ -684,37 +688,31 @@ class GraspExecutor:
             if isinstance(ori, (list, tuple, np.ndarray)) and len(ori) >= 3:
                 orientation_map[str(obj_name)] = [float(ori[0]), float(ori[1]), float(ori[2])]
 
+            # 预抓取偏移：完整格式 [x,y,z] 或简化格式 pre_grasp_height (标量→只改 Z)
             pre = cfg.get("pre_grasp_offset")
             if isinstance(pre, (list, tuple, np.ndarray)) and len(pre) >= 3:
                 pre_grasp_map[str(obj_name)] = [float(pre[0]), float(pre[1]), float(pre[2])]
+            elif "pre_grasp_height" in cfg:
+                pre_grasp_map[str(obj_name)] = [0.0, 0.0, float(cfg["pre_grasp_height"])]
 
             go = cfg.get("grasp_offset", cfg.get("offset"))
             if isinstance(go, (list, tuple, np.ndarray)) and len(go) >= 3:
                 grasp_offset_map[str(obj_name)] = [float(go[0]), float(go[1]), float(go[2])]
 
+            # 夹爪：支持嵌套 {gripper: {open, close}} 或平铺 {gripper_open, gripper_close}
             g_open = None
             g_close = None
             g_cfg = cfg.get("gripper")
             if isinstance(g_cfg, dict):
                 if "open" in g_cfg:
-                    g_open = float(g_cfg.get("open"))
-                elif "gripper_open" in g_cfg:
-                    g_open = float(g_cfg.get("gripper_open"))
-
+                    g_open = float(g_cfg["open"])
                 if "close" in g_cfg:
-                    g_close = float(g_cfg.get("close"))
-                elif "gripper_close" in g_cfg:
-                    g_close = float(g_cfg.get("gripper_close"))
+                    g_close = float(g_cfg["close"])
             else:
-                if "open" in cfg:
-                    g_open = float(cfg.get("open"))
-                elif "gripper_open" in cfg:
-                    g_open = float(cfg.get("gripper_open"))
-
-                if "close" in cfg:
-                    g_close = float(cfg.get("close"))
-                elif "gripper_close" in cfg:
-                    g_close = float(cfg.get("gripper_close"))
+                if "gripper_open" in cfg:
+                    g_open = float(cfg["gripper_open"])
+                if "gripper_close" in cfg:
+                    g_close = float(cfg["gripper_close"])
 
             if g_open is not None and g_close is not None:
                 gripper_map[str(obj_name)] = {
@@ -722,12 +720,19 @@ class GraspExecutor:
                     "close": float(np.clip(g_close, 0.0, 1.0)),
                 }
 
+            # 每物体 lift 高度
+            if "lift_height" in cfg:
+                self._object_lift_heights[str(obj_name)] = float(cfg["lift_height"])
+
         if orientation_map:
             self.set_default_orientation(orientation_map)
         if pre_grasp_map:
             self.set_pre_grasp_offset(pre_grasp_map)
         if grasp_offset_map:
             self.set_grasp_offsets(grasp_offset_map)
+        else:
+            # 未显式配 grasp_offset → 清空硬编码 GRASP_OFFSETS 回退
+            self._default_grasp_offset = np.array([0.0, 0.0, 0.0])
         if gripper_map:
             self.set_gripper_positions_by_object(gripper_map)
 

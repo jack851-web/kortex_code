@@ -1,5 +1,5 @@
 # ============================================================
-#  实机模式配置
+#  实机模式配置 (纯实机，无仿真同步)
 #  - object_position 和 plate_position 支持：
 #    1. 具体坐标：[x, y, z]
 #    2. "random"：随机生成位置（在工作空间范围内）
@@ -7,113 +7,71 @@
 
 robot:
   ip: "192.168.1.10"
-  connect_timeout: 5.0  # 实机连接超时时间（秒）
+  connect_timeout: 5.0
+  # 初始关节角度（度），任务完成后回到此位置
+  initial_joints: [260.44, 51.32, 315.13, 86.87, 284.12, 85.93]
+  initial_gripper: 0.0
 
 # 工作空间约束（用于random位置生成）
 workspace:
-  # 机械臂基座位置
   base_position: [0.0, 0.0, 0.0]
-  # 桌面区域范围 [x_min, x_max, y_min, y_max, z_surface]
-  table_bounds: [0.25, 0.50, -0.25, 0.25, 0.44]
-  # 安全边界（距离边缘的最小距离）
+  # 三轴坐标范围 [min, max]，单位 米
+  # X 轴：机械臂前方，数值越大越远
+  # Y 轴：机械臂左右，正值=左，负值=右（从机械臂视角）
+  # Z 轴：桌面高度范围
+  x_range: [0, 0.55]
+  y_range: [0, 0.55]
+  z_range: [0.05, 0.6]
   safety_margin: 0.05
-  # 物体和plate之间的最小距离
   min_object_plate_distance: 0.15
 
 cameras:
   real:
-    top:
+    hand:
       type: "opencv"
       index: 0
       width: 640
       height: 480
       fps: 30
-    side:
-      type: "opencv"
-      index: 1
-      width: 640
-      height: 480
-      fps: 30
-    hand:
-      type: "opencv"
-      index: 2
-      width: 640
-      height: 480
-      fps: 30
-  simu: [top, side, hand]
-
-simulation:
-  xml_path: "kortex_simu/simu/env/task_pick_place.xml"
-  coord_rotation_z: 0
-  initial_joints_unit: rad
-  initial_joints: [-0.594, 0.135, 0.81, -1.79, -1.33, 0.0]
-
-  object_library:
-    cup:
-      model_xml_path: "kortex_simu/simu/object/cup/model_new.xml"
-      body_name: "body_obj_cup"
-    mug:
-      model_xml_path: "kortex_simu/simu/object/mug_5/model_new.xml"
-      body_name: "body_obj_mug_5"
-    plate:
-      model_xml_path: "kortex_simu/simu/object/plate/model_new.xml"
-      body_name: "body_obj_plate"
-    plate_11:
-      model_xml_path: "kortex_simu/simu/object/plate_11/model_new.xml"
-      body_name: "body_obj_plate_11"
-  plate_target:
-    model_xml_path: "kortex_simu/simu/object/plate_11/model_new.xml"
-    body_name: "body_obj_plate_11"
 
 grasp:
-  lift_height: 0.1
-  micro_lift_height: 0.02
-  release_lift_height: 0.08
+  micro_lift_height: 0.02             # 放置时松开前微抬
+  release_lift_height: 0.08           # 放置后抬升
   object_profiles:
     default:
-      orientation: [180, 0, 0]
-      pre_grasp_offset: [0, 0, 0.05]
-      grasp_offset: [0.0, 0.0, 0.0]
-      gripper: {open: 0.0, close: 0.65}
+      pre_grasp_height: 0.05          # 预抓取高度（物体上方，米）
+      lift_height: 0.1                # 抓取后抬升高度
+      gripper_open: 0.0               # 夹爪张开
+      gripper_close: 0.65             # 夹爪闭合
     cup:
-      orientation: [176.02, 5.81, -83.23]
-      pre_grasp_offset: [0, 0, 0.01]
-      grasp_offset: [0.0, 0.012, 0]
-      gripper: {open: 0.80, close: 0.80}
+      pre_grasp_height: 0.01
+      lift_height: 0.1
+      gripper_open: 0.80
+      gripper_close: 0.80
     mug:
-      orientation: [180, 0, 0]
-      pre_grasp_offset: [0, 0, 0.08]
-      grasp_offset: [-0.022, 0.0, 0]
-      gripper: {open: 0.80, close: 0.80}
+      pre_grasp_height: 0.08
+      lift_height: 0.1
+      gripper_open: 0.3
+      gripper_close: 0.5
+    apple:
+      pre_grasp_height: 0.08
+      lift_height: 0.1
+      gripper_open: 0.1
+      gripper_close: 0.1
 
 dataset:
   real_data_root: "data/Real/realdata"
-  simu_data_root: "data/Real/simudata"
   fps: 30
 
 tasks:
   task1:
-    object_name: "mug"
-    object_position: [0.35, 0.15, 0.44]
-    plate_position: [0.35, -0.15, 0.44]
+    object_name: "apple"
+    object_position: [0.07, 0.4, 0.00]
+    plate_position: [0.358, 0.329, 0.02]
     description: "grasp mug and place to right side"
   task2:
-    object_name: "mug"
-    object_position: [0.35, -0.15, 0.44]
-    plate_position: [0.35, 0.15, 0.44]
-    description: "grasp mug and place to left side"
-  task3:
-    object_name: "mug"
-    object_position: [0.45, 0.0, 0.44]
-    plate_position: [0.25, 0.0, 0.44]
-    description: "grasp mug and place closer"
-  task4:
-    object_name: "mug"
-    object_position: "random"
-    plate_position: "random"
-    description: "random grasp and place task"
-  task5:
-    object_name: "mug"
-    object_position: [0.40, 0.10, 0.44]
-    plate_position: "random"
-    description: "fixed object, random plate"
+    object_name: "apple"
+    object_position: [0.07, 0.4, 0.01]
+    plate_position: [0.358, 0.329, 0.02]
+    description: "grasp mug and place to right side"
+ 

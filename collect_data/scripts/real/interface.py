@@ -60,6 +60,7 @@ class RealInterface:
             raise RobotNotConnectedError("Robot is not connected. Call connect() first.")
 
     def connect(self, ip: str, username: str = "admin", password: str = "admin") -> bool:
+        """仅连接机器人，不连接相机（相机单独调用 connect_cameras）"""
         try:
             self._ensure_import()
         except ImportError as e:
@@ -76,17 +77,23 @@ class RealInterface:
             self._robot = self._Gen3Lite(self._config)
             self._robot.connect(calibrate=False)
             self._connected = True
-            
-            if self._camera_config:
-                print("Connecting cameras...")
-                self._camera_manager = CameraManager(self._camera_config)
-                if not self._camera_manager.connect():
-                    print("Warning: Some cameras failed to connect")
-            
             return True
         except Exception as e:
             print(f"Failed to connect to robot: {e}")
             return False
+
+    def connect_cameras(self) -> bool:
+        """连接相机（在机器人连接成功后调用）"""
+        if not self._camera_config:
+            print("No camera config, skipping camera connection")
+            return True
+
+        print("Connecting cameras...")
+        self._camera_manager = CameraManager(self._camera_config)
+        if not self._camera_manager.connect():
+            print("Warning: Some cameras failed to connect")
+            return False
+        return True
 
     def get_joint_state(self) -> np.ndarray:
         self._check_connection()
@@ -141,17 +148,47 @@ class RealInterface:
         if len(joints) != 6:
             raise ValueError(f"Expected 6 joint values, got {len(joints)}")
         try:
-            action = {f"joint_{i}.pos": joints[i-1] for i in range(1, 7)}
+            # 角度归一化：0-360 → 各关节限位范围内的实际角度
+            # Kinova Gen3Lite 内部用连续旋转编码器，同一个物理位姿可能被报告为 260° 或 -100°
+            # 这里把超限值自动 wrap 到限位内
+            joints = self._normalize_joint_angles(joints)
+            action = {f"joint_{i}.pos": float(joints[i-1]) for i in range(1, 7)}
             self._robot.send_action(action)
             return True
         except Exception as e:
             raise RuntimeError(f"Failed to set joint target: {e}")
+
+    @staticmethod
+    def _normalize_joint_angles(joints: np.ndarray) -> np.ndarray:
+        """将 0-360 范围的角度归一化到各关节限位内（仅用于 set_joint_target）
+
+        Kinova 控制 API 期望 -180~180 范围，编码器报 0-360。
+        """
+        from kortex_real.gen3.gen3_lite import JOINT_LIMITS, JOINT_NAMES
+        result = joints.copy().astype(float)
+        for i, name in enumerate(JOINT_NAMES):
+            if i >= len(result):
+                break
+            limits = JOINT_LIMITS.get(name, {"min": -180, "max": 180})
+            lo, hi = limits["min"], limits["max"]
+            val = float(result[i])
+            while val > hi + 1e-6:
+                val -= 360.0
+            while val < lo - 1e-6:
+                val += 360.0
+            result[i] = val
+        return result
 
     def move_cartesian(self, pose: np.ndarray) -> bool:
         self._check_connection()
         if len(pose) < 6:
             current_pose = self.get_cartesian_pose()
             pose = np.concatenate([pose, current_pose[3:6]])
+        # 实机模式：保持当前末端姿态，只改变位置
+        # 强制指定 theta_x=180 等姿态可能导致 IK 无解 → ACTION_ABORT
+        current = self.get_cartesian_pose()
+        pose = np.copy(pose)
+        pose[3:6] = current[3:6]
         try:
             return self._robot.arm_move_cartesian(pose.tolist())
         except Exception as e:

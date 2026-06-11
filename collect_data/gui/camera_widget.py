@@ -17,6 +17,9 @@ class CameraWidget(QWidget):
         self._width = width
         self._height = height
         self._init_ui()
+        # 固定自身高度 = 标题行 + 图像高度，不随父布局拉伸
+        title_height = 24
+        self.setFixedSize(width, height + title_height)
     
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -108,10 +111,16 @@ class CameraPanel(QWidget):
             if item is not None and item.widget() is not None:
                 item.widget().setParent(self)
 
+        num_widgets = len(self._camera_widgets)
         for i, widget in enumerate(self._camera_widgets.values()):
             row = i // self._columns
             col = i % self._columns
             self._layout.addWidget(widget, row, col)
+
+        # 底部弹性空间：相机靠顶排列，不拉伸
+        if num_widgets > 0:
+            last_row = (num_widgets - 1) // self._columns + 1
+            self._layout.setRowStretch(last_row, 1)
     
     def add_camera(self, camera_name: str, width: int = 320, height: int = 240):
         """添加相机显示"""

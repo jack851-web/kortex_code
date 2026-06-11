@@ -154,7 +154,7 @@ class DataCollectionSystem:
                 use_ik=True,
             )
         else:
-            print("Using real interfaces")
+            print("Using real interfaces (pure real mode - no simulation)")
             real_cam_cfg = {}
             for cam_name, cam_cfg in real_camera_config.items():
                 real_cam_cfg[cam_name] = {
@@ -167,32 +167,29 @@ class DataCollectionSystem:
             if not self._real.connect(robot_config.get("ip", "192.168.1.10")):
                 print("Failed to connect to real robot")
                 return False
-            self._simu = SimuInterface(
-                simu_config.get("xml_path", ""),
-                camera_names=self._simu_camera_names,
-                use_ik=False,
-            )
+            self._real.connect_cameras()
+            self._simu = None
 
-        if not self._simu.initialize(simu_config.get("xml_path", "")):
-            print("Failed to initialize simulation")
-            return False
+        if self._simu is not None:
+            if not self._simu.initialize(simu_config.get("xml_path", "")):
+                print("Failed to initialize simulation")
+                return False
 
-        self._apply_sim_initial_joints()
+            self._apply_sim_initial_joints()
+            self._simu.set_display_cameras(self._simu_camera_names)
 
-        simu_camera_names = self._simu_camera_names
-        self._simu.set_display_cameras(simu_camera_names)
+            # 启动进程渲染器
+            print("\nStarting render process...")
+            self._simu.start_render_process()
 
-        # 启动进程渲染器（提高性能且避免缓冲区共享）
-        print("\nStarting render process...")
-        self._simu.start_render_process()
-
-        print("\nStarting viewers...")
-        print("  - Starting simulation viewer (MuJoCo window)")
-        self._simu.start_viewer()
-        
-        if simu_camera_names:
-            print(f"  - Starting simulation camera viewer: {simu_camera_names}")
-            self._simu.start_camera_viewer(simu_camera_names)
+            print("\nStarting viewers...")
+            print("  - Starting simulation viewer (MuJoCo window)")
+            self._simu.start_viewer()
+            
+            simu_camera_names = self._simu_camera_names
+            if simu_camera_names:
+                print(f"  - Starting simulation camera viewer: {simu_camera_names}")
+                self._simu.start_camera_viewer(simu_camera_names)
         
         real_camera_names = list(real_camera_config.keys()) if real_camera_config else []
         if (not self._use_mock) and real_camera_names:
@@ -201,9 +198,7 @@ class DataCollectionSystem:
         
         print("All viewers started. Press 'q' in camera windows to close them.\n")
 
-        # 创建数据收集器（先创建，再设置回调）
-        # 从相机配置中获取视频帧率（使用第一个真实相机的帧率，默认为30）
-        real_camera_config = camera_config.get("real", {})
+        # 从相机配置中获取视频帧率
         video_fps = 30
         if real_camera_config:
             first_cam = list(real_camera_config.values())[0]
@@ -211,50 +206,41 @@ class DataCollectionSystem:
         
         # 创建数据收集器
         if not self._use_mock:
+            real_cam_names = self._real_camera_names if self._real_camera_names else ['cam_0']
             self._real_data_collector = RealDataCollector(
                 self._real,
                 data_root=dataset_config.get("real_data_root", "./data/real_data"),
                 fps=dataset_config.get("fps", 20),
                 video_fps=video_fps,
+                camera_names=real_cam_names,
             )
+            self._simu_data_collector = None
+            self._sync_controller = None
         else:
             self._real_data_collector = None
-
-        self._simu_data_collector = SimuDataCollector(
-            self._simu,
-            data_root=dataset_config.get("simu_data_root", "./data/simu_data"),
-            fps=dataset_config.get("fps", 20),
-            video_fps=video_fps,
-            run_in_thread=False,
-        )
-
-        # 仅实机模式创建同步控制器；仿真独立模式不做实机同步
-        if not self._use_mock:
-            self._sync_controller = SyncController(
-                self._real,
+            self._simu_data_collector = SimuDataCollector(
                 self._simu,
-                on_sync_callback=self._simu_data_collector.collect_frame
+                data_root=dataset_config.get("simu_data_root", "./data/simu_data"),
+                fps=dataset_config.get("fps", 20),
+                video_fps=video_fps,
+                run_in_thread=False,
             )
-        else:
             self._sync_controller = None
 
+        pre_grasp_offs = [0, 0, float(grasp_config.get("pre_grasp_height", 0.05))]
         self._grasp_executor = GraspExecutor(
             self._real,
             self._simu,
             home_position=[0, 0, 0, 0, 0, 0],
-            pre_grasp_offset=grasp_config.get("pre_grasp_offset", [0, 0, 0.15]),
+            pre_grasp_offset=pre_grasp_offs,
             lift_height=grasp_config.get("lift_height", 0.20),
             approach_height=grasp_config.get("approach_height", 0.05),
+            use_simulation=self._use_mock,
         )
-        
-        if "default_orientation" in grasp_config:
-            self._grasp_executor.set_default_orientation(grasp_config["default_orientation"])
-        if "grasp_offsets" in grasp_config:
-            self._grasp_executor.set_grasp_offsets(grasp_config["grasp_offsets"])
-        if "gripper_positions" in grasp_config:
-            self._grasp_executor.set_gripper_positions_by_object(grasp_config["gripper_positions"])
-        if "object_profiles" in grasp_config:
-            self._grasp_executor.set_object_profiles(grasp_config["object_profiles"])
+
+        object_profiles = grasp_config.get("object_profiles", {})
+        if object_profiles:
+            self._grasp_executor.set_object_profiles(object_profiles)
 
         if self._use_mock and self._simu_data_collector is not None:
             self._grasp_executor.set_frame_callback(self._simu_data_collector.collect_frame)
@@ -277,11 +263,10 @@ class DataCollectionSystem:
         self._running = True
 
         try:
-            if self._sync_controller is not None:
-                self._sync_controller.start_sync()
             if self._real_data_collector is not None:
                 self._real_data_collector.start_collection()
-            self._simu_data_collector.start_collection()
+            if self._simu_data_collector is not None:
+                self._simu_data_collector.start_collection()
 
             print(f"\n{'='*60}")
             print("Data Collection System Started")
@@ -327,7 +312,7 @@ class DataCollectionSystem:
         object_model_xml = object_cfg.get("model_xml_path", "")
         object_body_name = object_cfg.get("body_name", object_body_name)
 
-        if object_model_xml and self._simu_base_xml_path:
+        if self._simu is not None and object_model_xml and self._simu_base_xml_path:
             if not self._simu.reload_scene_with_object(
                 self._simu_base_xml_path,
                 object_model_xml,
@@ -340,19 +325,20 @@ class DataCollectionSystem:
 
         self._grasp_executor.set_object_type(object_name)
         self._grasp_executor.set_sim_object_body_name(object_body_name)
-        self._simu.set_active_object_body_name(object_body_name)
+        if self._simu is not None:
+            self._simu.set_active_object_body_name(object_body_name)
 
-        # 先按config放置x/y，并按模型几何自动对齐z（底部高度）
-        self._simu.set_object_position(
-            object_body_name,
-            object_pos,
-            reset_z=True,
-        )
+            # 先按config放置x/y，并按模型几何自动对齐z（底部高度）
+            self._simu.set_object_position(
+                object_body_name,
+                object_pos,
+                reset_z=True,
+            )
 
-        # 预热渲染进程，确保首任务录制前已切到新场景并拿到新物体帧
-        for _ in range(3):
-            self._simu.get_camera_images(self._simu_camera_names)
-            time.sleep(0.03)
+            # 预热渲染进程，确保首任务录制前已切到新场景并拿到新物体帧
+            for _ in range(3):
+                self._simu.get_camera_images(self._simu_camera_names)
+                time.sleep(0.03)
 
         # 再读取任务目标
         self._grasp_executor.set_task(task_id, object_pos, plate_pos)
@@ -370,7 +356,8 @@ class DataCollectionSystem:
 
         if self._real_data_collector is not None:
             self._real_data_collector.start_episode(episode_id, self._real_camera_names, task_info)
-        self._simu_data_collector.start_episode(episode_id, self._simu_camera_names, task_info)
+        if self._simu_data_collector is not None:
+            self._simu_data_collector.start_episode(episode_id, self._simu_camera_names, task_info)
         print(f"Episode {episode_id} started")
 
         success = self._grasp_executor.execute(
@@ -379,7 +366,8 @@ class DataCollectionSystem:
 
         if self._real_data_collector is not None:
             self._real_data_collector.end_episode(episode_id, success)
-        self._simu_data_collector.end_episode(episode_id, success)
+        if self._simu_data_collector is not None:
+            self._simu_data_collector.end_episode(episode_id, success)
         print(f"Episode {episode_id} completed - Success: {success}")
 
         if task_id < len(self._tasks):
@@ -406,8 +394,6 @@ class DataCollectionSystem:
             self._real_data_collector.stop_collection()
         if self._simu_data_collector:
             self._simu_data_collector.stop_collection()
-        if self._sync_controller:
-            self._sync_controller.stop_sync()
         if self._real:
             self._real.disconnect()
         if self._simu:

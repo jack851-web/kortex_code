@@ -567,7 +567,9 @@ class MainWindow(QMainWindow):
         self._real_camera_panel.setVisible(has_real_cameras)
 
         if has_real_cameras:
-            self._real_camera_panel.set_columns(1)
+            num_cams = len(real_cameras)
+            columns = {1: 1, 2: 2}.get(num_cams, 2)
+            self._real_camera_panel.set_columns(columns)
             max_cam_width = 0
             for cam_name in real_cameras:
                 cam_cfg = real_camera_config.get(cam_name, {})
@@ -576,9 +578,9 @@ class MainWindow(QMainWindow):
                 max_cam_width = max(max_cam_width, width)
                 self._real_camera_panel.add_camera(f"Real: {cam_name}", width, height)
 
-            # 调整左侧面板宽度
+            # 调整左侧面板宽度：相机宽度 × 列数 + 间距
             if hasattr(self, '_left_panel'):
-                left_target_width = max_cam_width + 24
+                left_target_width = max_cam_width * columns + 40
                 self._left_panel.setMinimumWidth(max(500, left_target_width))
                 self.setMinimumWidth(left_target_width + 420)
 

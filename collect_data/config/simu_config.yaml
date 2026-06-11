@@ -9,8 +9,10 @@
 workspace:
   # 机械臂基座位置
   base_position: [0.0, 0.0, 0.0]
-  # 桌面区域范围 [x_min, x_max, y_min, y_max, z_surface]
-  table_bounds: [0.25, 0.50, -0.25, 0.25, 0.44]
+  # 三轴坐标范围 [min, max]，单位 米
+  x_range: [0.25, 0.50]
+  y_range: [-0.25, 0.25]
+  z_range: [0.42, 0.46]
   # 安全边界（距离边缘的最小距离）
   safety_margin: 0.05
   # 物体和plate之间的最小距离
@@ -45,25 +47,24 @@ simulation:
     radius: 0.09  # 盘子半径（米），用于任务成功判定
 
 grasp:
-  lift_height: 0.1
   micro_lift_height: 0.02
   release_lift_height: 0.08
   object_profiles:
     default:
-      orientation: [180, 0, 0]
-      pre_grasp_offset: [0, 0, 0.05]
-      grasp_offset: [0.0, 0.0, 0.0]
-      gripper: {open: 0.0, close: 0.65}
+      pre_grasp_height: 0.05
+      lift_height: 0.1
+      gripper_open: 0.0
+      gripper_close: 0.65
     cup:
-      orientation: [176.02, 5.81, -83.23]
-      pre_grasp_offset: [0, 0, 0.01]
-      grasp_offset: [0.0, 0.012, 0]
-      gripper: {open: 0.80, close: 0.80}
+      pre_grasp_height: 0.01
+      lift_height: 0.1
+      gripper_open: 0.80
+      gripper_close: 0.80
     mug:
-      orientation: [180, 0, 0]
-      pre_grasp_offset: [0, 0, 0.08]
-      grasp_offset: [0, 0.06, 0]
-      gripper: {open: 0.80, close: 0.80}
+      pre_grasp_height: 0.08
+      lift_height: 0.1
+      gripper_open: 0.80
+      gripper_close: 0.80
 
 dataset:
   mock_simu_data_root: "D:/VLA/data/61_data"
