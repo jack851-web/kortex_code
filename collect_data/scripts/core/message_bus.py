@@ -9,8 +9,11 @@
 - 线程安全: 所有操作加锁保护
 - Qt 集成: 订阅回调中通过 pyqtSignal 转到 GUI 线程
 """
+import logging
 import threading
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class Topic:
@@ -37,7 +40,7 @@ class Topic:
             try:
                 callback(message)
             except Exception as e:
-                print(f"[Topic:{self._name}] subscriber callback error: {e}")
+                logger.error(f"[Topic:{self._name}] subscriber callback error: {e}", exc_info=True)
 
     def subscribe(self, callback: Callable):
         """订阅话题，回调在发布者线程执行"""

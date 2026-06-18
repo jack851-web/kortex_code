@@ -17,79 +17,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))  # kortex_code
 # 项目根目录 (kortex_code)
 PROJECT_ROOT = Path(__file__).parent.parent
 
-
-def resolve_path(path_str: str, base_dir: Path = None) -> str:
-    """解析路径，支持相对路径和绝对路径
-    
-    Args:
-        path_str: 路径字符串
-        base_dir: 基准目录，默认为 PROJECT_ROOT
-    
-    Returns:
-        解析后的绝对路径字符串
-    """
-    if not path_str:
-        return path_str
-    
-    path = Path(path_str)
-    
-    # 已经是绝对路径
-    if path.is_absolute():
-        return str(path)
-    
-    # 相对路径：基于 base_dir 或 PROJECT_ROOT 解析
-    base = base_dir or PROJECT_ROOT
-    resolved = (base / path_str).resolve()
-    return str(resolved)
-
-
-def resolve_config_paths(config: dict, base_dir: Path = None) -> dict:
-    """递归解析配置中的路径字段
-    
-    自动识别以 _path, _root 结尾的字段以及 xml_path, model_xml_path 等常见路径字段
-    """
-    path_keys = {
-        'xml_path', 'model_xml_path', 'scene_base_xml_path',
-        'real_data_root', 'simu_data_root', 'mock_simu_data_root',
-        'data_root', 'output_path', 'log_path',
-    }
-    
-    def _resolve_value(key: str, value):
-        if isinstance(value, str):
-            # 检查是否是路径字段
-            is_path = (
-                key in path_keys or 
-                key.endswith('_path') or 
-                key.endswith('_root') or
-                key.endswith('_xml') or
-                key.endswith('_dir') or
-                '.xml' in value.lower() or
-                '.yaml' in value.lower() or
-                '.json' in value.lower()
-            )
-            if is_path:
-                return resolve_path(value, base_dir)
-            return value
-        elif isinstance(value, dict):
-            return {k: _resolve_value(k, v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_resolve_value(key, item) for item in value]
-        return value
-    
-    if config is None:
-        return config
-    
-    return {k: _resolve_value(k, v) for k, v in config.items()}
-
 from gui import MainWindow, MockTaskTunerWindow
 from PyQt5.QtWidgets import QApplication
 from scripts import (
-    RealInterface, MockRealInterface,
+    RealInterface,
     SimuInterface, MockSimuInterface,
     SyncController, GraspExecutor,
     RealDataCollector, SimuDataCollector,
     MessageBroker,
     SimuManager, SimuPublisher, RealPublisher,
+    resolve_path, resolve_config_paths,
 )
 
 
@@ -352,7 +289,11 @@ class DataCollectionSystem:
 
             def _connect_thread():
                 try:
-                    connect_result['success'] = self._real.connect(robot_ip)
+                    connect_result['success'] = self._real.connect(
+                        robot_ip,
+                        username=robot_config.get('username'),
+                        password=robot_config.get('password'),
+                    )
                 except Exception as e:
                     self._log(f"连接异常: {e}", "WARNING")
                     connect_result['success'] = False
@@ -386,9 +327,7 @@ class DataCollectionSystem:
         else:
             # 仿真独立模式: 启用 IK，不依赖实机同步
             self._log("使用仿真独立模式（IK）", "INFO")
-            from scripts import MockRealInterface
-            self._real = MockRealInterface()
-            self._real.connect("mock")
+            self._real = None
 
             # 使用 SimuManager 管理仿真（启用 IK）
             if not self._simu_manager.start_simulation(
@@ -1092,7 +1031,7 @@ class DataCollectionSystem:
 
             progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
             if progress_collector is not None:
-                progress_collector._save_progress()
+                progress_collector.save_progress()
 
             # 机械臂复位到初始位置（后台线程，不阻塞）
             if self._real_connected and self._grasp_executor is not None:
@@ -1134,19 +1073,17 @@ class DataCollectionSystem:
         self._running = False
         self._paused = False
         
-        # 如果当前有任务正在进行，保存该 episode
+        # 如果当前有任务正在进行，停止记录并丢弃未完成的数据
         if self._task_in_progress:
             if self._real_data_collector is not None:
                 self._real_data_collector.stop_recording()
+                self._real_data_collector.discard_current_task()
             if self._simu_data_collector is not None:
                 self._simu_data_collector.stop_recording()
-            
-            if self._real_data_collector is not None:
-                self._real_data_collector.end_episode(self._current_episode, True)
-            if self._simu_data_collector is not None:
-                self._simu_data_collector.end_episode(self._current_episode, True)
-            self._log(f"Episode {self._current_episode} 已保存（部分数据）", "WARNING")
-            self._current_episode += 1
+                self._simu_data_collector.discard_current_task()
+            self._task_in_progress = False
+            self._active_task_info = {}
+            self._log("当前任务数据已丢弃（任务未完成）", "WARNING")
         
         if self._real_data_collector:
             self._real_data_collector.stop_collection()
@@ -1157,7 +1094,7 @@ class DataCollectionSystem:
         # 保存进度
         progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
         if progress_collector is not None:
-            progress_collector._save_progress()
+            progress_collector.save_progress()
         
         # 停止仿真（仅仿真模式）
         if self._simu is not None and self._simu_manager.is_running:
@@ -1169,7 +1106,7 @@ class DataCollectionSystem:
             except Exception as e:
                 self._log(f"关闭仿真失败: {e}", "WARNING")
         
-        self._log(f"数据收集已停止 (共 {self._current_episode - 1} 个 episode)", "WARNING")
+        self._log(f"数据收集已停止 (共 {self._current_episode} 个 episode)", "WARNING")
         self._update_status("已停止", "#ff4444")
     
     def _execute_task(self, task_id: str, task_config: dict) -> bool:

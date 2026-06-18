@@ -7,6 +7,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import pyqtSignal
 
+from .styles import COLORS
+
 
 class ControlPanel(QWidget):
     """控制面板 - 任务控制按钮"""
@@ -39,11 +41,11 @@ class ControlPanel(QWidget):
         # 开始/停止数据收集按钮
         btn_layout = QHBoxLayout()
         self._start_btn = QPushButton("开始收集")
-        self._start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self._start_btn.setStyleSheet(f"background-color: {COLORS['success']}; color: {COLORS['white']}; font-weight: bold;")
         self._start_btn.clicked.connect(self.start_clicked.emit)
 
         self._stop_btn = QPushButton("停止收集")
-        self._stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+        self._stop_btn.setStyleSheet(f"background-color: {COLORS['error']}; color: {COLORS['white']}; font-weight: bold;")
         self._stop_btn.clicked.connect(self.stop_clicked.emit)
         self._stop_btn.setEnabled(False)
 
@@ -53,14 +55,14 @@ class ControlPanel(QWidget):
         
         # 执行下一个任务按钮
         self._next_task_btn = QPushButton("执行下一个任务")
-        self._next_task_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self._next_task_btn.setStyleSheet(f"background-color: {COLORS['info']}; color: {COLORS['white']}; font-weight: bold;")
         self._next_task_btn.clicked.connect(self.next_task_clicked.emit)
         self._next_task_btn.setEnabled(False)
         task_layout.addWidget(self._next_task_btn)
         
         # 重做任务按钮（任务执行中可直接点击，丢弃当前数据重新执行）
         self._retry_btn = QPushButton("重做任务")
-        self._retry_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self._retry_btn.setStyleSheet(f"background-color: {COLORS['warning']}; color: {COLORS['white']}; font-weight: bold;")
         self._retry_btn.clicked.connect(self.retry_clicked.emit)
         self._retry_btn.setEnabled(False)
         task_layout.addWidget(self._retry_btn)
@@ -128,15 +130,15 @@ class ControlPanel(QWidget):
         # 保存当前每个按钮的启用状态
         self._btn_original_states = {id(btn): btn.isEnabled() for btn in self._all_task_btns}
 
+        # 在对应按钮上显示状态文字（必须在禁用之前检查原始状态）
+        if self._btn_original_states.get(id(self._complete_task_btn)):
+            self._complete_task_btn.setText(label)
+        if self._btn_original_states.get(id(self._stop_btn)):
+            self._stop_btn.setText(label)
+
         # 全部禁用
         for btn in self._all_task_btns:
             btn.setEnabled(False)
-
-        # 在对应按钮上显示状态文字
-        if self._complete_task_btn.isEnabled() == False and self._btn_original_states.get(id(self._complete_task_btn)):
-            self._complete_task_btn.setText(label)
-        if self._stop_btn.isEnabled() == False and self._btn_original_states.get(id(self._stop_btn)):
-            self._stop_btn.setText(label)
 
     def set_idle(self):
         """恢复按钮到 set_busy 之前的状态"""

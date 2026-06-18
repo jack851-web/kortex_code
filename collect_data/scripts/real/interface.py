@@ -24,6 +24,9 @@ class RealInterface:
         self._camera_manager: Optional[CameraManager] = None
         self._viewer_running = False
         self._viewer_thread = None
+        # 缓存关节限位信息，避免每次调用时重复导入
+        self._joint_limits = None
+        self._joint_names = None
 
     @classmethod
     def from_config_file(cls, config_path: str) -> "RealInterface":
@@ -47,7 +50,11 @@ class RealInterface:
             return True
         try:
             import sys
-            sys.path.insert(0, r'D:\VLA\kortex_code\kortex_real')
+            # 基于项目根目录动态解析 kortex_real 路径，而非硬编码绝对路径
+            _project_root = Path(__file__).parent.parent.parent.parent  # collect_data -> kortex_code
+            _kortex_real_path = str(_project_root / 'kortex_real')
+            if _kortex_real_path not in sys.path:
+                sys.path.insert(0, _kortex_real_path)
             from gen3 import Gen3Lite, Gen3LiteConfig
             self._Gen3Lite = Gen3Lite
             self._Gen3LiteConfig = Gen3LiteConfig
@@ -59,8 +66,13 @@ class RealInterface:
         if not self._connected or self._robot is None:
             raise RobotNotConnectedError("Robot is not connected. Call connect() first.")
 
-    def connect(self, ip: str, username: str = "admin", password: str = "admin") -> bool:
-        """仅连接机器人，不连接相机（相机单独调用 connect_cameras）"""
+    def connect(self, ip: str, username: str = None, password: str = None) -> bool:
+        """仅连接机器人，不连接相机（相机单独调用 connect_cameras）
+
+        注意: username 和 password 应通过配置文件传入，不提供默认值以避免安全隐患。
+        """
+        if username is None or password is None:
+            raise ValueError("必须提供 username 和 password 参数，请从配置文件中读取")
         try:
             self._ensure_import()
         except ImportError as e:
@@ -158,12 +170,27 @@ class RealInterface:
         except Exception as e:
             raise RuntimeError(f"Failed to set joint target: {e}")
 
+    def _ensure_joint_limits(self):
+        """延迟加载并缓存关节限位信息"""
+        if self._joint_limits is not None:
+            return
+        try:
+            from kortex_real.gen3.gen3_lite import JOINT_LIMITS, JOINT_NAMES
+            self._joint_limits = JOINT_LIMITS
+            self._joint_names = JOINT_NAMES
+        except ImportError:
+            # 回退默认值
+            self._joint_limits = {}
+            self._joint_names = [f'J{i}' for i in range(6)]
+
     @staticmethod
     def _normalize_joint_angles(joints: np.ndarray) -> np.ndarray:
         """将 0-360 范围的角度归一化到各关节限位内（仅用于 set_joint_target）
 
         Kinova 控制 API 期望 -180~180 范围，编码器报 0-360。
         """
+        # 注意：静态方法无法使用实例缓存，此处仍需导入
+        # 但由于 Python 模块缓存机制，重复 import 开销极小
         from kortex_real.gen3.gen3_lite import JOINT_LIMITS, JOINT_NAMES
         result = joints.copy().astype(float)
         for i, name in enumerate(JOINT_NAMES):

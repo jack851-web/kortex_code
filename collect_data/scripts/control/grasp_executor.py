@@ -70,6 +70,10 @@ class GraspExecutor:
         self._real = real_interface
         self._simu = simu_interface
         self._use_simulation = use_simulation  # 纯仿真模式
+
+        # 仿真模式下 real_interface 可以为 None（所有操作走 simu 路径）
+        if not use_simulation and real_interface is None:
+            raise ValueError("实机模式下必须提供 real_interface")
         self._home_position = np.array(home_position)
         self._default_pre_grasp_offset = np.array([0.0, 0.0, 0.15], dtype=float)
         self._object_pre_grasp_offsets: Dict[str, np.ndarray] = {}

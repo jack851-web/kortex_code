@@ -18,6 +18,7 @@ from scripts.core import (
     ALL_REAL_TOPICS,
     COLLECT_STATUS, COLLECT_TASK, COLLECT_LOG, COLLECT_EPISODE,
     ALL_COLLECT_TOPICS,
+    resolve_path, resolve_config_paths,
 )
 
 # 真实机器人模块
@@ -52,6 +53,7 @@ __all__ = [
     'ALL_REAL_TOPICS',
     'COLLECT_STATUS', 'COLLECT_TASK', 'COLLECT_LOG', 'COLLECT_EPISODE',
     'ALL_COLLECT_TOPICS',
+    'resolve_path', 'resolve_config_paths',
     # Real
     'RealInterface', 'MockRealInterface', 'RobotNotConnectedError',
     'RealPublisher', 'RealDataCollector',

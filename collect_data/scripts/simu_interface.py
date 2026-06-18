@@ -113,59 +113,51 @@ class SimuInterface:
     def get_active_object_body_name(self) -> str:
         return self._active_object_body_name
 
+    # ── 线程渲染器管理（公共接口，避免外部直接访问 _thread_renderers）──
+
+    def has_thread_renderer(self, tid: int) -> bool:
+        """检查指定线程是否有缓存的渲染器"""
+        return tid in self._thread_renderers
+
+    def get_thread_renderer(self, tid: int):
+        """获取指定线程的渲染器（可能为 None）"""
+        return self._thread_renderers.get(tid)
+
+    def set_thread_renderer(self, tid: int, renderer):
+        """设置指定线程的渲染器"""
+        self._thread_renderers[tid] = renderer
+
+    def pop_thread_renderer(self, tid: int):
+        """弹出并返回指定线程的渲染器"""
+        return self._thread_renderers.pop(tid, None)
+
+    def get_thread_renderer_tids(self):
+        """获取所有线程渲染器的线程 ID 列表"""
+        return list(self._thread_renderers.keys())
+
+    def clear_thread_renderers(self):
+        """清理所有线程渲染器（仅释放 MjrContext 和 Scene，不跨线程销毁 GLFW 窗口）"""
+        for tid, renderer in list(self._thread_renderers.items()):
+            try:
+                if hasattr(renderer, '_mjr_context') and renderer._mjr_context is not None:
+                    try:
+                        renderer._mjr_context.free()
+                    except Exception:
+                        pass
+                    renderer._mjr_context = None
+                if hasattr(renderer, '_scene') and renderer._scene is not None:
+                    renderer._scene = None
+                if hasattr(renderer, '_gl_context'):
+                    renderer._gl_context = None
+            except Exception as e:
+                print(f"[SimuInterface] Error cleaning thread renderer (tid={tid}): {e}")
+        self._thread_renderers.clear()
+
     def _build_scene_with_object(self, base_scene_xml: str, object_model_xml: str, object_body_name: Optional[str] = None) -> Optional[str]:
-        try:
-            base_text = Path(base_scene_xml).read_text(encoding="utf-8")
-            object_root = ET.parse(object_model_xml).getroot()
-
-            asset_elem = object_root.find("asset")
-            worldbody_elem = object_root.find("worldbody")
-            if worldbody_elem is None:
-                print(f"[SimuInterface] Invalid object xml (missing worldbody): {object_model_xml}")
-                return None
-
-            selected_body = None
-            if object_body_name:
-                selected_body = worldbody_elem.find(f".//body[@name='{object_body_name}']")
-
-            if selected_body is None:
-                selected_body = worldbody_elem.find("body")
-
-            if selected_body is None:
-                print(f"[SimuInterface] Invalid object xml (no body found): {object_model_xml}")
-                return None
-
-            asset_xml = ""
-            if asset_elem is not None:
-                object_root_dir = Path(object_model_xml).parent
-                for child in list(asset_elem):
-                    file_attr = child.attrib.get("file")
-                    if file_attr:
-                        file_path = Path(file_attr)
-                        if not file_path.is_absolute():
-                            child.set("file", str((object_root_dir / file_path).resolve()).replace("\\", "/"))
-
-                asset_children = [ET.tostring(child, encoding="unicode") for child in list(asset_elem)]
-                asset_xml = "\n".join(asset_children)
-
-
-            body_xml = ET.tostring(selected_body, encoding="unicode")
-
-            if "<!-- DYNAMIC_OBJECT_ASSET -->" not in base_text or "<!-- DYNAMIC_OBJECT_BODY -->" not in base_text:
-                print("[SimuInterface] Base scene xml missing DYNAMIC_OBJECT placeholders")
-                return None
-
-            composed_xml = base_text.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
-            composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
-
-            generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
-            generated_path.write_text(composed_xml, encoding="utf-8")
-            self._generated_scene_xml_path = str(generated_path)
-            return str(generated_path)
-
-        except Exception as e:
-            print(f"[SimuInterface] build scene with object failed: {e}")
-            return None
+        result = build_scene_with_object(base_scene_xml, object_model_xml, object_body_name)
+        if result is not None:
+            self._generated_scene_xml_path = result
+        return result
 
     def reload_scene_with_object(self, base_scene_xml: str, object_model_xml: str, object_body_name: Optional[str] = None, show_viewer: bool = False) -> bool:
         generated_xml = self._build_scene_with_object(base_scene_xml, object_model_xml, object_body_name)
@@ -222,122 +214,13 @@ class SimuInterface:
         plate_body_name: Optional[str] = None,
     ) -> Optional[str]:
         """构建包含两个物体的场景XML"""
-        print(f"[SimuInterface] _build_scene_with_objects called:")
-        print(f"  - base_scene_xml: {base_scene_xml}")
-        print(f"  - object_model_xml: {object_model_xml}")
-        print(f"  - object_body_name: {object_body_name}")
-        print(f"  - plate_model_xml: {plate_model_xml}")
-        print(f"  - plate_body_name: {plate_body_name}")
-        
-        try:
-            base_text = Path(base_scene_xml).read_text(encoding="utf-8")
-            
-            asset_xml = ""
-            body_xml = ""
-            
-            if object_model_xml:
-                object_root = ET.parse(object_model_xml).getroot()
-                asset_elem = object_root.find("asset")
-                worldbody_elem = object_root.find("worldbody")
-                
-                if worldbody_elem is not None:
-                    selected_body = None
-                    if object_body_name:
-                        selected_body = worldbody_elem.find(f".//body[@name='{object_body_name}']")
-                    if selected_body is None:
-                        selected_body = worldbody_elem.find("body")
-                    
-                    if selected_body is not None:
-                        if asset_elem is not None:
-                            object_root_dir = Path(object_model_xml).parent
-                            for child in list(asset_elem):
-                                file_attr = child.attrib.get("file")
-                                if file_attr:
-                                    file_path = Path(file_attr)
-                                    if not file_path.is_absolute():
-                                        child.set("file", str((object_root_dir / file_path).resolve()).replace("\\", "/"))
-                            asset_children = [ET.tostring(child, encoding="unicode") for child in list(asset_elem)]
-                            asset_xml = "\n".join(asset_children)
-                        
-                        body_xml = ET.tostring(selected_body, encoding="unicode")
-            
-            plate_asset_xml = ""
-            plate_body_xml = ""
-            if plate_model_xml:
-                print(f"[SimuInterface] Loading plate model from: {plate_model_xml}")
-                if not Path(plate_model_xml).exists():
-                    print(f"[SimuInterface] WARNING: Plate model file not found: {plate_model_xml}")
-                else:
-                    try:
-                        plate_root = ET.parse(plate_model_xml).getroot()
-                        plate_asset_elem = plate_root.find("asset")
-                        plate_worldbody_elem = plate_root.find("worldbody")
-                        
-                        if plate_worldbody_elem is not None:
-                            plate_selected_body = None
-                            if plate_body_name:
-                                plate_selected_body = plate_worldbody_elem.find(f".//body[@name='{plate_body_name}']")
-                                print(f"[SimuInterface] Looking for plate body: '{plate_body_name}', found: {plate_selected_body is not None}")
-                            if plate_selected_body is None:
-                                plate_selected_body = plate_worldbody_elem.find("body")
-                                print(f"[SimuInterface] Using first body as fallback: {plate_selected_body is not None}")
-                            
-                            if plate_selected_body is not None:
-                                if plate_asset_elem is not None:
-                                    plate_root_dir = Path(plate_model_xml).parent
-                                    for child in list(plate_asset_elem):
-                                        file_attr = child.attrib.get("file")
-                                        if file_attr:
-                                            file_path = Path(file_attr)
-                                            if not file_path.is_absolute():
-                                                child.set("file", str((plate_root_dir / file_path).resolve()).replace("\\", "/"))
-                                    plate_asset_children = [ET.tostring(child, encoding="unicode") for child in list(plate_asset_elem)]
-                                    plate_asset_xml = "\n".join(plate_asset_children)
-                                    print(f"[SimuInterface] Plate asset loaded: {len(plate_asset_children)} assets")
-                                
-                                plate_body_xml = ET.tostring(plate_selected_body, encoding="unicode")
-                                print(f"[SimuInterface] Plate body loaded successfully")
-                            else:
-                                print(f"[SimuInterface] WARNING: No plate body found in model")
-                        else:
-                            print(f"[SimuInterface] WARNING: No worldbody in plate model")
-                    except Exception as e:
-                        print(f"[SimuInterface] ERROR parsing plate model: {e}")
-            
-            composed_xml = base_text
-            print(f"[SimuInterface] DEBUG: asset_xml length={len(asset_xml)}, plate_asset_xml length={len(plate_asset_xml)}")
-            print(f"[SimuInterface] DEBUG: body_xml length={len(body_xml)}, plate_body_xml length={len(plate_body_xml)}")
-            if "<!-- DYNAMIC_OBJECT_ASSET -->" in composed_xml:
-                composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
-                print(f"[SimuInterface] Replaced DYNAMIC_OBJECT_ASSET")
-            else:
-                print(f"[SimuInterface] WARNING: DYNAMIC_OBJECT_ASSET not found in base XML")
-            if "<!-- DYNAMIC_OBJECT_BODY -->" in composed_xml:
-                composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
-                print(f"[SimuInterface] Replaced DYNAMIC_OBJECT_BODY")
-            else:
-                print(f"[SimuInterface] WARNING: DYNAMIC_OBJECT_BODY not found in base XML")
-            if "<!-- PLATE_OBJECT_ASSET -->" in composed_xml:
-                composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_ASSET -->", plate_asset_xml)
-                print(f"[SimuInterface] Replaced PLATE_OBJECT_ASSET")
-            else:
-                print(f"[SimuInterface] WARNING: PLATE_OBJECT_ASSET not found in base XML")
-            if "<!-- PLATE_OBJECT_BODY -->" in composed_xml:
-                composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_BODY -->", plate_body_xml)
-                print(f"[SimuInterface] Replaced PLATE_OBJECT_BODY")
-            else:
-                print(f"[SimuInterface] WARNING: PLATE_OBJECT_BODY not found in base XML")
-
-            generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
-            generated_path.write_text(composed_xml, encoding="utf-8")
-            self._generated_scene_xml_path = str(generated_path)
-            return str(generated_path)
-
-        except Exception as e:
-            print(f"[SimuInterface] build scene with objects failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        result = build_scene_with_objects(
+            base_scene_xml, object_model_xml, object_body_name,
+            plate_model_xml, plate_body_name
+        )
+        if result is not None:
+            self._generated_scene_xml_path = result
+        return result
 
     def initialize(self, xml_path: Optional[str] = None, show_viewer: bool = True) -> bool:
         if xml_path is not None:
@@ -1491,6 +1374,20 @@ class SimuInterface:
         self.set_joint_target(joint_positions)
         self.set_gripper(gripper_position)
         self.step(1000)
+
+    def update_render_state(self, joints: np.ndarray, gripper: float, obj_pos: Optional[np.ndarray] = None):
+        """更新进程渲染器的状态（封装对 _render_process 的直接访问）
+
+        Args:
+            joints: 关节角度数组
+            gripper: 夹爪开合度
+            obj_pos: 物体位置 [x, y, z]，可选
+        """
+        if self._render_process is not None:
+            self._render_process.update_joints(joints)
+            self._render_process.update_gripper(gripper)
+            if obj_pos is not None:
+                self._render_process.update_object_position(obj_pos)
     
     # ========== 纯仿真模式: IK 控制方法 ==========
     
@@ -1926,3 +1823,188 @@ class MockSimuInterface:
 
     def disconnect(self):
         self._connected = False
+
+
+# ================================================================
+# 模块级场景构建函数（不依赖 SimuInterface 实例）
+# ================================================================
+
+def build_scene_with_object(base_scene_xml: str, object_model_xml: str, object_body_name: Optional[str] = None) -> Optional[str]:
+    """构建包含单个物体的场景 XML
+
+    Args:
+        base_scene_xml: 基础场景 XML 路径（需包含 DYNAMIC_OBJECT_ASSET/BODY 占位符）
+        object_model_xml: 物体模型 XML 路径
+        object_body_name: 物体 body 名称（可选，默认取第一个 body）
+
+    Returns:
+        生成的 XML 文件路径，失败返回 None
+    """
+    try:
+        base_text = Path(base_scene_xml).read_text(encoding="utf-8")
+        object_root = ET.parse(object_model_xml).getroot()
+
+        asset_elem = object_root.find("asset")
+        worldbody_elem = object_root.find("worldbody")
+        if worldbody_elem is None:
+            print(f"[build_scene_with_object] Invalid object xml (missing worldbody): {object_model_xml}")
+            return None
+
+        selected_body = None
+        if object_body_name:
+            selected_body = worldbody_elem.find(f".//body[@name='{object_body_name}']")
+
+        if selected_body is None:
+            selected_body = worldbody_elem.find("body")
+
+        if selected_body is None:
+            print(f"[build_scene_with_object] Invalid object xml (no body found): {object_model_xml}")
+            return None
+
+        asset_xml = ""
+        if asset_elem is not None:
+            object_root_dir = Path(object_model_xml).parent
+            for child in list(asset_elem):
+                file_attr = child.attrib.get("file")
+                if file_attr:
+                    file_path = Path(file_attr)
+                    if not file_path.is_absolute():
+                        child.set("file", str((object_root_dir / file_path).resolve()).replace("\\", "/"))
+
+            asset_children = [ET.tostring(child, encoding="unicode") for child in list(asset_elem)]
+            asset_xml = "\n".join(asset_children)
+
+        body_xml = ET.tostring(selected_body, encoding="unicode")
+
+        if "<!-- DYNAMIC_OBJECT_ASSET -->" not in base_text or "<!-- DYNAMIC_OBJECT_BODY -->" not in base_text:
+            print("[build_scene_with_object] Base scene xml missing DYNAMIC_OBJECT placeholders")
+            return None
+
+        composed_xml = base_text.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
+        composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
+
+        generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
+        generated_path.write_text(composed_xml, encoding="utf-8")
+        return str(generated_path)
+
+    except Exception as e:
+        print(f"[build_scene_with_object] failed: {e}")
+        return None
+
+
+def build_scene_with_objects(
+    base_scene_xml: str,
+    object_model_xml: str,
+    object_body_name: Optional[str] = None,
+    plate_model_xml: Optional[str] = None,
+    plate_body_name: Optional[str] = None,
+) -> Optional[str]:
+    """构建包含物体和放置目标的场景 XML
+
+    Args:
+        base_scene_xml: 基础场景 XML 路径（需包含占位符）
+        object_model_xml: 物体模型 XML 路径
+        object_body_name: 物体 body 名称
+        plate_model_xml: 放置目标模型 XML 路径（可选）
+        plate_body_name: 放置目标 body 名称（可选）
+
+    Returns:
+        生成的 XML 文件路径，失败返回 None
+    """
+    try:
+        base_text = Path(base_scene_xml).read_text(encoding="utf-8")
+
+        asset_xml = ""
+        body_xml = ""
+
+        if object_model_xml:
+            object_root = ET.parse(object_model_xml).getroot()
+            asset_elem = object_root.find("asset")
+            worldbody_elem = object_root.find("worldbody")
+
+            if worldbody_elem is not None:
+                selected_body = None
+                if object_body_name:
+                    selected_body = worldbody_elem.find(f".//body[@name='{object_body_name}']")
+                if selected_body is None:
+                    selected_body = worldbody_elem.find("body")
+
+                if selected_body is not None:
+                    if asset_elem is not None:
+                        object_root_dir = Path(object_model_xml).parent
+                        for child in list(asset_elem):
+                            file_attr = child.attrib.get("file")
+                            if file_attr:
+                                file_path = Path(file_attr)
+                                if not file_path.is_absolute():
+                                    child.set("file", str((object_root_dir / file_path).resolve()).replace("\\", "/"))
+                        asset_children = [ET.tostring(child, encoding="unicode") for child in list(asset_elem)]
+                        asset_xml = "\n".join(asset_children)
+
+                    body_xml = ET.tostring(selected_body, encoding="unicode")
+
+        plate_asset_xml = ""
+        plate_body_xml = ""
+        if plate_model_xml:
+            if not Path(plate_model_xml).exists():
+                print(f"[build_scene_with_objects] WARNING: Plate model file not found: {plate_model_xml}")
+            else:
+                try:
+                    plate_root = ET.parse(plate_model_xml).getroot()
+                    plate_asset_elem = plate_root.find("asset")
+                    plate_worldbody_elem = plate_root.find("worldbody")
+
+                    if plate_worldbody_elem is not None:
+                        plate_selected_body = None
+                        if plate_body_name:
+                            plate_selected_body = plate_worldbody_elem.find(f".//body[@name='{plate_body_name}']")
+                        if plate_selected_body is None:
+                            plate_selected_body = plate_worldbody_elem.find("body")
+
+                        if plate_selected_body is not None:
+                            if plate_asset_elem is not None:
+                                plate_root_dir = Path(plate_model_xml).parent
+                                for child in list(plate_asset_elem):
+                                    file_attr = child.attrib.get("file")
+                                    if file_attr:
+                                        file_path = Path(file_attr)
+                                        if not file_path.is_absolute():
+                                            child.set("file", str((plate_root_dir / file_path).resolve()).replace("\\", "/"))
+                                plate_asset_children = [ET.tostring(child, encoding="unicode") for child in list(plate_asset_elem)]
+                                plate_asset_xml = "\n".join(plate_asset_children)
+
+                            plate_body_xml = ET.tostring(plate_selected_body, encoding="unicode")
+                        else:
+                            print("[build_scene_with_objects] WARNING: No plate body found in model")
+                    else:
+                        print("[build_scene_with_objects] WARNING: No worldbody in plate model")
+                except Exception as e:
+                    print(f"[build_scene_with_objects] ERROR parsing plate model: {e}")
+
+        composed_xml = base_text
+        if "<!-- DYNAMIC_OBJECT_ASSET -->" in composed_xml:
+            composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
+        else:
+            print("[build_scene_with_objects] WARNING: DYNAMIC_OBJECT_ASSET not found in base XML")
+        if "<!-- DYNAMIC_OBJECT_BODY -->" in composed_xml:
+            composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
+        else:
+            print("[build_scene_with_objects] WARNING: DYNAMIC_OBJECT_BODY not found in base XML")
+        if "<!-- PLATE_OBJECT_ASSET -->" in composed_xml:
+            composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_ASSET -->", plate_asset_xml)
+        else:
+            print("[build_scene_with_objects] WARNING: PLATE_OBJECT_ASSET not found in base XML")
+        if "<!-- PLATE_OBJECT_BODY -->" in composed_xml:
+            composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_BODY -->", plate_body_xml)
+        else:
+            print("[build_scene_with_objects] WARNING: PLATE_OBJECT_BODY not found in base XML")
+
+        generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
+        generated_path.write_text(composed_xml, encoding="utf-8")
+        return str(generated_path)
+
+    except Exception as e:
+        print(f"[build_scene_with_objects] failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None

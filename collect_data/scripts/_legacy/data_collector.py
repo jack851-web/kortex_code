@@ -5,6 +5,15 @@
 - scripts.real.data_collector.RealDataCollector
 - scripts.simu.data_collector.SimuDataCollector
 """
+import warnings
+warnings.warn(
+    "scripts._legacy.data_collector 已弃用，请使用 "
+    "scripts.real.data_collector.RealDataCollector 或 "
+    "scripts.simu.data_collector.SimuDataCollector",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import json
 import os
 import time

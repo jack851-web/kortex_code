@@ -1,11 +1,14 @@
 """
 状态面板组件
 """
+import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QGridLayout, QProgressBar
 )
 from PyQt5.QtCore import Qt
+
+from .styles import COLORS
 
 
 class StatusPanel(QWidget):
@@ -41,7 +44,7 @@ class StatusPanel(QWidget):
         self._timer_label_title.setStyleSheet("font-size: 13px;")
         timer_layout.addWidget(self._timer_label_title)
         self._timer_label = QLabel("00:00")
-        self._timer_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2196F3;")
+        self._timer_label.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['info']};")
         timer_layout.addWidget(self._timer_label)
         timer_layout.addStretch()
         layout.addLayout(timer_layout)
@@ -167,7 +170,6 @@ class StatusPanel(QWidget):
 
     def update_simu_joints(self, joints):
         """更新仿真关节位置（输入为弧度，转换为角度显示）"""
-        import numpy as np
         for i, label in enumerate(self._simu_joint_labels):
             if i < len(joints):
                 # 弧度转角度

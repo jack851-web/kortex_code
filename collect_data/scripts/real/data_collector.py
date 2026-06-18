@@ -17,9 +17,6 @@ import threading
 from typing import Dict, List, Any
 from pathlib import Path
 
-# 导入关节归一化函数
-from kortex_real.gen3.gen3_lite import JOINT_NAMES as _JOINT_NAMES
-
 
 MAX_EPISODE_FRAMES = 5000
 CAMERA_KEY_PREFIX = "observation.images"
@@ -335,6 +332,11 @@ class RealDataCollector:
             sleep_time = max(0, (1.0 / self._fps) - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    @property
+    def episode_count(self) -> int:
+        """当前已采集的 episode 数量"""
+        return self._episode_count
 
     def start_episode(self, episode_id: int, camera_names: list, task_info: Dict[str, Any]):
         """开始一个新的 episode（数据集在 start_collection 时已初始化）"""
@@ -756,6 +758,10 @@ class RealDataCollector:
 
         desc = task_info.get("task_name", "") or task_info.get("description", "")
         return desc if desc else "Grasp the object"
+
+    def save_progress(self):
+        """保存收集进度（公共接口）"""
+        self._save_progress()
 
     def _save_progress(self):
         self._data_root.mkdir(parents=True, exist_ok=True)

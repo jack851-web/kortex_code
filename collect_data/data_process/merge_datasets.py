@@ -19,6 +19,8 @@ r"""
         --max_data_file_size_mb 200
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -135,7 +137,7 @@ def build_video_file_map(datasets: list[dict], video_keys: list[str]) -> dict:
         for ds_idx, ds in enumerate(datasets):
             vfiles = collect_video_files(ds["root"], vk)
             for old_idx in range(len(vfiles)):
-                mapping[vk][(ds_idx, old_idx)] = cum_idx = old_idx + cum_count
+                mapping[vk][(ds_idx, old_idx)] = old_idx + cum_count
             cum_count += len(vfiles)
     return mapping
 

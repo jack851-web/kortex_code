@@ -12,57 +12,14 @@ from scripts import (
     MockSimuInterface,
     SyncController,
     GraspExecutor,
+    resolve_path,
+    resolve_config_paths,
 )
 from scripts.real.data_collector import RealDataCollector
 from scripts.simu.data_collector import SimuDataCollector
 
 # 项目根目录 (kortex_code)
 PROJECT_ROOT = Path(__file__).parent.parent
-
-
-def resolve_path(path_str: str, base_dir: Path = None) -> str:
-    """解析路径，支持相对路径和绝对路径"""
-    if not path_str:
-        return path_str
-    path = Path(path_str)
-    if path.is_absolute():
-        return str(path)
-    base = base_dir or PROJECT_ROOT
-    return str((base / path_str).resolve())
-
-
-def resolve_config_paths(config: dict, base_dir: Path = None) -> dict:
-    """递归解析配置中的路径字段"""
-    path_keys = {
-        'xml_path', 'model_xml_path', 'scene_base_xml_path',
-        'real_data_root', 'simu_data_root', 'mock_simu_data_root',
-        'data_root', 'output_path', 'log_path',
-    }
-    
-    def _resolve_value(key: str, value):
-        if isinstance(value, str):
-            is_path = (
-                key in path_keys or 
-                key.endswith('_path') or 
-                key.endswith('_root') or
-                key.endswith('_xml') or
-                key.endswith('_dir') or
-                '.xml' in value.lower() or
-                '.yaml' in value.lower() or
-                '.json' in value.lower()
-            )
-            if is_path:
-                return resolve_path(value, base_dir)
-            return value
-        elif isinstance(value, dict):
-            return {k: _resolve_value(k, v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_resolve_value(key, item) for item in value]
-        return value
-    
-    if config is None:
-        return config
-    return {k: _resolve_value(k, v) for k, v in config.items()}
 
 
 class DataCollectionSystem:
@@ -164,7 +121,11 @@ class DataCollectionSystem:
                     "fps": cam_cfg.get("fps", 30)
                 }
             self._real = RealInterface(camera_config=real_cam_cfg)
-            if not self._real.connect(robot_config.get("ip", "192.168.1.10")):
+            if not self._real.connect(
+                robot_config.get("ip", "192.168.1.10"),
+                username=robot_config.get("username"),
+                password=robot_config.get("password"),
+            ):
                 print("Failed to connect to real robot")
                 return False
             self._real.connect_cameras()
@@ -282,7 +243,7 @@ class DataCollectionSystem:
 
             print(f"\n{'='*60}")
             print("All tasks completed")
-            episode_count = self._real_data_collector._episode_count if self._real_data_collector is not None else self._simu_data_collector._episode_count
+            episode_count = self._real_data_collector.episode_count if self._real_data_collector is not None else self._simu_data_collector.episode_count
             print(f"Total episodes collected: {episode_count}")
             print(f"{'='*60}\n")
 
@@ -351,7 +312,7 @@ class DataCollectionSystem:
             "plate_position": plate_pos,
         }
 
-        base_episode_count = self._real_data_collector._episode_count if self._real_data_collector is not None else self._simu_data_collector._episode_count
+        base_episode_count = self._real_data_collector.episode_count if self._real_data_collector is not None else self._simu_data_collector.episode_count
         episode_id = base_episode_count + 1
 
         if self._real_data_collector is not None:

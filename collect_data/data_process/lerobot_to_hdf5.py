@@ -87,8 +87,8 @@ def main():
                         help="输出 HDF5 目录")
     parser.add_argument("--episodes", type=int, nargs="*", default=None,
                         help="指定转换的 episode 索引（空格分隔），默认全部")
-    parser.add_argument("--is_sim", action="store_true", default=True,
-                        help="标记为仿真数据")
+    parser.add_argument("--is_sim", action="store_true", default=False,
+                        help="标记为仿真数据（默认为真实数据）")
     parser.add_argument("--clean", action="store_true",
                         help="清除输出目录中已有的 hdf5 文件")
     args = parser.parse_args()

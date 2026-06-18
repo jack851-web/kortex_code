@@ -35,51 +35,6 @@ from scripts.core.topic_defs import (
 )
 
 
-class DataCollectionWorker(QThread):
-    """数据收集工作线程"""
-
-    log_signal = pyqtSignal(str, str)
-    status_signal = pyqtSignal(str, str)
-    joints_signal = pyqtSignal(object)
-    cartesian_signal = pyqtSignal(object)
-    gripper_signal = pyqtSignal(float)
-    task_signal = pyqtSignal(str, int, int)
-    camera_signal = pyqtSignal(dict)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, data_collector):
-        super().__init__()
-        self._collector = data_collector
-        self._running = False
-        self._paused = False
-
-    def run(self):
-        self._running = True
-        self.log_signal.emit("数据收集线程启动", "INFO")
-
-        while self._running:
-            if self._paused:
-                self.msleep(100)
-                continue
-
-            try:
-                self.msleep(10)
-            except Exception as e:
-                self.log_signal.emit(f"收集错误: {e}", "ERROR")
-
-        self.log_signal.emit("数据收集线程停止", "INFO")
-        self.finished_signal.emit()
-
-    def stop(self):
-        self._running = False
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
-
-
 class MainWindow(QMainWindow):
     """主窗口 - 通过 MessageBroker 订阅数据"""
 

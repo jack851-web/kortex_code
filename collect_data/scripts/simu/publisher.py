@@ -86,27 +86,11 @@ class SimuPublisher:
 
     def _cleanup_remaining_renderers(self):
         """清理残留的 renderer（线程停止后调用，作为兜底）"""
-        if not self._simu._thread_renderers:
+        if not self._simu.get_thread_renderer_tids():
             return
 
-        print(f"[SimuPublisher] Cleaning up {len(self._simu._thread_renderers)} remaining renderers...")
-        for tid, renderer in list(self._simu._thread_renderers.items()):
-            try:
-                # MjrContext 可以在任何线程释放
-                if hasattr(renderer, '_mjr_context') and renderer._mjr_context is not None:
-                    try:
-                        renderer._mjr_context.free()
-                    except Exception:
-                        pass
-                    renderer._mjr_context = None
-                if hasattr(renderer, '_scene') and renderer._scene is not None:
-                    renderer._scene = None
-                # GLContext 已经随着线程结束而失效，置空即可
-                if hasattr(renderer, '_gl_context'):
-                    renderer._gl_context = None
-            except Exception as e:
-                print(f"[SimuPublisher] Error cleaning renderer: {e}")
-        self._simu._thread_renderers.clear()
+        print(f"[SimuPublisher] Cleaning up remaining renderers...")
+        self._simu.clear_thread_renderers()
 
     @property
     def is_running(self) -> bool:
@@ -147,10 +131,10 @@ class SimuPublisher:
         """清理当前线程创建的 renderer（必须在线程内调用）"""
         if self._simu is None:
             return
-        if tid not in self._simu._thread_renderers:
+        if not self._simu.has_thread_renderer(tid):
             return
 
-        renderer = self._simu._thread_renderers.get(tid)
+        renderer = self._simu.get_thread_renderer(tid)
         if renderer is None:
             return
 
@@ -179,7 +163,7 @@ class SimuPublisher:
             print(f"[SimuPublisher] Error cleaning renderer: {e}")
         finally:
             # 从缓存中移除
-            self._simu._thread_renderers.pop(tid, None)
+            self._simu.pop_thread_renderer(tid)
             print(f"[SimuPublisher] Renderer cleaned up (tid={tid})")
 
     def _publish_once(self):
@@ -313,8 +297,8 @@ class SimuPublisher:
 
         tid = threading.current_thread().ident
         # 检查是否有缓存的渲染器
-        if tid in simu._thread_renderers:
-            return simu._thread_renderers[tid]
+        if simu.has_thread_renderer(tid):
+            return simu.get_thread_renderer(tid)
 
         # 使用主渲染器（如果是在主线程创建的）
         if simu._renderer is not None and simu._renderer_thread_id == tid:
@@ -323,7 +307,7 @@ class SimuPublisher:
         # 创建新的线程渲染器
         try:
             renderer = mujoco.Renderer(simu._model, height=simu._render_height, width=simu._render_width)
-            simu._thread_renderers[tid] = renderer
+            simu.set_thread_renderer(tid, renderer)
             return renderer
         except Exception as e:
             print(f"[SimuPublisher] Failed to create renderer: {e}")
@@ -347,8 +331,8 @@ class SimuPublisher:
                         )
                         # 替换线程缓存的旧 renderer
                         tid = threading.current_thread().ident
-                        if tid in simu._thread_renderers:
-                            simu._thread_renderers[tid] = new_renderer
+                        if simu.has_thread_renderer(tid):
+                            simu.set_thread_renderer(tid, new_renderer)
                         elif hasattr(simu, '_renderer') and simu._renderer is renderer:
                             simu._renderer = new_renderer
                         return self._render_with_retry(new_renderer, simu, cam_id)

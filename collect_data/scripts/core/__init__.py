@@ -1,6 +1,7 @@
 """核心基础设施模块"""
 
 from .message_bus import MessageBroker, Topic
+from .config_utils import resolve_path, resolve_config_paths
 from .topic_defs import (
     # 仿真话题
     SIMU_IMAGES, SIMU_JOINTS, SIMU_GRIPPER, SIMU_TCP_POSE,
@@ -17,6 +18,7 @@ from .topic_defs import (
 __all__ = [
     'MessageBroker',
     'Topic',
+    'resolve_path', 'resolve_config_paths',
     'SIMU_IMAGES', 'SIMU_JOINTS', 'SIMU_GRIPPER', 'SIMU_TCP_POSE',
     'SIMU_OBJECT_POS', 'SIMU_STATUS', 'SIMU_CARTESIAN', 'ALL_SIMU_TOPICS',
     'REAL_IMAGES', 'REAL_JOINTS', 'REAL_CARTESIAN', 'REAL_GRIPPER', 'REAL_STATUS',

@@ -59,12 +59,9 @@ class SyncController:
                 
                 self._update_adhesion(real_gripper)
 
-                if hasattr(self._simu, '_render_process') and self._simu._render_process is not None:
-                    self._simu._render_process.update_joints(real_joints)
-                    self._simu._render_process.update_gripper(real_gripper)
-                    active_body = self._simu.get_active_object_body_name() if hasattr(self._simu, 'get_active_object_body_name') else self._adhesion_object_body_name
-                    obj_pos = self._simu.get_object_position(active_body)
-                    self._simu._render_process.update_object_position(obj_pos)
+                active_body = self._simu.get_active_object_body_name() if hasattr(self._simu, 'get_active_object_body_name') else self._adhesion_object_body_name
+                obj_pos = self._simu.get_object_position(active_body)
+                self._simu.update_render_state(real_joints, real_gripper, obj_pos)
 
                 
                 self._last_real_joints = real_joints.copy()

@@ -17,8 +17,34 @@ import threading
 from typing import Dict, List, Any
 from pathlib import Path
 
-# 导入关节归一化函数
-from kortex_real.gen3.gen3_lite import normalize_joints, normalize_ee_pose, JOINT_NAMES as _JOINT_NAMES
+# 关节归一化参数（与 Gen3 Lite 一致）
+_JOINT_LIMITS_DEG = {
+    "joint_1": (0.0, 360.0),
+    "joint_2": (0.0, 360.0),
+    "joint_3": (0.0, 360.0),
+    "joint_4": (0.0, 360.0),
+    "joint_5": (0.0, 360.0),
+    "joint_6": (0.0, 360.0),
+}
+_EE_WORKSPACE = {"x": (0.0, 1.0), "y": (-0.5, 0.5), "z": (0.0, 0.8)}
+
+
+def _normalize_joints(joints_deg: np.ndarray) -> np.ndarray:
+    """将关节角度归一化到 [0, 1]"""
+    result = np.zeros(len(joints_deg), dtype=np.float32)
+    for i, val in enumerate(joints_deg):
+        key = f"joint_{i + 1}"
+        lo, hi = _JOINT_LIMITS_DEG.get(key, (0.0, 360.0))
+        result[i] = np.clip((val - lo) / (hi - lo), 0.0, 1.0)
+    return result
+
+
+def _normalize_ee_pose(x: float, y: float, z: float) -> np.ndarray:
+    """将末端位姿归一化到 [0, 1]"""
+    nx = np.clip((x - _EE_WORKSPACE["x"][0]) / (_EE_WORKSPACE["x"][1] - _EE_WORKSPACE["x"][0]), 0.0, 1.0)
+    ny = np.clip((y - _EE_WORKSPACE["y"][0]) / (_EE_WORKSPACE["y"][1] - _EE_WORKSPACE["y"][0]), 0.0, 1.0)
+    nz = np.clip((z - _EE_WORKSPACE["z"][0]) / (_EE_WORKSPACE["z"][1] - _EE_WORKSPACE["z"][0]), 0.0, 1.0)
+    return np.array([nx, ny, nz], dtype=np.float32)
 
 
 # 单个 Episode 最大帧数限制
@@ -327,11 +353,11 @@ class SimuDataCollector:
                 # 构建 state 向量: [6关节角(归一化), 1夹爪, 3末端位姿(归一化)] = 10维
                 # 仿真输出的是弧度，先转度数再归一化
                 joints_deg = np.rad2deg(joints_rad) if joints_rad is not None else np.zeros(6)
-                normalized_joints = normalize_joints(joints_deg)
+                normalized_joints = _normalize_joints(joints_deg)
 
                 # 末端位姿归一化
                 if tcp_pos is not None:
-                    normalized_ee = normalize_ee_pose(tcp_pos[0], tcp_pos[1], tcp_pos[2])
+                    normalized_ee = _normalize_ee_pose(tcp_pos[0], tcp_pos[1], tcp_pos[2])
                 else:
                     normalized_ee = np.zeros(3, dtype=np.float32)
 
@@ -376,6 +402,11 @@ class SimuDataCollector:
             print(f"[SimuDataCollector] Error: {e}")
             import traceback
             traceback.print_exc()
+
+    @property
+    def episode_count(self) -> int:
+        """当前已采集的 episode 数量"""
+        return self._episode_count
 
     def start_episode(self, episode_id: int, camera_names: list, task_info: Dict[str, Any]):
         """开始一个新的 episode
@@ -834,6 +865,10 @@ class SimuDataCollector:
         # 旧格式
         desc = task_info.get("task_name", "") or task_info.get("description", "")
         return desc if desc else "Grasp the object"
+
+    def save_progress(self):
+        """保存收集进度（公共接口）"""
+        self._save_progress()
 
     def _save_progress(self):
         self._data_root.mkdir(parents=True, exist_ok=True)

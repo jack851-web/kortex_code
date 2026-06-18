@@ -208,19 +208,16 @@ class SimuManager:
 
         final_xml = base_xml  # 默认使用基础 XML
         if object_model_xml:
-            # 先创建临时 SimuInterface 仅用于构建合并 XML（不加载模型/不创建 renderer）
-            from .interface import SimuInterface
-            tmp_simu_for_build = SimuInterface.__new__(SimuInterface)
-            tmp_simu_for_build._generated_scene_xml_path = None
-            tmp_simu_for_build._active_object_body_name = object_body_name
+            # 使用模块级函数构建合并 XML（无需创建 SimuInterface 实例）
+            from .interface import build_scene_with_object, build_scene_with_objects
             try:
                 if plate_model_xml:
-                    generated = tmp_simu_for_build._build_scene_with_objects(
+                    generated = build_scene_with_objects(
                         base_xml, object_model_xml, object_body_name,
                         plate_model_xml, plate_body_name
                     )
                 else:
-                    generated = tmp_simu_for_build._build_scene_with_object(
+                    generated = build_scene_with_object(
                         base_xml, object_model_xml, object_body_name
                     )
                 if generated:

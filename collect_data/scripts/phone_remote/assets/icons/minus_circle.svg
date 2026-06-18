@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 圆形外框 -->
+  <circle cx="24" cy="24" r="20"/>
+  <!-- 减号 -->
+  <line x1="16" y1="24" x2="32" y2="24"/>
+</svg>

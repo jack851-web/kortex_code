@@ -7,6 +7,8 @@ from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QGridLayout
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt
 
+from .styles import COLORS
+
 
 class CameraWidget(QWidget):
     """单个相机显示组件"""
@@ -17,9 +19,9 @@ class CameraWidget(QWidget):
         self._width = width
         self._height = height
         self._init_ui()
-        # 固定自身高度 = 标题行 + 图像高度，不随父布局拉伸
+        # 设置最小尺寸，允许布局拉伸
         title_height = 24
-        self.setFixedSize(width, height + title_height)
+        self.setMinimumSize(width, height + title_height)
     
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -27,7 +29,7 @@ class CameraWidget(QWidget):
         
         # 标题
         self._title_label = QLabel(self._camera_name)
-        self._title_label.setStyleSheet("font-weight: bold; color: #333;")
+        self._title_label.setStyleSheet(f"font-weight: bold; color: {COLORS['text_dark']};")
         layout.addWidget(self._title_label)
         
         # 图像显示

@@ -2,9 +2,11 @@
 日志面板组件
 """
 from datetime import datetime
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout, QFileDialog
 from PyQt5.QtCore import Qt, pyqtSignal, QMetaObject, Q_ARG
 from PyQt5.QtGui import QTextCursor, QFont
+
+from .styles import COLORS
 
 
 class LogPanel(QWidget):
@@ -29,7 +31,7 @@ class LogPanel(QWidget):
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setFont(QFont("Consolas", 9))
-        self._log_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
+        self._log_text.setStyleSheet(f"background-color: {COLORS['bg_dark']}; color: {COLORS['text_light']};")
         
         layout.addWidget(self._log_text)
         
@@ -58,12 +60,12 @@ class LogPanel(QWidget):
         
         # 根据级别设置颜色
         color_map = {
-            "INFO": "#d4d4d4",
-            "WARNING": "#ffa500",
-            "ERROR": "#ff4444",
-            "SUCCESS": "#44ff44",
+            "INFO": COLORS['text_light'],
+            "WARNING": COLORS['warning'],
+            "ERROR": COLORS['error'],
+            "SUCCESS": COLORS['success'],
         }
-        color = color_map.get(level, "#d4d4d4")
+        color = color_map.get(level, COLORS['text_light'])
         
         html = f'<span style="color: #888;">[{timestamp}]</span> <span style="color: {color};">[{level}]</span> {message}'
         
@@ -97,7 +99,6 @@ class LogPanel(QWidget):
     
     def _save_log(self):
         """保存日志"""
-        from PyQt5.QtWidgets import QFileDialog
         filename, _ = QFileDialog.getSaveFileName(
             self, "保存日志", "", "文本文件 (*.txt);;所有文件 (*.*)"
         )

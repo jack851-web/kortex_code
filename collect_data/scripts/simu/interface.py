@@ -6,5 +6,6 @@
 """
 # 从原始位置导入，保持向后兼容
 from scripts.simu_interface import SimuInterface, MockSimuInterface
+from scripts.simu_interface import build_scene_with_object, build_scene_with_objects
 
-__all__ = ['SimuInterface', 'MockSimuInterface']
+__all__ = ['SimuInterface', 'MockSimuInterface', 'build_scene_with_object', 'build_scene_with_objects']
