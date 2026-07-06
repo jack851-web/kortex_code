@@ -111,11 +111,11 @@ class MuJoCoIK:
     def jacobian(self, joint_angles: Optional[np.ndarray] = None, skip_forward: bool = False) -> np.ndarray:
         """
         计算雅可比矩阵
-        
+
         Args:
             joint_angles: 关节角度 (可选，默认使用当前状态)
             skip_forward: 是否跳过 mj_forward（如果刚调用过 forward_kinematics 则为 True）
-            
+
         Returns:
             雅可比矩阵 (6 x n_joints)
         """
@@ -124,32 +124,161 @@ class MuJoCoIK:
             for i, qpos_adr in enumerate(self.joint_qposadrs):
                 if i < len(joint_angles):
                     self.data.qpos[qpos_adr] = joint_angles[i]
-        
+
         # 只有在需要时才调用 mj_forward
         if not skip_forward:
             mujoco.mj_forward(self.model, self.data)
-        
+
         # 计算雅可比矩阵
         jacp = np.zeros((3, self.model.nv))  # 位置雅可比
         jacr = np.zeros((3, self.model.nv))  # 旋转雅可比
-        
+
         mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.ee_id)
-        
+
         # 提取关节对应的列
         jacobian = np.zeros((6, self.n_joints))
         for i, dof_adr in enumerate(self.joint_dofadrs):
             jacobian[:3, i] = jacp[:, dof_adr]
             jacobian[3:, i] = jacr[:, dof_adr]
-        
+
         return jacobian
+
+    def inverse_kinematics_fast(self,
+                                target_position: np.ndarray,
+                                target_orientation: Optional[np.ndarray] = None,
+                                initial_guess: Optional[np.ndarray] = None,
+                                max_iterations: int = 5,
+                                tolerance: float = 1e-2,
+                                damping: float = 0.05,
+                                step_scale: float = 0.8,
+                                orientation_weight: float = 0.3) -> np.ndarray:
+        """
+        快速 IK：Jacobian DLS，支持位置+姿态（可选软约束）
+
+        相比 inverse_kinematics：
+        - 最多5次迭代，单次耗时预期 1-5ms
+        - 阻尼更小（0.05），步长更大（0.8），收敛更快
+        - 姿态为软约束（权重0.3），位置优先，姿态辅助
+          避免纯位置IK导致末端姿态千奇百怪
+
+        Args:
+            target_position: 目标位置 [x, y, z]
+            target_orientation: 目标姿态旋转矩阵 (3x3)，None则纯位置IK
+            initial_guess: 初始关节角（弧度）
+            max_iterations: 最大迭代次数，默认5
+            tolerance: 位置容差（米），默认1cm
+            damping: DLS 阻尼系数
+            step_scale: 步长缩放因子
+            orientation_weight: 姿态误差权重(0-1)，越小姿态约束越弱
+                                0=纯位置IK，1=位置姿态等权，0.3=姿态软约束(推荐)
+        """
+        target_position = np.asarray(target_position, dtype=float).reshape(3)
+        use_orientation = target_orientation is not None
+        if use_orientation:
+            target_orientation = np.asarray(target_orientation, dtype=float).reshape(3, 3)
+
+        if initial_guess is not None:
+            q = np.asarray(initial_guess, dtype=float).copy()
+        else:
+            q = np.zeros(self.n_joints)
+
+        success = False
+        pos_err_norm = float('inf')
+        rot_err_norm = 0.0
+
+        for iteration in range(max_iterations):
+            # 1. 设置关节角并前向运动学
+            for i, qpos_adr in enumerate(self.joint_qposadrs):
+                if i < len(q):
+                    self.data.qpos[qpos_adr] = q[i]
+            mujoco.mj_forward(self.model, self.data)
+
+            # 2. 获取末端位置和姿态
+            ee_pos = self.data.site_xpos[self.ee_id].copy()
+            pos_error = target_position - ee_pos
+            pos_err_norm = float(np.linalg.norm(pos_error))
+
+            # 3. 计算雅可比（位置+姿态）
+            jacp = np.zeros((3, self.model.nv))
+            jacr = np.zeros((3, self.model.nv))
+            mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.ee_id)
+
+            if not use_orientation:
+                # 纯位置IK：3行雅可比
+                J = np.zeros((3, self.n_joints))
+                for i, dof_adr in enumerate(self.joint_dofadrs):
+                    J[:, i] = jacp[:, dof_adr]
+                error = pos_error
+                # 位置收敛检查
+                if pos_err_norm < tolerance:
+                    success = True
+                    break
+            else:
+                # 6DOF IK：6行雅可比，姿态加权（软约束）
+                ee_rot = self.data.site_xmat[self.ee_id].reshape(3, 3).copy()
+                # 姿态误差：轴角表示
+                rot_error_mat = target_orientation @ ee_rot.T
+                rot_error = self._rotation_matrix_to_axis_angle(rot_error_mat)
+                rot_err_norm = float(np.linalg.norm(rot_error))
+
+                # 收敛检查：位置和姿态都满足
+                if pos_err_norm < tolerance and rot_err_norm < 0.1:  # 0.1rad ≈ 5.7°
+                    success = True
+                    break
+
+                # 构建加权雅可比和误差向量
+                # 位置权重1.0，姿态权重orientation_weight
+                J = np.zeros((6, self.n_joints))
+                for i, dof_adr in enumerate(self.joint_dofadrs):
+                    J[:3, i] = jacp[:, dof_adr]
+                    J[3:, i] = jacr[:, dof_adr]
+
+                # 加权：位置行权重1.0，姿态行权重orientation_weight
+                W = np.eye(6)
+                W[3:, 3:] *= orientation_weight
+                J_w = W @ J
+                error = np.concatenate([pos_error, rot_error])
+
+                # 用加权雅可比做DLS
+                J = J_w  # 后续DLS用加权雅可比
+                # 但误差向量也要加权
+                error = W @ error
+
+            # 4. DLS 求解：delta_q = J^T (J J^T + λ²I)^-1 error
+            n_rows = J.shape[0]
+            JJT = J @ J.T + damping ** 2 * np.eye(n_rows)
+            try:
+                delta_q = J.T @ np.linalg.solve(JJT, error)
+            except np.linalg.LinAlgError:
+                delta_q = J.T @ error / (np.linalg.norm(J @ J.T) + 1e-6)
+
+            # 5. 限制步长避免过冲
+            step_norm = np.linalg.norm(delta_q)
+            if step_norm > 0.15:
+                delta_q = delta_q / (step_norm + 1e-12) * 0.15
+
+            q += step_scale * delta_q
+
+            # 6. 关节限位
+            for i in range(self.n_joints):
+                q[i] = np.clip(q[i], self.joint_ranges[i][0], self.joint_ranges[i][1])
+
+        self.last_solve_info = {
+            'success': success,
+            'iterations': iteration + 1,
+            'position_error': pos_err_norm,
+            'orientation_error': rot_err_norm,
+            'timed_out': not success,
+        }
+        return q
     
     def inverse_kinematics(self,
                           target_position: np.ndarray,
                           target_orientation: Optional[np.ndarray] = None,
                           initial_guess: Optional[np.ndarray] = None,
-                          max_iterations: int = 50,  # 增加默认迭代次数
-                          tolerance: float = 5e-4,   # 收紧容差到 0.5mm
-                          damping: float = 0.05) -> np.ndarray:
+                          max_iterations: int = 30,   # 遥操作只需粗略解，30次迭代足够，过多导致延时
+                          tolerance: float = 5e-3,   # 5mm 容差，遥操作不需要高精度
+                          damping: float = 0.2) -> np.ndarray:
         """
         逆运动学：阻尼最小二乘法 (DLS)
         返回关节角；求解状态可通过 get_last_solve_info() 获取。

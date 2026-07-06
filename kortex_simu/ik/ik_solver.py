@@ -1,6 +1,11 @@
 """
 Kinova Gen3 Lite 逆运动学求解器
 基于DH参数的正逆运动学实现
+
+单位约定：
+  - IK 求解器内部使用弧度（与 DH 参数惯例一致）
+  - 对外接口 forward_kinematics / inverse_kinematics 的 joint_angles 均为弧度
+  - 上层（simu_interface）负责度数 <-> 弧度转换
 """
 
 import numpy as np
@@ -9,32 +14,44 @@ from typing import Tuple, Optional, List, Dict, Any
 
 class IKSolver:
     """IK求解器基类"""
-    
+
     def forward_kinematics(self, joint_angles: np.ndarray) -> np.ndarray:
-        """正运动学：从关节角度计算笛卡尔坐标"""
+        """正运动学：从关节角度计算笛卡尔坐标
+
+        Args:
+            joint_angles: 关节角度（弧度）
+        """
         raise NotImplementedError
-    
+
     def inverse_kinematics(self, position: np.ndarray, orientation: Optional[np.ndarray] = None) -> np.ndarray:
-        """逆运动学：从笛卡尔坐标计算关节角度"""
+        """逆运动学：从笛卡尔坐标计算关节角度
+
+        Returns:
+            关节角度（弧度）
+        """
         raise NotImplementedError
-    
+
     def jacobian(self, joint_angles: np.ndarray) -> np.ndarray:
-        """计算雅可比矩阵"""
+        """计算雅可比矩阵
+
+        Args:
+            joint_angles: 关节角度（弧度）
+        """
         raise NotImplementedError
 
 
 class KinovaGen3LiteIK(IKSolver):
     """
     Kinova Gen3 Lite 逆运动学求解器
-    
+
     机械臂结构:
     - 6个关节 (J0-J5) + 夹爪
     - 采用标准的6-DOF机械臂逆运动学
-    
+
     DH参数 (单位: 米, 弧度):
     基于 gen3_lite_gen3_lite_2f.xml 中的关节定义
     """
-    
+
     def __init__(self):
         self.dh_params = {
             'd1': 0.12825,      # 基座高度
@@ -45,7 +62,8 @@ class KinovaGen3LiteIK(IKSolver):
             'd6': 0.105,        # End effector offset
             'a2': 0.05955,      # Shoulder offset
         }
-        
+
+        # 关节限位（弧度）— 与 Kinova Gen3 Lite 硬件规格对应
         self.joint_limits = {
             'J0': (-2.76, 2.76),
             'J1': (-2.76, 2.76),
@@ -244,15 +262,18 @@ class KinovaGen3LiteIK(IKSolver):
         }
         return q
     
-    def inverse_kinematics_analytical(self, position: np.ndarray, 
+    def inverse_kinematics_analytical(self, position: np.ndarray,
                                       preferred_angles: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        解析逆运动学（简化版本，不考虑姿态）
-        
+        解析逆运动学（简化版本，仅求解前 3 个关节位置；后 3 个腕关节取 preferred_angles 或 0）
+
+        注意：此为简化解析解，不保证姿态匹配。需要精确姿态时请使用
+        inverse_kinematics()（数值解）或 mujoco_ik.MuJoCoIK。
+
         Args:
             position: 目标位置 [x, y, z] (米)
             preferred_angles: 优先角度用于解决多解问题
-            
+
         Returns:
             6个关节角度 (弧度), shape=(6,)
         """

@@ -1,12 +1,19 @@
 """
 纯仿真模式控制器
 使用 IK 控制仿真机械臂
+
+单位约定：
+  - 本控制器内部所有关节角度均使用弧度（与 MuJoCo API 一致）
+  - 上层模块（如 simu_interface）负责度数 <-> 弧度转换
 """
 
+import logging
 import numpy as np
 import mujoco
 from typing import Optional, Tuple, Dict, Any
 from .mujoco_ik import MuJoCoIK
+
+logger = logging.getLogger(__name__)
 
 
 class SimulationController:
@@ -102,9 +109,9 @@ class SimulationController:
         ik_success = solve_info.get('success', True)
         if not is_valid or not ik_success:
             if not is_valid:
-                print(f"IK solution violates joint limits: {violations}")
+                logger.warning(f"IK solution violates joint limits: {violations}")
             if not ik_success:
-                print(f"IK failed to converge: {solve_info}")
+                logger.warning(f"IK failed to converge: {solve_info}")
             return False
         
         # 轨迹插值

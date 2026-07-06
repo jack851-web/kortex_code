@@ -133,12 +133,13 @@
     <touch name="left_fingertip_force" site="left_fingertip"/>
   </sensor>
   <actuator>
-    <position name="actuator_J0" joint="J0" kp="5000" ctrlrange="-2.7 2.7"/>
-    <position name="actuator_J1" joint="J1" kp="5000" ctrlrange="-2.7 2.7"/>
-    <position name="actuator_J2" joint="J2" kp="5000" ctrlrange="-2.7 2.7"/>
-    <position name="actuator_J3" joint="J3" kp="5000" ctrlrange="-2.6 2.6"/>
-    <position name="actuator_J4" joint="J4" kp="5000" ctrlrange="-2.6 2.6"/>
-    <position name="actuator_J5" joint="J5" kp="5000" ctrlrange="-2.6 2.6"/>
+    <!-- kp 从 5000 降到 2000，配合 damping=100 减少遥操作时关节震荡 -->
+    <position name="actuator_J0" joint="J0" kp="2000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J1" joint="J1" kp="2000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J2" joint="J2" kp="2000" ctrlrange="-2.7 2.7"/>
+    <position name="actuator_J3" joint="J3" kp="2000" ctrlrange="-2.6 2.6"/>
+    <position name="actuator_J4" joint="J4" kp="2000" ctrlrange="-2.6 2.6"/>
+    <position name="actuator_J5" joint="J5" kp="2000" ctrlrange="-2.6 2.6"/>
     <!-- 夹爪执行器：高 kp 确保足够夹持力 -->
     <position name="actuator_RIGHT_BOTTOM" joint="RIGHT_BOTTOM" kp="1800" forcerange="-60 60" ctrlrange="0 0.8"/>
     <position name="actuator_RIGHT_TIP" joint="RIGHT_TIP" kp="1500" forcerange="-40 40" ctrlrange="-0.3 0.3"/>
