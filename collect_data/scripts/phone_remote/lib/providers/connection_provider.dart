@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/constants.dart';
 import '../core/storage_service.dart';
 import '../services/websocket_service.dart';
+import '../services/sound_service.dart';
 
 /// 连接状态管理
 class ConnectionState {
@@ -41,7 +42,6 @@ class ConnectionNotifier extends StateNotifier<ConnectionState> {
 
   ConnectionNotifier(this._wsService) : super(const ConnectionState()) {
     _loadSavedConfig();
-    _wsService.onConnectionChanged = _onConnectionChanged;
   }
 
   /// 暴露WebSocketService实例供外部使用
@@ -93,7 +93,8 @@ class ConnectionNotifier extends StateNotifier<ConnectionState> {
     state = state.copyWith(isConnected: false);
   }
 
-  void _onConnectionChanged(bool connected) {
+  /// 由外部回调触发连接状态更新
+  void onConnectionChanged(bool connected) {
     state = state.copyWith(isConnected: connected);
   }
 
@@ -103,6 +104,10 @@ class ConnectionNotifier extends StateNotifier<ConnectionState> {
     super.dispose();
   }
 }
+
+final soundServiceProvider = Provider<SoundService>((ref) {
+  return SoundService();
+});
 
 final connectionProvider =
     StateNotifierProvider<ConnectionNotifier, ConnectionState>((ref) {

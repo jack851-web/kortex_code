@@ -122,7 +122,28 @@ class StatusPanel(QWidget):
         simu_layout.addWidget(self._simu_gripper_label)
 
         layout.addWidget(self._simu_group)
-        
+
+        # 遥操作状态组
+        self._teleop_group = QGroupBox("遥操作状态")
+        teleop_layout = QVBoxLayout(self._teleop_group)
+        self._teleop_ip_label = QLabel("IP: -")
+        self._teleop_ip_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #1976D2;")
+        self._teleop_ip_label.setTextInteractionFlags(
+            self._teleop_ip_label.textInteractionFlags() | Qt.TextSelectableByMouse
+        )
+        teleop_layout.addWidget(self._teleop_ip_label)
+        self._teleop_phone_label = QLabel("手机: 未连接")
+        self._teleop_phone_label.setStyleSheet("font-size: 13px;")
+        teleop_layout.addWidget(self._teleop_phone_label)
+        self._teleop_align_label = QLabel("对齐: 未完成")
+        self._teleop_align_label.setStyleSheet("font-size: 13px;")
+        teleop_layout.addWidget(self._teleop_align_label)
+        self._teleop_collecting_label = QLabel("采集: 未开始")
+        self._teleop_collecting_label.setStyleSheet("font-size: 13px;")
+        teleop_layout.addWidget(self._teleop_collecting_label)
+        self._teleop_group.setVisible(False)
+        layout.addWidget(self._teleop_group)
+
         # 添加弹性空间
         layout.addStretch()
 
@@ -201,3 +222,26 @@ class StatusPanel(QWidget):
     def reset_timer(self):
         """重置计时显示"""
         self._timer_label.setText("00:00")
+
+    def set_teleop_visible(self, visible: bool):
+        """设置遥操作状态组可见性"""
+        self._teleop_group.setVisible(visible)
+
+    def update_teleop_status(self, phone_connected: bool, aligned: bool, collecting: bool, ip_info: str = ""):
+        """更新遥操作状态"""
+        if ip_info:
+            self._teleop_ip_label.setText(f"IP: {ip_info}")
+        phone_text = "手机: 已连接" if phone_connected else "手机: 未连接"
+        phone_color = "#4CAF50" if phone_connected else "#666"
+        self._teleop_phone_label.setText(phone_text)
+        self._teleop_phone_label.setStyleSheet(f"font-size: 13px; color: {phone_color};")
+
+        align_text = "对齐: 已完成" if aligned else "对齐: 未完成"
+        align_color = "#4CAF50" if aligned else "#666"
+        self._teleop_align_label.setText(align_text)
+        self._teleop_align_label.setStyleSheet(f"font-size: 13px; color: {align_color};")
+
+        collect_text = "采集: 进行中" if collecting else "采集: 未开始"
+        collect_color = "#FF9800" if collecting else "#666"
+        self._teleop_collecting_label.setText(collect_text)
+        self._teleop_collecting_label.setStyleSheet(f"font-size: 13px; color: {collect_color};")

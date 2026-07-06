@@ -2,29 +2,31 @@ class AppConstants {
   AppConstants._();
 
   // 默认连接配置
-  static const String defaultIp = '192.168.1.100';
+  // defaultIp 留空，强制用户填写 PC 局域网 IP（避免硬编码错误 IP 误导）
+  static const String defaultIp = '';
   static const int defaultPort = 8765;
 
   // WebSocket配置
-  static const int heartbeatInterval = 5;   // 心跳间隔（秒）
-  static const int heartbeatTimeout = 15;    // 心跳超时（秒）
+  static const int heartbeatInterval = 3; // 心跳间隔（秒）
+  static const int heartbeatTimeout = 15; // 心跳超时（秒）
 
   // ARCore配置
-  static const int arcoreUpdateFrequency = 60;  // ARCore更新频率(Hz)
+  static const int arcoreUpdateFrequency = 60; // ARCore更新频率(Hz)
 
   // 夹爪控制范围
-  static const double gripperMin = 0.0;     // 完全闭合
-  static const double gripperMax = 1.0;     // 完全张开
-  static const double gripperDefault = 0.5; // 默认中间位置
+  static const double gripperMin = 0.0; // 完全打开
+  static const double gripperMax = 1.0; // 完全闭合
+  static const double gripperDefault = 0.0; // 默认完全打开
+  static const double gripperStep = 0.05; // 每次增量步长
 
   // 校准方向列表
   static const List<String> calibrationDirections = [
-    'Y+',   // 手机向上
-    'Y-',   // 手机向下
-    'X-',   // 手机向左
-    'X+',   // 手机向右
-    'Z+',   // 手机向前
-    'Z-',   // 手机向后
+    'Y+', // 手机向上
+    'Y-', // 手机向下
+    'X-', // 手机向左
+    'X+', // 手机向右
+    'Z+', // 手机向前
+    'Z-', // 手机向后
   ];
 
   // 校准方向显示名称

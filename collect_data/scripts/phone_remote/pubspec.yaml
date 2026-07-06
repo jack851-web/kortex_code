@@ -10,9 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # ARCore（Google官方ARCore SDK for Flutter）
-  # 支持6DoF位姿追踪、平面检测、深度感知、环境光估计
-  augen: ^1.4.0
+  # ARCore（通过原生Android SDK集成，不再使用augen插件）
+  # augen已被移除，ARCore由MainActivity.kt直接管理
 
   # WebSocket通信
   web_socket_channel: ^3.0.0

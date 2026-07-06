@@ -8,6 +8,7 @@ class AppTheme {
   static const Color primaryGreen = Color(0xFF4CAF50);       // 张开按钮 / 开始任务边框
   static const Color primaryBlack = Color(0xFF212121);        // 闭合按钮 / 主要填充按钮
   static const Color primaryRed = Color(0xFFF44336);          // 急停按钮
+  static const Color primaryBlue = Color(0xFF2196F3);         // 标定按钮
   static const Color accentYellowOrange = Color(0xFFFFB300);  // 开始/结束 Ep 边框
   static const Color accentPurple = Color(0xFF9C27B0);        // 结束任务边框
 

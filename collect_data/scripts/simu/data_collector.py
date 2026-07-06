@@ -4,7 +4,7 @@
 核心设计：
 - 使用 LeRobotDataset.create() + streaming_encoding 直接写入 LeRobot v3.0 格式
 - 每帧调用 add_frame()，视频实时流式编码为 MP4（libsvtav1/h264）
-- observation.state: [6关节角(归一化[-1,1]), 1夹爪(0~1), 3末端位姿(归一化[-1,1])] = 10维 float32
+- observation.state: [6关节角(归一化[0,1]), 1夹爪(0~1), 3末端位姿(归一化[0,1])] = 10维 float32
 - action: [6关节归一化增量, 1夹爪增量, 3末端位姿增量] = 10维 float32（= 下一帧state - 当前帧state）
 - end_episode 时调用 save_episode()，停止时调用 finalize()
 - 保持外部接口与旧版完全兼容
@@ -12,10 +12,17 @@
 import json
 import time
 import gc
+import os
+import shutil
+import logging
+import traceback
 import numpy as np
 import threading
 from typing import Dict, List, Any
 from pathlib import Path
+from scripts.core.data_utils import parse_task_description, save_progress, load_progress
+
+logger = logging.getLogger(__name__)
 
 # 关节归一化参数（与 Gen3 Lite 一致）
 _JOINT_LIMITS_DEG = {
@@ -60,7 +67,7 @@ def _build_features(camera_names: List[str], image_height: int = 480, image_widt
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (10,),  # 6关节角(归一化[-1,1]) + 1夹爪[0,1] + 3末端位姿(归一化[-1,1])
+            "shape": (10,),  # 6关节角(归一化[0,1]) + 1夹爪[0,1] + 3末端位姿(归一化[0,1])
             "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper", "ee_x", "ee_y", "ee_z"],
         },
         "action": {
@@ -145,7 +152,8 @@ class SimuDataCollector:
         # 任务描述（VLA 训练需要）
         self._task_description = ""
 
-        self._save_progress()
+        # 恢复已有进度（不主动创建文件）
+        self._episode_count = load_progress(self._data_root)
 
     def set_simu_interface(self, simu_interface):
         """更新仿真接口引用（任务切换后 SimuInterface 被重建时调用）"""
@@ -153,7 +161,6 @@ class SimuDataCollector:
 
     def _init_lerobot_dataset(self):
         """创建或恢复 LeRobot 数据集"""
-        import os
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         # 禁用 HuggingFace Hub 连接（本地模式）
@@ -178,8 +185,7 @@ class SimuDataCollector:
         if not dataset_exists:
             # 数据集不存在或无效，清理目录后创建新数据集
             if self._data_root.exists():
-                import shutil
-                print(f"[SimuDataCollector] Cleaning incomplete dataset at {self._data_root}")
+                logger.info(f"[SimuDataCollector] Cleaning incomplete dataset at {self._data_root}")
                 shutil.rmtree(self._data_root)
 
             try:
@@ -195,13 +201,13 @@ class SimuDataCollector:
                     metadata_buffer_size=10,
                     encoder_queue_maxsize=30,
                 )
-                print(f"[SimuDataCollector] New LeRobot dataset created at {self._data_root}")
+                logger.info(f"[SimuDataCollector] New LeRobot dataset created at {self._data_root}")
             except Exception as e:
-                print(f"[SimuDataCollector] Failed to create dataset: {e}")
+                logger.info(f"[SimuDataCollector] Failed to create dataset: {e}")
                 raise
         else:
             # 数据集已存在且有效，加载现有数据集继续追加
-            print(f"[SimuDataCollector] Loading existing LeRobot dataset from {self._data_root}")
+            logger.info(f"[SimuDataCollector] Loading existing LeRobot dataset from {self._data_root}")
             try:
                 self._dataset = LeRobotDataset(
                     repo_id=self._repo_id,
@@ -223,11 +229,10 @@ class SimuDataCollector:
                         preset=None,
                         queue_maxsize=30,
                     )
-                    print(f"[SimuDataCollector] Re-initialized streaming encoder for existing dataset")
+                    logger.info(f"[SimuDataCollector] Re-initialized streaming encoder for existing dataset")
             except Exception as e:
-                print(f"[SimuDataCollector] Failed to load existing dataset: {e}")
+                logger.info(f"[SimuDataCollector] Failed to load existing dataset: {e}")
                 # 如果加载失败，删除并重新创建
-                import shutil
                 shutil.rmtree(self._data_root)
                 self._dataset = LeRobotDataset.create(
                     repo_id=self._repo_id,
@@ -241,7 +246,7 @@ class SimuDataCollector:
                     metadata_buffer_size=10,
                     encoder_queue_maxsize=30,
                 )
-                print(f"[SimuDataCollector] Recreated LeRobot dataset at {self._data_root}")
+                logger.info(f"[SimuDataCollector] Recreated LeRobot dataset at {self._data_root}")
 
     def start_collection(self):
         """开始收集"""
@@ -253,9 +258,9 @@ class SimuDataCollector:
             self._stop_event.clear()
             self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
             self._collect_thread.start()
-            print(f"[SimuDataCollector] Started (thread mode, target FPS: {self._fps})")
+            logger.info(f"[SimuDataCollector] Started (thread mode, target FPS: {self._fps})")
         else:
-            print("[SimuDataCollector] Started (callback mode)")
+            logger.info("[SimuDataCollector] Started (callback mode)")
 
     def stop_collection(self):
         """停止收集，关闭数据集"""
@@ -276,21 +281,19 @@ class SimuDataCollector:
             if self._dataset.episode_buffer.get("size", 0) > 0:
                 try:
                     self._dataset.save_episode()
-                    print("[SimuDataCollector] Saved remaining episode buffer on stop")
+                    logger.info("[SimuDataCollector] Saved remaining episode buffer on stop")
                 except Exception as e:
-                    print(f"[SimuDataCollector] Warning: failed to save remaining buffer: {e}")
+                    logger.warning(f"[SimuDataCollector] failed to save remaining buffer: {e}")
             # 结束数据集
             try:
                 self._dataset.finalize()
             except Exception as e:
-                print(f"[SimuDataCollector] Warning: finalize error: {e}")
+                logger.warning(f"[SimuDataCollector] finalize error: {e}")
             self._dataset = None
 
-        print("[SimuDataCollector] Stopped")
+        logger.info("[SimuDataCollector] Stopped")
 
     def _collect_loop(self):
-        if hasattr(self._simu, '_collector_thread_id'):
-            self._simu._collector_thread_id = threading.current_thread()
         while not self._stop_event.is_set():
             loop_start = time.time()
             self.collect_frame()
@@ -332,27 +335,48 @@ class SimuDataCollector:
             return
 
         try:
+            # 记录采集线程 ID，让 simu.get_camera_images 知道这是采集线程，不返回黑帧
+            if self._simu is not None:
+                self._simu._collector_thread_id = threading.current_thread().ident
+
             timestamp = time.time()
             if self._min_frame_interval > 0 and (timestamp - self._last_collect_ts) < self._min_frame_interval:
                 return
             self._last_collect_ts = timestamp
 
             # 获取数据
-            if self._broker is not None and self._latest_broker_images is not None:
+            # 优先直接从 simu 获取图像，避免 broker 发布黑帧/旧帧导致录制无画面。
+            # broker 路径仅在 simu 不可用时作为降级。
+            if self._simu is not None:
+                # 直接从 simu 获取真实图像（无论是否进程渲染器模式）
+                images = self._simu.get_camera_images(self._camera_names)
+                joints_deg_direct = self._simu.get_joint_state()
+                gripper = self._simu.get_gripper_state()
+                tcp_pos = self._simu.get_tcp_position()
+                joints_rad = None  # 直接模式：joints 已是度数
+            elif self._broker is not None and self._latest_broker_images is not None:
                 images = self._latest_broker_images
+                # broker 发布的是弧度（见 topic_defs.py 与 publisher.py）
                 joints_rad = self._latest_broker_joints
                 gripper = self._latest_broker_gripper if self._latest_broker_gripper is not None else 0.0
                 tcp_pos = self._latest_broker_tcp  # [x, y, z] 或 None
             else:
-                images = self._simu.get_camera_images(self._camera_names)
-                joints_rad = self._simu.get_joint_state()
-                gripper = self._simu.get_gripper_state()
-                tcp_pos = self._simu.get_tcp_position()  # 获取末端位置 [x, y, z]
+                # 兜底：无 simu 也无 broker，使用黑帧
+                images = {}
+                joints_rad = None
+                joints_deg_direct = None
+                gripper = 0.0
+                tcp_pos = None
 
             with self._data_lock:
                 # 构建 state 向量: [6关节角(归一化), 1夹爪, 3末端位姿(归一化)] = 10维
-                # 仿真输出的是弧度，先转度数再归一化
-                joints_deg = np.rad2deg(joints_rad) if joints_rad is not None else np.zeros(6)
+                # 统一为度数后归一化
+                if joints_rad is not None:
+                    # broker 模式：joints 是弧度，转度数
+                    joints_deg = np.rad2deg(joints_rad)
+                else:
+                    # 进程渲染器模式或直接模式：joints 已是度数
+                    joints_deg = joints_deg_direct if joints_deg_direct is not None else np.zeros(6)
                 normalized_joints = _normalize_joints(joints_deg)
 
                 # 末端位姿归一化
@@ -399,9 +423,8 @@ class SimuDataCollector:
                 self._frame_count += 1
 
         except Exception as e:
-            print(f"[SimuDataCollector] Error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[SimuDataCollector] Error: {e}")
+            logger.debug(traceback.format_exc())
 
     @property
     def episode_count(self) -> int:
@@ -422,7 +445,7 @@ class SimuDataCollector:
         self._camera_names = camera_names
 
         # 解析任务描述
-        self._task_description = self._parse_task_description(task_info)
+        self._task_description = parse_task_description(task_info)
 
         with self._data_lock:
             self._frame_count = 0
@@ -442,7 +465,7 @@ class SimuDataCollector:
             # 创建新的 episode buffer
             self._dataset.episode_buffer = self._dataset.create_episode_buffer()
 
-        print(f"[SimuDataCollector] Episode {episode_id} started (LeRobot mode, task: {self._task_description})")
+        logger.info(f"[SimuDataCollector] Episode {episode_id} started (LeRobot mode, task: {self._task_description})")
 
     def start_recording(self):
         """开始记录数据（任务执行期间）"""
@@ -453,229 +476,18 @@ class SimuDataCollector:
 
         if hasattr(self._simu, 'set_collecting_active'):
             self._simu.set_collecting_active(True)
-            self._simu._collector_thread_id = threading.current_thread()
 
-        print(f"[SimuDataCollector] Recording started, save point: frame={self._task_save_point}")
+        logger.info(f"[SimuDataCollector] Recording started, save point: frame={self._task_save_point}")
 
     def stop_recording(self):
         """停止记录数据"""
         self._is_recording = False
         if hasattr(self._simu, 'set_collecting_active'):
             self._simu.set_collecting_active(False)
-            self._simu._collector_thread_id = None
         with self._data_lock:
             self._last_task_end_point = self._frame_count
-        print("[SimuDataCollector] Recording stopped")
+        logger.info("[SimuDataCollector] Recording stopped")
 
-    def delete_last_episode(self) -> bool:
-        """删除最后一个已保存的 episode（用于重做任务时清理旧数据）
-
-        注意：此方法会重新编码视频文件，确保数据一致性。
-
-        Returns:
-            bool: 是否成功删除
-        """
-        import pandas as pd
-        import av
-        import shutil
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-        with self._data_lock:
-            if self._dataset is None:
-                print("[SimuDataCollector] No dataset to delete from")
-                return False
-
-            # 获取当前 episode 数量
-            total_episodes = self._dataset.meta.total_episodes
-            if total_episodes == 0:
-                print("[SimuDataCollector] No episodes to delete")
-                return False
-
-            last_episode_idx = total_episodes - 1
-            print(f"[SimuDataCollector] Deleting episode {last_episode_idx} (with video re-encoding)...")
-
-            try:
-                # 1. 从 parquet 数据中删除该 episode 的行
-                data_dir = self._data_root / "data" / "chunk-000"
-                if data_dir.exists():
-                    for parquet_file in data_dir.glob("*.parquet"):
-                        try:
-                            df = pd.read_parquet(parquet_file)
-                        except Exception as e:
-                            print(f"[SimuDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
-                            # 如果文件损坏，尝试删除它
-                            try:
-                                parquet_file.unlink()
-                                print(f"[SimuDataCollector] Deleted corrupted file: {parquet_file.name}")
-                            except Exception:
-                                pass
-                            continue
-                        if "episode_index" in df.columns:
-                            original_len = len(df)
-                            df = df[df["episode_index"] != last_episode_idx]
-                            if len(df) < original_len:
-                                df.to_parquet(parquet_file, index=False)
-                                print(f"[SimuDataCollector] Removed episode {last_episode_idx} from {parquet_file.name}")
-
-                # 2. 重新编码视频（移除被删除episode的帧）
-                self._reencode_videos_without_episode(last_episode_idx)
-
-                # 3. 更新 meta/info.json
-                info_path = self._data_root / "meta" / "info.json"
-                if info_path.exists():
-                    with open(info_path, "r") as f:
-                        info = json.load(f)
-                    info["total_episodes"] = total_episodes - 1
-                    # 重新计算 total_frames
-                    total_frames = 0
-                    if data_dir.exists():
-                        for pf in data_dir.glob("*.parquet"):
-                            try:
-                                pdf = pd.read_parquet(pf)
-                                total_frames += len(pdf)
-                            except Exception:
-                                pass  # 跳过损坏的文件
-                    info["total_frames"] = total_frames
-                    with open(info_path, "w") as f:
-                        json.dump(info, f, indent=2)
-                    print(f"[SimuDataCollector] Updated info.json: total_episodes = {total_episodes - 1}")
-
-                # 4. 更新 meta/tasks.parquet
-                tasks_path = self._data_root / "meta" / "tasks.parquet"
-                if tasks_path.exists():
-                    try:
-                        tasks_df = pd.read_parquet(tasks_path)
-                        if "episode" in tasks_df.columns:
-                            tasks_df = tasks_df[tasks_df["episode"] != last_episode_idx]
-                            tasks_df.to_parquet(tasks_path, index=False)
-                            print(f"[SimuDataCollector] Removed episode {last_episode_idx} from tasks.parquet")
-                    except Exception as e:
-                        print(f"[SimuDataCollector] Warning: Failed to update tasks.parquet: {e}")
-
-                # 5. 更新 meta/episodes parquet
-                self._update_episodes_parquet_after_delete(last_episode_idx)
-
-                # 6. 更新 dataset 元数据
-                self._dataset.meta.total_episodes = total_episodes - 1
-
-                print(f"[SimuDataCollector] Episode {last_episode_idx} deleted successfully")
-                return True
-
-            except Exception as e:
-                print(f"[SimuDataCollector] Failed to delete episode: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
-
-    def _reencode_videos_without_episode(self, episode_to_delete: int):
-        """重新编码视频，移除指定episode的帧"""
-        import av
-        import shutil
-        import pandas as pd
-
-        # 获取所有视频目录
-        videos_dir = self._data_root / "videos"
-        if not videos_dir.exists():
-            return
-
-        # 读取parquet获取每个episode的帧范围
-        data_dir = self._data_root / "data" / "chunk-000"
-        if not data_dir.exists():
-            return
-
-        # 收集所有episode的帧范围
-        episode_frames = {}  # episode_index -> list of frame indices
-        for parquet_file in sorted(data_dir.glob("*.parquet")):
-            try:
-                df = pd.read_parquet(parquet_file)
-            except Exception:
-                continue  # 跳过损坏的文件
-            if "episode_index" in df.columns and "frame_index" in df.columns:
-                for ep_idx in df["episode_index"].unique():
-                    if ep_idx not in episode_frames:
-                        episode_frames[ep_idx] = []
-                    ep_df = df[df["episode_index"] == ep_idx]
-                    episode_frames[ep_idx].extend(ep_df["frame_index"].tolist())
-
-        if not episode_frames:
-            return
-
-        # 确定要保留的帧索引（全局）
-        frames_to_keep = set()
-        for ep_idx, frames in episode_frames.items():
-            if ep_idx != episode_to_delete:
-                frames_to_keep.update(frames)
-
-        # 对每个视频key进行处理
-        for video_key_dir in videos_dir.iterdir():
-            if not video_key_dir.is_dir():
-                continue
-            video_key = video_key_dir.name
-
-            # 处理每个视频文件
-            for chunk_dir in video_key_dir.glob("chunk-*"):
-                for video_file in sorted(chunk_dir.glob("*.mp4")):
-                    print(f"[SimuDataCollector] Re-encoding {video_file}...")
-
-                    # 创建临时文件
-                    temp_video = video_file.with_suffix(".temp.mp4")
-
-                    try:
-                        # 使用PyAV解码和重新编码
-                        with av.open(str(video_file)) as input_container:
-                            input_stream = input_container.streams.video[0]
-
-                            # 创建输出容器
-                            with av.open(str(temp_video), 'w') as output_container:
-                                output_stream = output_container.add_stream('libx264', rate=30)
-                                output_stream.width = input_stream.width
-                                output_stream.height = input_stream.height
-                                output_stream.pix_fmt = 'yuv420p'
-                                output_stream.options = {'crf': '23'}
-
-                                frame_idx = 0
-                                for packet in input_container.demux(input_stream):
-                                    for frame in packet.decode():
-                                        if frame_idx in frames_to_keep:
-                                            # 重新编码这帧
-                                            frame.pict_type = None  # 重置帧类型让编码器决定
-                                            output_container.mux(output_stream.encode(frame))
-                                        frame_idx += 1
-
-                                # 刷新编码器
-                                for packet in output_stream.encode():
-                                    output_container.mux(packet)
-
-                        # 替换原文件
-                        temp_video.replace(video_file)
-                        print(f"[SimuDataCollector] Re-encoded {video_file.name} ({frame_idx} frames, kept {len(frames_to_keep)})")
-
-                    except Exception as e:
-                        print(f"[SimuDataCollector] Failed to re-encode {video_file}: {e}")
-                        if temp_video.exists():
-                            temp_video.unlink()
-
-    def _update_episodes_parquet_after_delete(self, deleted_episode_idx: int):
-        """删除episode后更新meta/episodes parquet文件"""
-        import pandas as pd
-
-        episodes_dir = self._data_root / "meta" / "episodes"
-        if not episodes_dir.exists():
-            return
-
-        for chunk_dir in episodes_dir.glob("chunk-*"):
-            for parquet_file in sorted(chunk_dir.glob("*.parquet")):
-                try:
-                    df = pd.read_parquet(parquet_file)
-                except Exception as e:
-                    print(f"[SimuDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
-                    continue
-                if "episode_index" in df.columns:
-                    original_len = len(df)
-                    df = df[df["episode_index"] != deleted_episode_idx]
-                    if len(df) < original_len:
-                        df.to_parquet(parquet_file, index=False)
-                        print(f"[SimuDataCollector] Updated {parquet_file.name}")
 
     def discard_current_task(self):
         """丢弃当前任务的数据（用于重做任务）
@@ -694,7 +506,7 @@ class SimuDataCollector:
                 ep_idx = self._dataset.meta.total_episodes
                 self._dataset.episode_buffer = self._dataset.create_episode_buffer(ep_idx)
 
-            print(f"[SimuDataCollector] Current task data discarded, reverted to frame={save_point}")
+            logger.info(f"[SimuDataCollector] Current task data discarded, reverted to frame={save_point}")
 
     def end_episode(self, episode_id: int, success: bool = True):
         """结束 episode，保存到 LeRobot 数据集"""
@@ -711,16 +523,15 @@ class SimuDataCollector:
                 try:
                     self._dataset.save_episode()
                     self._patch_info_json()  # 补全 total_videos 等字段
-                    print(f"[SimuDataCollector] Episode {episode_id} saved to LeRobot ({num_frames} frames)")
+                    logger.info(f"[SimuDataCollector] Episode {episode_id} saved to LeRobot ({num_frames} frames)")
                 except Exception as e:
-                    print(f"[SimuDataCollector] Save error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    logger.error(f"[SimuDataCollector] Save error: {e}")
+                    logger.debug(traceback.format_exc())
             elif num_frames == 0:
-                print(f"[SimuDataCollector] Episode {episode_id}: No frames collected, skipping save")
+                logger.info(f"[SimuDataCollector] Episode {episode_id}: No frames collected, skipping save")
 
             elapsed = time.time() - t0
-            print(f"[SimuDataCollector] Episode {episode_id} completed in {elapsed:.1f}s")
+            logger.info(f"[SimuDataCollector] Episode {episode_id} completed in {elapsed:.1f}s")
 
             # 重置状态
             self._frame_count = 0
@@ -768,13 +579,13 @@ class SimuDataCollector:
             if patched:
                 with open(info_path, "w") as f:
                     json.dump(info, f, indent=2)
-                print(f"[SimuDataCollector] Patched info.json")
+                logger.info(f"[SimuDataCollector] Patched info.json")
 
             # 生成 episodes parquet（rerun 需要）
             self._write_episodes_parquet()
 
         except Exception as e:
-            print(f"[SimuDataCollector] Warning: failed to patch metadata: {e}")
+            logger.warning(f"[SimuDataCollector] failed to patch metadata: {e}")
 
     def _write_episodes_parquet(self):
         """生成 meta/episodes/chunk-000/file-000.parquet（v3 格式，rerun 可视化需要）"""
@@ -819,9 +630,9 @@ class SimuDataCollector:
             if legacy_jsonl.exists():
                 legacy_jsonl.unlink()
 
-            print(f"[SimuDataCollector] Generated {episodes_path} ({total_episodes} episodes)")
+            logger.info(f"[SimuDataCollector] Generated {episodes_path} ({total_episodes} episodes)")
         except Exception as e:
-            print(f"[SimuDataCollector] Warning: failed to generate episodes parquet: {e}")
+            logger.warning(f"[SimuDataCollector] failed to generate episodes parquet: {e}")
 
     def _estimate_episode_length(self, episode_index, total_episodes):
         """估算单个 episode 的帧数"""
@@ -835,7 +646,7 @@ class SimuDataCollector:
                 if state_key in stats:
                     return stats[state_key].get("count", 0) // total_episodes
             except Exception:
-                pass
+                logger.debug("Failed to read stats for frames_per_episode", exc_info=True)
         return 0
 
     def finalize(self):
@@ -843,42 +654,17 @@ class SimuDataCollector:
         if self._dataset is not None:
             try:
                 self._dataset.finalize()
-                print("[SimuDataCollector] Dataset finalized")
+                logger.info("[SimuDataCollector] Dataset finalized")
             except Exception as e:
-                print(f"[SimuDataCollector] Finalize error: {e}")
+                logger.info(f"[SimuDataCollector] Finalize error: {e}")
             # 补全 rerun 需要的字段
             self._patch_info_json()
             self._dataset = None
 
-    def _parse_task_description(self, task_info: Dict[str, Any]) -> str:
-        """从 task_info 解析出任务描述字符串"""
-        # 新格式: {"tasks": [...]}
-        if "tasks" in task_info:
-            tasks = task_info["tasks"]
-            if isinstance(tasks, list) and len(tasks) > 0:
-                # 取最后一个任务的描述（通常是当前正在执行的任务）
-                last_task = tasks[-1]
-                desc = last_task.get("task_name", "") or last_task.get("description", "")
-                if desc:
-                    return desc
-
-        # 旧格式
-        desc = task_info.get("task_name", "") or task_info.get("description", "")
-        return desc if desc else "Grasp the object"
-
     def save_progress(self):
         """保存收集进度（公共接口）"""
-        self._save_progress()
-
-    def _save_progress(self):
-        self._data_root.mkdir(parents=True, exist_ok=True)
-        progress_file = self._data_root / "progress.json"
-        with open(progress_file, "w") as f:
-            json.dump({"episode_count": self._episode_count}, f, indent=2)
+        save_progress(self._data_root, self._episode_count)
 
     def load_progress(self) -> int:
-        progress_file = self._data_root / "progress.json"
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                self._episode_count = json.load(f).get("episode_count", 0)
+        self._episode_count = load_progress(self._data_root)
         return self._episode_count

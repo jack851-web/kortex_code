@@ -2,12 +2,15 @@
 相机显示组件
 """
 import cv2
+import logging
 import numpy as np
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget, QGridLayout
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt
 
 from .styles import COLORS
+
+logger = logging.getLogger(__name__)
 
 
 class CameraWidget(QWidget):
@@ -81,7 +84,7 @@ class CameraWidget(QWidget):
             self._image_label.setPixmap(pixmap)
             
         except Exception as e:
-            print(f"[CameraWidget] Error updating image: {e}")
+            logger.debug(f"Error updating image: {e}")
 
 
 class CameraPanel(QWidget):

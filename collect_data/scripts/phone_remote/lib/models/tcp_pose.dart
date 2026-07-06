@@ -20,13 +20,16 @@ class TcpPose {
 
   // 从服务器消息创建
   factory TcpPose.fromJson(Map<String, dynamic> json) {
+    // 注意：JSON 中整数（如 0）会被 Dart 解析为 int，直接调用 .toDouble() 会抛异常，
+    // 必须先转 num 再 toDouble()
+    double parseNum(dynamic v) => (v as num? ?? 0.0).toDouble();
     return TcpPose(
-      x: (json['x'] ?? 0.0).toDouble(),
-      y: (json['y'] ?? 0.0).toDouble(),
-      z: (json['z'] ?? 0.0).toDouble(),
-      rx: (json['rx'] ?? 0.0).toDouble(),
-      ry: (json['ry'] ?? 0.0).toDouble(),
-      rz: (json['rz'] ?? 0.0).toDouble(),
+      x: parseNum(json['x']),
+      y: parseNum(json['y']),
+      z: parseNum(json['z']),
+      rx: parseNum(json['rx']),
+      ry: parseNum(json['ry']),
+      rz: parseNum(json['rz']),
     );
   }
 

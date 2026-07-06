@@ -1,15 +1,16 @@
 import argparse
 import sys
 import time
+import logging
 import yaml
 import numpy as np
 from pathlib import Path
 
 from scripts import (
     RealInterface,
-    MockRealInterface,
+    RealStubInterface,
     SimuInterface,
-    MockSimuInterface,
+    SimuStubInterface,
     SyncController,
     GraspExecutor,
     resolve_path,
@@ -17,6 +18,8 @@ from scripts import (
 )
 from scripts.real.data_collector import RealDataCollector
 from scripts.simu.data_collector import SimuDataCollector
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录 (kortex_code)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -62,7 +65,7 @@ class DataCollectionSystem:
                 })
             return True
         except Exception as e:
-            print(f"Failed to load config: {e}")
+            logger.error(f"Failed to load config: {e}")
             return False
 
     def initialize(self) -> bool:
@@ -85,7 +88,7 @@ class DataCollectionSystem:
                 self._sim_initial_joints_deg = np.rad2deg(arr)
             else:
                 self._sim_initial_joints_deg = arr
-            print(f"[Config] simulation.initial_joints loaded ({sim_init_unit}): {sim_init_joints[:6]}")
+            logger.info(f"simulation.initial_joints loaded ({sim_init_unit}): {sim_init_joints[:6]}")
 
         # 仿真初始夹爪 (0=张开, 1=闭合)
         self._sim_initial_gripper = float(simu_config.get("initial_gripper", 0.0))
@@ -102,8 +105,8 @@ class DataCollectionSystem:
         self._real_camera_names = list(real_camera_config.keys()) if real_camera_config else []
 
         if self._use_mock:
-            print("Using simulation-only mode (IK enabled)")
-            self._real = MockRealInterface(camera_names=list(real_camera_config.keys()))
+            logger.info("Using simulation-only mode (IK enabled)")
+            self._real = RealStubInterface(camera_names=list(real_camera_config.keys()))
             self._real.connect("mock")
             self._simu = SimuInterface(
                 simu_config.get("xml_path", ""),
@@ -111,7 +114,7 @@ class DataCollectionSystem:
                 use_ik=True,
             )
         else:
-            print("Using real interfaces (pure real mode - no simulation)")
+            logger.info("Using real interfaces (pure real mode - no simulation)")
             real_cam_cfg = {}
             for cam_name, cam_cfg in real_camera_config.items():
                 real_cam_cfg[cam_name] = {
@@ -126,38 +129,38 @@ class DataCollectionSystem:
                 username=robot_config.get("username"),
                 password=robot_config.get("password"),
             ):
-                print("Failed to connect to real robot")
+                logger.error("Failed to connect to real robot")
                 return False
             self._real.connect_cameras()
             self._simu = None
 
         if self._simu is not None:
             if not self._simu.initialize(simu_config.get("xml_path", "")):
-                print("Failed to initialize simulation")
+                logger.error("Failed to initialize simulation")
                 return False
 
             self._apply_sim_initial_joints()
             self._simu.set_display_cameras(self._simu_camera_names)
 
             # 启动进程渲染器
-            print("\nStarting render process...")
+            logger.info("Starting render process...")
             self._simu.start_render_process()
 
-            print("\nStarting viewers...")
-            print("  - Starting simulation viewer (MuJoCo window)")
+            logger.info("Starting viewers...")
+            logger.info("  - Starting simulation viewer (MuJoCo window)")
             self._simu.start_viewer()
             
             simu_camera_names = self._simu_camera_names
             if simu_camera_names:
-                print(f"  - Starting simulation camera viewer: {simu_camera_names}")
+                logger.info(f"  - Starting simulation camera viewer: {simu_camera_names}")
                 self._simu.start_camera_viewer(simu_camera_names)
         
         real_camera_names = list(real_camera_config.keys()) if real_camera_config else []
         if (not self._use_mock) and real_camera_names:
-            print(f"  - Starting real camera viewer: {real_camera_names}")
+            logger.info(f"  - Starting real camera viewer: {real_camera_names}")
             self._real.start_camera_viewer()
         
-        print("All viewers started. Press 'q' in camera windows to close them.\n")
+        logger.info("All viewers started. Press 'q' in camera windows to close them.")
 
         # 从相机配置中获取视频帧率
         video_fps = 30
@@ -210,7 +213,7 @@ class DataCollectionSystem:
         progress_collector = self._real_data_collector if self._real_data_collector is not None else self._simu_data_collector
         saved_count = progress_collector.load_progress() if progress_collector is not None else 0
         if saved_count > 0:
-            print(f"Resumed from episode {saved_count}")
+            logger.info(f"Resumed from episode {saved_count}")
             self._current_task_index = saved_count
 
         return True
@@ -229,11 +232,11 @@ class DataCollectionSystem:
             if self._simu_data_collector is not None:
                 self._simu_data_collector.start_collection()
 
-            print(f"\n{'='*60}")
-            print("Data Collection System Started")
-            print(f"Total tasks: {len(self._tasks)}")
-            print(f"Starting from task: {self._current_task_index + 1}")
-            print(f"{'='*60}\n")
+            logger.info(f"{'='*60}")
+            logger.info("Data Collection System Started")
+            logger.info(f"Total tasks: {len(self._tasks)}")
+            logger.info(f"Starting from task: {self._current_task_index + 1}")
+            logger.info(f"{'='*60}")
 
             for i in range(self._current_task_index, len(self._tasks)):
                 if not self._running:
@@ -241,16 +244,16 @@ class DataCollectionSystem:
                 task = self._tasks[i]
                 self._execute_task(i + 1, task)
 
-            print(f"\n{'='*60}")
-            print("All tasks completed")
+            logger.info(f"{'='*60}")
+            logger.info("All tasks completed")
             episode_count = self._real_data_collector.episode_count if self._real_data_collector is not None else self._simu_data_collector.episode_count
-            print(f"Total episodes collected: {episode_count}")
-            print(f"{'='*60}\n")
+            logger.info(f"Total episodes collected: {episode_count}")
+            logger.info(f"{'='*60}")
 
             return True
 
         except KeyboardInterrupt:
-            print("\nInterrupted by user")
+            logger.info("Interrupted by user")
             return False
         finally:
             self._cleanup()
@@ -263,11 +266,11 @@ class DataCollectionSystem:
         object_pos = task.get("object_position", [0.3, 0.0, 0.05])
         plate_pos = task.get("plate_position", [0.4, 0.0, 0.05])
 
-        print(f"\n--- {task_name} ({task_id}/{len(self._tasks)}) ---")
-        print(f"Description: {description}")
-        print(f"Object: {object_name}, body: {object_body_name}")
-        print(f"Object Position: {object_pos}")
-        print(f"Plate Position: {plate_pos}")
+        logger.info(f"--- {task_name} ({task_id}/{len(self._tasks)}) ---")
+        logger.info(f"Description: {description}")
+        logger.info(f"Object: {object_name}, body: {object_body_name}")
+        logger.info(f"Object Position: {object_pos}")
+        logger.info(f"Plate Position: {plate_pos}")
 
         object_cfg = self._object_library.get(object_name, {}) if isinstance(self._object_library, dict) else {}
         object_model_xml = object_cfg.get("model_xml_path", "")
@@ -280,7 +283,7 @@ class DataCollectionSystem:
                 object_body_name=object_body_name,
                 show_viewer=False,
             ):
-                print(f"[ERROR] Failed to load object model: {object_name}")
+                logger.error(f"Failed to load object model: {object_name}")
                 return
             self._apply_sim_initial_joints()
 
@@ -319,7 +322,7 @@ class DataCollectionSystem:
             self._real_data_collector.start_episode(episode_id, self._real_camera_names, task_info)
         if self._simu_data_collector is not None:
             self._simu_data_collector.start_episode(episode_id, self._simu_camera_names, task_info)
-        print(f"Episode {episode_id} started")
+        logger.info(f"Episode {episode_id} started")
 
         success = self._grasp_executor.execute(
             progress_callback=self._on_waypoint_progress
@@ -329,11 +332,11 @@ class DataCollectionSystem:
             self._real_data_collector.end_episode(episode_id, success)
         if self._simu_data_collector is not None:
             self._simu_data_collector.end_episode(episode_id, success)
-        print(f"Episode {episode_id} completed - Success: {success}")
+        logger.info(f"Episode {episode_id} completed - Success: {success}")
 
         if task_id < len(self._tasks):
-            print("\n[INFO] Please change the object position for the next task.")
-            print("[INFO] Press Enter to continue...")
+            logger.info("Please change the object position for the next task.")
+            logger.info("Press Enter to continue...")
             try:
                 input()
             except EOFError:
@@ -344,13 +347,13 @@ class DataCollectionSystem:
             return
         ok = self._simu.set_joint_positions(self._sim_initial_joints_deg, gripper=self._sim_initial_gripper)
         if ok:
-            print(f"[Config] Applied simulation initial joints (deg): {self._sim_initial_joints_deg.tolist()}")
+            logger.info(f"Applied simulation initial joints (deg): {self._sim_initial_joints_deg.tolist()}")
 
     def _on_waypoint_progress(self, waypoint_name: str, current: int, total: int):
-        print(f"  Progress: [{current}/{total}] {waypoint_name}")
+        logger.info(f"  Progress: [{current}/{total}] {waypoint_name}")
 
     def _cleanup(self):
-        print("\nCleaning up...")
+        logger.info("Cleaning up...")
         if self._real_data_collector:
             self._real_data_collector.stop_collection()
         if self._simu_data_collector:
@@ -360,7 +363,7 @@ class DataCollectionSystem:
         if self._simu:
             self._simu.stop_render_process()
             self._simu.close()
-        print("Cleanup completed")
+        logger.info("Cleanup completed")
 
     def stop(self):
         self._running = False
@@ -383,7 +386,7 @@ def main():
 
     config_path = Path(__file__).parent / args.config
     if not config_path.exists():
-        print(f"Config file not found: {config_path}")
+        logger.error(f"Config file not found: {config_path}")
         sys.exit(1)
 
     system = DataCollectionSystem(str(config_path), use_mock=not args.real)

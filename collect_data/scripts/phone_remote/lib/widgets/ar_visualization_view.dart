@@ -1,19 +1,22 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
-import 'package:augen/augen.dart';
 import '../services/arcore_service.dart';
 
 /// AR可视化视图组件
 ///
-/// 功能：
-/// - 显示ARCore相机画面
-/// - 可视化检测到的平面（辅助定位）
-/// - 显示追踪状态指示
-/// - 集成ARCoreService进行6DoF追踪
+/// 使用自定义PlatformView（arcore-view）渲染ARCore相机画面，
+/// 并通过ARCoreService获取6DoF位姿数据。
+///
+/// 使用混合合成（Hybrid Composition）模式，确保GLSurfaceView正确渲染。
+/// 虚拟显示模式会导致ARCore的GL_TEXTURE_EXTERNAL_OES纹理黑屏。
 class ARVisualizationView extends StatefulWidget {
   final ARCoreService? arService;
-  final Function(AugenController controller)? onControllerReady;
-  final Function(ARPlane plane)? onPlaneDetected;
+  final Function()? onControllerReady;
+  final Function(Map<String, dynamic> plane)? onPlaneDetected;
   final bool enableTracking;
   final ARVisualizationConfig config;
   final double height;
@@ -34,7 +37,14 @@ class ARVisualizationView extends StatefulWidget {
 
 class _ARVisualizationViewState extends State<ARVisualizationView> {
   bool _isInitialized = false;
+  bool _arSupported = true;
   String _statusMessage = '初始化中...';
+  MethodChannel? _viewChannel;
+
+  @override
+  void initState() {
+    super.initState();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -44,16 +54,67 @@ class _ARVisualizationViewState extends State<ARVisualizationView> {
         borderRadius: BorderRadius.circular(12),
         child: Stack(
           children: [
-            // ARCore相机视图（使用AugenView）
-            Positioned.fill(
-              child: AugenView(
-                onViewCreated: _onAugenViewCreated,
-                config: ARSessionConfig(
-                  planeDetection: widget.config.showPlanes,
-                  lightEstimation: widget.config.enableLightEstimation,
+            // ARCore相机画面 - 使用混合合成模式
+            if (_arSupported)
+              Positioned.fill(
+                child: PlatformViewLink(
+                  viewType: 'arcore-view',
+                  surfaceFactory: (context, controller) {
+                    return AndroidViewSurface(
+                      controller: controller as AndroidViewController,
+                      gestureRecognizers: const <Factory<
+                          OneSequenceGestureRecognizer>>{},
+                      hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+                    );
+                  },
+                  onCreatePlatformView: (params) {
+                    final controller =
+                        PlatformViewsService.initExpensiveAndroidView(
+                      id: params.id,
+                      viewType: 'arcore-view',
+                      layoutDirection: TextDirection.ltr,
+                      creationParams: null,
+                      creationParamsCodec: const StandardMessageCodec(),
+                      onFocus: () {
+                        params.onFocusChanged(true);
+                      },
+                    );
+                    controller.addOnPlatformViewCreatedListener((id) {
+                      _onPlatformViewCreated(id);
+                      params.onPlatformViewCreated(id);
+                    });
+                    controller.create();
+                    return controller;
+                  },
+                ),
+              )
+            else
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black87,
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SvgPicture.asset(
+                          'assets/icons/alert_triangle.svg',
+                          width: 32,
+                          height: 32,
+                          colorFilter: const ColorFilter.mode(
+                            Colors.orangeAccent,
+                            BlendMode.srcIn,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          '此设备不支持ARCore',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
-            ),
 
             // 状态覆盖层
             Positioned(
@@ -116,6 +177,7 @@ class _ARVisualizationViewState extends State<ARVisualizationView> {
   }
 
   String _getStatusText() {
+    if (!_arSupported) return 'ARCore不可用';
     if (!_isInitialized) return _statusMessage;
     if (!(widget.arService?.isTracking ?? false)) return 'AR已就绪 - 等待追踪';
     return '正在追踪';
@@ -163,61 +225,71 @@ class _ARVisualizationViewState extends State<ARVisualizationView> {
     );
   }
 
-  void _onAugenViewCreated(AugenController controller) async {
-    _isInitialized = true;
+  void _onPlatformViewCreated(int viewId) {
+    _viewChannel = MethodChannel('arcore_view_$viewId');
 
-    // 初始化AR服务
-    try {
-      await controller.initialize(ARSessionConfig(
-        planeDetection: widget.config.showPlanes,
-        lightEstimation: widget.config.enableLightEstimation,
-      ));
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _statusMessage = 'AR初始化失败: $e';
-        });
+    // 监听平面检测事件
+    _viewChannel!.setMethodCallHandler((call) async {
+      if (call.method == 'onPlanesUpdated') {
+        final planes = call.arguments as List;
+        if (planes.isNotEmpty) {
+          widget.onPlaneDetected?.call(Map<String, dynamic>.from(planes.first));
+          if (mounted) {
+            setState(() {
+              _statusMessage = '检测到平面';
+            });
+          }
+        }
       }
-      return;
-    }
+    });
 
-    // 初始化ARCore服务
-    if (widget.arService != null) {
-      widget.arService!.initController(controller);
+    // 初始化AR Session
+    _initializeAR();
+  }
 
-      // 设置平面检测回调（单个ARPlane）
-      widget.arService!.onPlaneDetected = (ARPlane plane) {
-        widget.onPlaneDetected?.call(plane);
+  Future<void> _initializeAR() async {
+    try {
+      final result = await _viewChannel?.invokeMethod<bool>('initialize');
+      if (result == true) {
         if (mounted) {
           setState(() {
-            _statusMessage = '检测到平面';
+            _isInitialized = true;
+            _arSupported = true;
+            _statusMessage = 'AR系统就绪';
           });
         }
-      };
-    }
 
-    // 通知外部控制器已就绪
-    widget.onControllerReady?.call(controller);
+        widget.onControllerReady?.call();
 
-    if (mounted) {
-      setState(() {
-        _statusMessage = 'AR系统就绪';
-      });
-    }
-
-    // 如果启用自动追踪
-    if (widget.enableTracking && widget.arService != null) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted) {
-          widget.arService!.startTracking();
+        // 自动开始追踪
+        if (widget.enableTracking && widget.arService != null) {
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted) {
+              widget.arService!.startTracking();
+            }
+          });
         }
-      });
+      } else {
+        if (mounted) {
+          setState(() {
+            _arSupported = false;
+            _statusMessage = 'AR初始化失败';
+          });
+        }
+      }
+    } on PlatformException catch (e) {
+      if (mounted) {
+        setState(() {
+          _arSupported = false;
+          _statusMessage = 'AR不可用: ${e.message}';
+        });
+      }
     }
   }
 
   @override
   void dispose() {
-    // 不在这里dispose controller，它由AugenView管理
+    _viewChannel?.setMethodCallHandler(null);
     super.dispose();
   }
 }

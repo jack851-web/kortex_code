@@ -9,9 +9,13 @@
 """
 import sys
 import time
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QApplication, QMessageBox,
@@ -223,6 +227,7 @@ class MainWindow(QMainWindow):
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._update_display_from_cache)
         self._update_timer.timeout.connect(self._update_task_timer)
+        self._update_timer.timeout.connect(self._update_teleop_status)
         if self._mock_mode:
             self._update_timer.timeout.connect(self._process_keyboard_teleop)
         self._update_timer.start(50)  # 20 FPS 刷新 GUI
@@ -382,7 +387,7 @@ class MainWindow(QMainWindow):
             else:
                 self._update_real_display()
         except Exception:
-            pass
+            logger.debug("Display update error", exc_info=True)
 
         if self._mock_mode:
             self._update_mock_state()
@@ -776,6 +781,20 @@ class MainWindow(QMainWindow):
         if current > 0:
             self._reset_task_timer()
             self._start_task_timer()
+
+    def _update_teleop_status(self):
+        """定时更新遥操作状态显示"""
+        if self._data_system and self._data_system.is_teleop_mode():
+            self._status_panel.set_teleop_visible(True)
+            phone_connected = self._data_system.is_phone_connected()
+            aligned = (self._data_system._teleop_controller is not None
+                       and self._data_system._teleop_controller.is_aligned)
+            collecting = (self._data_system._teleop_controller is not None
+                          and self._data_system._teleop_controller._collecting_active)
+            ip_info = f"{self._data_system.get_local_ip()}:{self._data_system.get_teleop_port()}"
+            self._status_panel.update_teleop_status(phone_connected, aligned, collecting, ip_info)
+        else:
+            self._status_panel.set_teleop_visible(False)
 
     def closeEvent(self, event):
         """关闭事件"""

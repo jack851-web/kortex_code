@@ -1,11 +1,15 @@
 import numpy as np
+import os
+import logging
+import sys
 from typing import Optional, Dict
-import yaml
 from pathlib import Path
 import cv2
 import threading
 import time
 from .camera import CameraManager
+
+logger = logging.getLogger(__name__)
 
 
 class RobotNotConnectedError(Exception):
@@ -28,28 +32,10 @@ class RealInterface:
         self._joint_limits = None
         self._joint_names = None
 
-    @classmethod
-    def from_config_file(cls, config_path: str) -> "RealInterface":
-        config_path = Path(config_path)
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        
-        camera_config = {}
-        for cam_name, cam_cfg in cfg.get("cameras", {}).items():
-            camera_config[cam_name] = {
-                "index": cam_cfg.get("index", 0),
-                "width": cam_cfg.get("width", 640),
-                "height": cam_cfg.get("height", 480),
-                "fps": cam_cfg.get("fps", 30)
-            }
-        
-        return cls(camera_config=camera_config)
-
     def _ensure_import(self):
         if self._Gen3Lite is not None:
             return True
         try:
-            import sys
             # 基于项目根目录动态解析 kortex_real 路径，而非硬编码绝对路径
             _project_root = Path(__file__).parent.parent.parent.parent  # collect_data -> kortex_code
             _kortex_real_path = str(_project_root / 'kortex_real')
@@ -69,14 +55,23 @@ class RealInterface:
     def connect(self, ip: str, username: str = None, password: str = None) -> bool:
         """仅连接机器人，不连接相机（相机单独调用 connect_cameras）
 
-        注意: username 和 password 应通过配置文件传入，不提供默认值以避免安全隐患。
+        注意: username 和 password 优先使用参数传入，其次从环境变量读取：
+          - KORTEX_USERNAME / KORTEX_PASSWORD
+        不提供默认值以避免安全隐患。
         """
+        if username is None:
+            username = os.environ.get('KORTEX_USERNAME')
+        if password is None:
+            password = os.environ.get('KORTEX_PASSWORD')
         if username is None or password is None:
-            raise ValueError("必须提供 username 和 password 参数，请从配置文件中读取")
+            raise ValueError(
+                "必须提供 username 和 password 参数，"
+                "可通过配置文件传入或设置环境变量 KORTEX_USERNAME / KORTEX_PASSWORD"
+            )
         try:
             self._ensure_import()
         except ImportError as e:
-            print(f"Failed to import robot module: {e}")
+            logger.error(f"Failed to import robot module: {e}")
             return False
         try:
             self._config = self._Gen3LiteConfig(
@@ -91,19 +86,19 @@ class RealInterface:
             self._connected = True
             return True
         except Exception as e:
-            print(f"Failed to connect to robot: {e}")
+            logger.error(f"Failed to connect to robot: {type(e).__name__}")
             return False
 
     def connect_cameras(self) -> bool:
         """连接相机（在机器人连接成功后调用）"""
         if not self._camera_config:
-            print("No camera config, skipping camera connection")
+            logger.info("No camera config, skipping camera connection")
             return True
 
-        print("Connecting cameras...")
+        logger.info("Connecting cameras...")
         self._camera_manager = CameraManager(self._camera_config)
         if not self._camera_manager.connect():
-            print("Warning: Some cameras failed to connect")
+            logger.warning("Some cameras failed to connect")
             return False
         return True
 
@@ -183,20 +178,19 @@ class RealInterface:
             self._joint_limits = {}
             self._joint_names = [f'J{i}' for i in range(6)]
 
-    @staticmethod
-    def _normalize_joint_angles(joints: np.ndarray) -> np.ndarray:
+    def _normalize_joint_angles(self, joints: np.ndarray) -> np.ndarray:
         """将 0-360 范围的角度归一化到各关节限位内（仅用于 set_joint_target）
 
         Kinova 控制 API 期望 -180~180 范围，编码器报 0-360。
         """
-        # 注意：静态方法无法使用实例缓存，此处仍需导入
-        # 但由于 Python 模块缓存机制，重复 import 开销极小
-        from kortex_real.gen3.gen3_lite import JOINT_LIMITS, JOINT_NAMES
+        # 使用实例缓存的关节限位信息，避免每次调用时重复导入
+        if self._joint_limits is None or self._joint_names is None:
+            self._ensure_joint_limits()
         result = joints.copy().astype(float)
-        for i, name in enumerate(JOINT_NAMES):
+        for i, name in enumerate(self._joint_names):
             if i >= len(result):
                 break
-            limits = JOINT_LIMITS.get(name, {"min": -180, "max": 180})
+            limits = self._joint_limits.get(name, {"min": -180, "max": 180})
             lo, hi = limits["min"], limits["max"]
             val = float(result[i])
             while val > hi + 1e-6:
@@ -206,16 +200,18 @@ class RealInterface:
             result[i] = val
         return result
 
-    def move_cartesian(self, pose: np.ndarray) -> bool:
+    def move_cartesian(self, pose: np.ndarray, keep_orientation: bool = True) -> bool:
         self._check_connection()
+        pose = np.copy(pose)
         if len(pose) < 6:
             current_pose = self.get_cartesian_pose()
             pose = np.concatenate([pose, current_pose[3:6]])
-        # 实机模式：保持当前末端姿态，只改变位置
+        # keep_orientation=True 时保持当前末端姿态，只改变位置
         # 强制指定 theta_x=180 等姿态可能导致 IK 无解 → ACTION_ABORT
-        current = self.get_cartesian_pose()
-        pose = np.copy(pose)
-        pose[3:6] = current[3:6]
+        # keep_orientation=False 时使用传入的姿态角（遥操作模式需要）
+        if keep_orientation:
+            current = self.get_cartesian_pose()
+            pose[3:6] = current[3:6]
         try:
             return self._robot.arm_move_cartesian(pose.tolist())
         except Exception as e:
@@ -231,9 +227,9 @@ class RealInterface:
 
     def set_gripper(self, position: float) -> bool:
         self._check_connection()
-        print(f"[RealInterface] set_gripper called with position={position}")
+        logger.debug(f"set_gripper called with position={position}")
         position = np.clip(position, 0.0, 1.0)
-        print(f"[RealInterface] After clip: position={position}")
+        logger.debug(f"After clip: position={position}")
         try:
             action = {"gripper.pos": position}
             self._robot.send_action(action)
@@ -241,30 +237,6 @@ class RealInterface:
         except Exception as e:
             raise RuntimeError(f"Failed to set gripper: {e}")
     
-    def is_at_position(self, target_pose: np.ndarray, position_tol: float = 0.005, orientation_tol: float = 1.0) -> bool:
-        """检查是否到达目标位置"""
-        current_pose = self.get_cartesian_pose()
-        pos_diff = np.linalg.norm(current_pose[:3] - target_pose[:3])
-        ori_diff = np.linalg.norm(current_pose[3:6] - target_pose[3:6])
-        return pos_diff < position_tol and ori_diff < orientation_tol
-    
-    def wait_for_arrival(self, target_pose: np.ndarray, timeout: float = 10.0, 
-                         position_tol: float = 0.005, orientation_tol: float = 1.0,
-                         callback: callable = None) -> bool:
-        """等待到达目标位置"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            current_pose = self.get_cartesian_pose()
-            pos_diff = np.linalg.norm(current_pose[:3] - target_pose[:3])
-            ori_diff = np.linalg.norm(current_pose[3:6] - target_pose[3:6])
-            
-            if callback:
-                callback(current_pose, target_pose, pos_diff, ori_diff)
-            
-            if pos_diff < position_tol and ori_diff < orientation_tol:
-                return True
-            time.sleep(0.05)
-        return False
 
     def get_camera_images(self) -> Dict[str, np.ndarray]:
         self._check_connection()
@@ -276,11 +248,11 @@ class RealInterface:
                     img = all_images[name]
                     # 检测全黑帧
                     if img.max() == 0:
-                        print(f"[WARNING] Camera '{name}' returned all-black frame! "
+                        logger.warning(f"Camera '{name}' returned all-black frame! "
                               f"Camera may not be working properly.")
                     result[name] = img
                 else:
-                    print(f"[WARNING] Camera '{name}' not found in camera manager results! "
+                    logger.warning(f"Camera '{name}' not found in camera manager results! "
                           f"Returning black placeholder. Available cameras: {list(all_images.keys())}")
                     result[name] = np.zeros((480, 640, 3), dtype=np.uint8)
             return result
@@ -295,7 +267,7 @@ class RealInterface:
             try:
                 self._robot.disconnect()
             except Exception:
-                pass
+                logger.debug("Failed to disconnect robot", exc_info=True)
         self._connected = False
         self._robot = None
 
@@ -344,7 +316,8 @@ class RealInterface:
 
 
 
-class MockRealInterface:
+class RealStubInterface:
+    """实机接口桩 - 用于测试（不依赖真实硬件运行）"""
     def __init__(self, camera_names: list = None):
         self._connected = False
         self._gripper_position = 0.0
@@ -358,7 +331,7 @@ class MockRealInterface:
         if not self._connected:
             raise RobotNotConnectedError("Mock robot is not connected. Call connect() first.")
 
-    def connect(self, ip: str, username: str = "admin", password: str = "admin") -> bool:
+    def connect(self, ip: str, username: str = None, password: str = None) -> bool:
         self._connected = True
         return True
 

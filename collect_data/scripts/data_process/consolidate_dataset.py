@@ -150,7 +150,16 @@ def consolidate_dataset(
     file_idx = 0
     start = 0
     total_rows = len(merged_df)
-    rows_per_file = int(data_file_size_mb * 1024 * 1024 / 500)  # 约500字节/行
+    # 估算每行字节数：根据第一行实际占用估算，避免过小/过大
+    if total_rows > 0:
+        sample_path = dst_data_dir / f"_sample_{file_idx:03d}.parquet"
+        merged_df.iloc[:min(100, total_rows)].to_parquet(sample_path, index=False)
+        sample_size = sample_path.stat().st_size
+        sample_path.unlink()
+        bytes_per_row = max(sample_size / min(100, total_rows), 1.0)
+    else:
+        bytes_per_row = 500.0
+    rows_per_file = max(1, int(data_file_size_mb * 1024 * 1024 / bytes_per_row))
 
     dst_data_dir = _data_chunk_dir(out_root, chunk_idx)
     dst_data_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +365,8 @@ def consolidate_dataset(
         new_info = json.load(f)
 
     new_info["total_episodes"] = total_episodes
-    new_info["total_frames"] = int(merged_df["index"].max() - merged_df["index"].min() + 1)
+    # total_frames 直接用合并后的行数（不依赖 index 列连续性）
+    new_info["total_frames"] = int(len(merged_df))
     new_info["total_tasks"] = 1
 
     data_chunk_counts = {}

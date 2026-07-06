@@ -4,6 +4,7 @@
 供 main.py、main_qt.py、gui/object_profile_tuner_window.py 等模块统一使用。
 """
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -41,9 +42,9 @@ def resolve_path(path_str: str, base_dir: Path = None, allowed_roots: list = Non
 
     # 如果指定了允许的根目录，校验路径是否在其下
     if allowed_roots:
-        allowed_roots_resolved = [Path(r).resolve() for r in allowed_roots]
-        if not any(resolved_str.startswith(str(r)) for r in allowed_roots_resolved):
-            logger.warning(f"配置路径超出允许范围: {resolved_str} 不在 {allowed_roots} 下")
+        allowed_roots_resolved = [str(Path(r).resolve()) for r in allowed_roots]
+        if not any(resolved_str.startswith(r + os.sep) or resolved_str == r for r in allowed_roots_resolved):
+            raise ValueError(f"配置路径超出允许范围: {resolved_str} 不在 {allowed_roots} 下")
 
     return resolved_str
 

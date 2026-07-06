@@ -10,7 +10,10 @@ MuJoCo 仿真生命周期管理器
 - 保证资源干净释放，无 OpenGL 泄漏
 """
 import gc
+import os
 import time
+import logging
+import traceback
 import threading
 import numpy as np
 from typing import Optional, List, Dict, Any
@@ -18,6 +21,8 @@ from typing import Optional, List, Dict, Any
 from scripts.core.message_bus import MessageBroker
 from scripts.core.topic_defs import ALL_SIMU_TOPICS
 from .publisher import SimuPublisher
+
+logger = logging.getLogger(__name__)
 
 
 class SimuManager:
@@ -49,8 +54,8 @@ class SimuManager:
     def start_simulation(self, xml_path: str, camera_names: List[str],
                          use_ik: bool = False, fps: int = 20,
                          show_viewer: bool = False,
-                         use_process_renderer: bool = False) -> bool:
-        """启动仿真：创建 SimuInterface + Publisher
+                         use_process_renderer: bool = None) -> bool:
+        """启动仿真:创建 SimuInterface + Publisher
 
         Args:
             xml_path: MuJoCo XML 场景路径
@@ -58,13 +63,22 @@ class SimuManager:
             use_ik: 是否启用 IK
             fps: 发布频率
             show_viewer: 是否显示被动查看器
-            use_process_renderer: 是否使用进程渲染器
+            use_process_renderer: 是否使用进程渲染器。None 时默认开启,
+                可设环境变量 DISABLE_PROCESS_RENDERER=1 关闭,避免与控制循环/采集
+                线程共享 OpenGL 上下文。
 
         Returns:
             是否成功启动
         """
+        # v3: 默认开启进程渲染器(避免与控制循环/采集线程共享 OpenGL 上下文)
+        # 设置环境变量 DISABLE_PROCESS_RENDERER=1 可回退到旧模式
+        if use_process_renderer is None:
+            use_process_renderer = os.environ.get("DISABLE_PROCESS_RENDERER", "0") != "1"
         # 1. 确保旧的已清理
         self.stop_simulation()
+
+        # 短暂等待，确保旧 MuJoCo/OpenGL 资源完全释放
+        time.sleep(0.1)
 
         # 2. 保存配置（用于重建）
         self._simu_config = {
@@ -80,7 +94,7 @@ class SimuManager:
         from .interface import SimuInterface
         self._simu = SimuInterface(xml_path, camera_names=camera_names, use_ik=use_ik)
         if not self._simu.initialize(show_viewer=show_viewer):
-            print("[SimuManager] Failed to initialize SimuInterface")
+            logger.error("Failed to initialize SimuInterface")
             self._simu = None
             return False
 
@@ -92,13 +106,13 @@ class SimuManager:
             try:
                 self._simu.start_render_process(camera_names)
             except Exception as e:
-                print(f"[SimuManager] Failed to start render process: {e}")
+                logger.warning(f"Failed to start render process: {e}")
 
         # 6. 启动发布者
         self._publisher = SimuPublisher(self._simu, self._broker, fps=fps)
         self._publisher.start()
 
-        print(f"[SimuManager] Simulation started: xml={xml_path}, cameras={camera_names}, ik={use_ik}")
+        logger.info(f"Simulation started: xml={xml_path}, cameras={camera_names}, ik={use_ik}")
         return True
 
     def stop_simulation(self):
@@ -112,24 +126,23 @@ class SimuManager:
         if self._simu is not None:
             try:
                 self._simu.close_glfw_viewer()
-            except Exception as e:
-                print(f"[SimuManager] close_glfw_viewer error: {e}")
+            except Exception:
+                logger.debug("Failed to close GLFW viewer", exc_info=True)
 
             try:
                 self._simu.stop_process_renderer()
-            except Exception as e:
-                print(f"[SimuManager] stop_process_renderer error: {e}")
+            except Exception:
+                logger.debug("Failed to stop process renderer", exc_info=True)
 
             try:
                 self._simu.disconnect()
-            except Exception as e:
-                print(f"[SimuManager] disconnect error: {e}")
+            except Exception:
+                logger.debug("Failed to disconnect simu", exc_info=True)
 
             self._simu = None
 
         # 3. 强制 GC 回收 OpenGL/MuJoCo 资源
         gc.collect()
-        time.sleep(0.2)
         gc.collect()  # 二次 GC 确保循环引用也被回收
 
         # 4. 清除仿真相关话题的缓存（避免 GUI 显示过期数据）
@@ -138,8 +151,6 @@ class SimuManager:
             topic = self._broker.get_topic(topic_name)
             if topic is not None:
                 topic.clear_latest()
-
-        print("[SimuManager] Simulation stopped and resources cleaned")
 
     def restart_simulation(self, xml_path: str = None, camera_names: List[str] = None,
                            use_ik: bool = None, fps: int = None,
@@ -185,8 +196,7 @@ class SimuManager:
         Returns:
             是否成功
         """
-        # 停止旧的仿真
-        self.stop_simulation()
+        # start_simulation 内部会先调用 stop_simulation()，无需重复调用
 
         base_xml = task_config.get('base_scene_xml', '')
         camera_names = task_config.get('camera_names', ['agentview'])
@@ -196,7 +206,7 @@ class SimuManager:
         use_process_renderer = task_config.get('use_process_renderer', False)
 
         if not base_xml:
-            print("[SimuManager] No base scene XML provided")
+            logger.error("No base scene XML provided")
             return False
 
         # 如果有物体模型，先构建合并的 XML（在 SimuInterface 创建之前）
@@ -222,27 +232,33 @@ class SimuManager:
                     )
                 if generated:
                     final_xml = generated
-                    print(f"[SimuManager] Using generated scene XML: {generated}")
+                    logger.info(f"Using generated scene XML: {generated}")
             except Exception as e:
-                print(f"[SimuManager] Failed to build scene XML, using base XML: {e}")
+                logger.warning(f"Failed to build scene XML, using base XML: {e}")
 
         # 启动新仿真（使用合并后的 XML，只需一次 initialize）
         if not self.start_simulation(final_xml, camera_names, use_ik, fps, show_viewer, use_process_renderer):
             return False
 
-        # 设置物体属性和初始状态
+        # 设置初始关节（直接设 qpos，瞬间到位）—— 无论是否有物体模型都需要应用
+        if self._simu is not None:
+            initial_joints = task_config.get('initial_joints_deg')
+            initial_gripper = task_config.get('initial_gripper', 0.0)
+            if initial_joints is not None:
+                try:
+                    self._simu.set_joint_positions(np.array(initial_joints[:6], dtype=float), gripper=initial_gripper)
+                    # 推进仿真几步让物理状态稳定
+                    self._simu.step(10)
+                except Exception as e:
+                    logger.warning(f"Failed to set initial joints: {e}")
+
+        # 设置物体属性
         if object_model_xml and self._simu is not None:
             try:
                 # 设置物体位置
                 object_position = task_config.get('object_position')
                 if object_position is not None:
                     self._simu.set_object_position(object_body_name, np.array(object_position), reset_z=True)
-
-                # 设置初始关节（直接设 qpos，瞬间到位）
-                initial_joints = task_config.get('initial_joints_deg')
-                initial_gripper = task_config.get('initial_gripper', 0.0)
-                if initial_joints is not None:
-                    self._simu.set_joint_positions(np.array(initial_joints[:6], dtype=float), gripper=initial_gripper)
 
                 # 设置放置目标位置
                 plate_position = task_config.get('plate_position')
@@ -255,12 +271,11 @@ class SimuManager:
                     time.sleep(0.03)
 
             except Exception as e:
-                print(f"[SimuManager] Failed to setup task scene: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"Failed to setup task scene: {e}")
+                logger.debug(traceback.format_exc())
                 return False
 
-        print(f"[SimuManager] Task simulation started successfully")
+        logger.info("Task simulation started successfully")
         return True
 
     def apply_initial_joints(self, joints_deg: Optional[np.ndarray] = None):
@@ -269,4 +284,4 @@ class SimuManager:
             return
         if joints_deg is not None:
             self._simu.set_joint_target(np.asarray(joints_deg[:6], dtype=float))
-            self._simu.step(300)
+            self._simu.step(50)

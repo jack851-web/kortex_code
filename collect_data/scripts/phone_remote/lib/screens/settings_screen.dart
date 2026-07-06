@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import '../core/theme.dart';
 import '../core/constants.dart';
+import '../core/storage_service.dart';
 import '../providers/connection_provider.dart';
 import '../providers/calibration_provider.dart';
 
@@ -39,33 +40,66 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   /// 保存并连接
   Future<void> _saveAndConnect() async {
-    setState(() => _isConnecting = true);
-
     final ip = _ipController.text.trim();
     final port = int.tryParse(_portController.text) ?? AppConstants.defaultPort;
+
+    // 校验 IP 不能为空
+    if (ip.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('请填写 PC 端 IP 地址（在 PC 端启动日志中查看"手机请连接到: x.x.x.x"）'),
+          backgroundColor: AppTheme.accentYellowOrange,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isConnecting = true);
 
     // 更新状态
     ref.read(connectionProvider.notifier).updateIp(ip);
     ref.read(connectionProvider.notifier).updatePort(port);
 
+    // 保存配置
+    await StorageService.setString(AppConstants.keyIp, ip);
+    await StorageService.setInt(AppConstants.keyPort, port);
+
     // 尝试连接
     final success =
         await ref.read(connectionProvider.notifier).saveAndConnect();
 
-    if (success && mounted) {
-      // 连接成功，跳转到主控页
-      Navigator.of(context).pushReplacementNamed('/main');
-    } else if (mounted) {
-      // 显示错误提示
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(ref.read(connectionProvider).error ?? '连接失败'),
-          backgroundColor: AppTheme.primaryRed,
-        ),
-      );
+    if (mounted) {
+      if (success) {
+        // 连接成功，跳转到主控页
+        Navigator.of(context).pushReplacementNamed('/main');
+      } else {
+        // 连接失败，停留在设置页让用户重试
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                Text(ref.read(connectionProvider).error ?? '连接失败，请检查 IP 和端口'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
     }
 
     setState(() => _isConnecting = false);
+  }
+
+  /// 直接进入主页（不连接）
+  void _goToMainPage() {
+    // 保存当前配置
+    final ip = _ipController.text.trim();
+    final port = int.tryParse(_portController.text) ?? AppConstants.defaultPort;
+    ref.read(connectionProvider.notifier).updateIp(ip);
+    ref.read(connectionProvider.notifier).updatePort(port);
+    StorageService.setString(AppConstants.keyIp, ip);
+    StorageService.setInt(AppConstants.keyPort, port);
+
+    Navigator.of(context).pushReplacementNamed('/main');
   }
 
   /// 跳转到校准页面
@@ -86,8 +120,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             // 可滚动内容区域
             Expanded(
               child: SingleChildScrollView(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: AppTheme.pagePaddingH),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: AppTheme.pagePaddingH),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -232,6 +266,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 : const Text('保存并连接'),
           ),
         ),
+        const SizedBox(height: 10),
+        // 进入主页按钮（白色边框）
+        SizedBox(
+          width: double.infinity,
+          height: AppTheme.buttonHeight,
+          child: OutlinedButton(
+            onPressed: _goToMainPage,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppTheme.textPrimary,
+              side: const BorderSide(color: Color(0xFFBDBDBD), width: 1.5),
+            ),
+            child: const Text('进入主页'),
+          ),
+        ),
       ],
     );
   }
@@ -336,6 +384,24 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               side: const BorderSide(color: Color(0xFFBDBDBD), width: 1.5),
             ),
             child: Text(isCalibrated ? '重新标定' : '开始标定'),
+          ),
+        ),
+
+        const SizedBox(height: 8),
+
+        // 智能标定按钮（推荐）
+        SizedBox(
+          width: double.infinity,
+          height: AppTheme.buttonHeight,
+          child: ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pushNamed('/smart_calibration');
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.primaryGreen,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('智能标定（推荐）'),
           ),
         ),
       ],

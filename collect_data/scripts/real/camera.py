@@ -1,10 +1,13 @@
 import os
 import platform
 import cv2
+import logging
 import numpy as np
 import threading
 import time
 from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
 
 # Windows MSMF 后端需要关闭硬件变换，否则某些摄像头会返回全黑帧
 if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS" not in os.environ:
@@ -42,8 +45,8 @@ class SimpleCamera:
                         ret, frame = self._cap.read()
                         if ret:
                             if frame is not None and frame.max() == 0:
-                                print(f"[WARNING] Camera {self._index}: initial frame is all black with {backend_names[backend]} backend!")
-                            print(f"Camera {self._index} connected with {backend_names[backend]} backend")
+                                logger.warning(f"Camera {self._index}: initial frame is all black with {backend_names[backend]} backend!")
+                            logger.info(f"Camera {self._index} connected with {backend_names[backend]} backend")
                             self._latest_frame = frame
                             self._stop_event.clear()
                             self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -60,7 +63,7 @@ class SimpleCamera:
                     if self._cap is not None:
                         self._cap.release()
         
-        print(f"Failed to connect camera {self._index}")
+        logger.error(f"Failed to connect camera {self._index}")
         return False
 
     def _read_loop(self):
@@ -72,7 +75,7 @@ class SimpleCamera:
             if ret:
                 # 检测全黑帧
                 if frame is not None and frame.max() == 0 and not _black_frame_warned:
-                    print(f"[WARNING] Camera {self._index}: frame is all black! "
+                    logger.warning(f"Camera {self._index}: frame is all black! "
                           f"This may be caused by MSMF hardware transforms. "
                           f"OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS={os.environ.get('OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS', 'not set')}")
                     _black_frame_warned = True
@@ -108,7 +111,7 @@ class CameraManager:
 
     def connect(self) -> bool:
         for name, cfg in self._configs.items():
-            print(f"Connecting camera: {name}")
+            logger.info(f"Connecting camera: {name}")
             cam = SimpleCamera(
                 index=cfg.get("index", 0),
                 width=cfg.get("width", 640),
@@ -116,7 +119,7 @@ class CameraManager:
                 fps=cfg.get("fps", 30)
             )
             if not cam.connect():
-                print(f"  Failed to connect camera: {name}")
+                logger.warning(f"  Failed to connect camera: {name}")
                 continue
             self._cameras[name] = cam
             time.sleep(0.3)

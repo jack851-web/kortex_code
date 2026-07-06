@@ -5,7 +5,7 @@
 2. 纯仿真模式: 使用 IK 根据笛卡尔坐标控制仿真机械臂
 """
 # 从原始位置导入，保持向后兼容
-from scripts.simu_interface import SimuInterface, MockSimuInterface
+from scripts.simu_interface import SimuInterface, SimuStubInterface
 from scripts.simu_interface import build_scene_with_object, build_scene_with_objects
 
-__all__ = ['SimuInterface', 'MockSimuInterface', 'build_scene_with_object', 'build_scene_with_objects']
+__all__ = ['SimuInterface', 'SimuStubInterface', 'build_scene_with_object', 'build_scene_with_objects']

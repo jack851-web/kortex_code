@@ -2,11 +2,14 @@
 仿真渲染进程 - 在独立进程中运行 MuJoCo 渲染
 通过 multiprocessing.Queue 与主进程通信
 """
+import logging
 import multiprocessing as mp
 import numpy as np
 import mujoco
 import time
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def render_worker(
@@ -40,12 +43,12 @@ def render_worker(
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    
+
     # 为每个相机创建独立的 renderer
     renderers = {}
     for cam_name in camera_names:
         renderers[cam_name] = mujoco.Renderer(model, height=height, width=width)
-    
+
     running = True
     current_joints = None
     current_object_pos = None
@@ -57,6 +60,16 @@ def render_worker(
     right_tip_idx = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "RIGHT_TIP")
     left_tip_idx = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "LEFT_TIP")
 
+    # 动态读取夹爪最大张开值（从 actuator ctrlrange）
+    gripper_max_open = 0.8  # 默认值
+    for i in range(model.nu):
+        actuator_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or ""
+        if "RIGHT_BOTTOM" in actuator_name.upper() or "right_bottom" in actuator_name:
+            ctrl_range = model.actuator_ctrlrange[i]
+            gripper_max_open = float(ctrl_range[1])
+            logger.debug(f"render_worker: gripper_max_open from actuator '{actuator_name}': {gripper_max_open}")
+            break
+
     def _drain_latest(queue, latest_value):
         if queue is None:
             return latest_value
@@ -64,7 +77,7 @@ def render_worker(
             while not queue.empty():
                 latest_value = queue.get_nowait()
         except Exception:
-            pass
+            logger.debug("Queue drain failed", exc_info=True)
         return latest_value
 
     def _apply_latest_state():
@@ -80,8 +93,8 @@ def render_worker(
                 data.qpos[i] = joints_rad[i]
 
         if current_gripper is not None:
-            right_bottom_pos = 0.8 * (1 - current_gripper)
-            left_bottom_pos = -0.8 * (1 - current_gripper)
+            right_bottom_pos = gripper_max_open * (1 - current_gripper)
+            left_bottom_pos = -gripper_max_open * (1 - current_gripper)
 
             if right_bottom_idx >= 0:
                 qpos_idx = model.jnt_qposadr[right_bottom_idx]
@@ -105,7 +118,7 @@ def render_worker(
                         qpos_adr = model.jnt_qposadr[joint_adr]
                         data.qpos[qpos_adr:qpos_adr+3] = current_object_pos
             except Exception:
-                pass
+                logger.debug("Failed to apply object position", exc_info=True)
 
         mujoco.mj_forward(model, data)
 
@@ -133,10 +146,10 @@ def render_worker(
 
                 result_queue.put(images)
         except Exception:
-            pass
+            logger.debug("Render loop iteration failed", exc_info=True)
 
         time.sleep(0.001)
-    
+
     # 清理
     for renderer in renderers.values():
         del renderer
@@ -147,14 +160,14 @@ class SimuRenderProcess:
     仿真渲染进程管理器
     在独立进程中运行 MuJoCo 渲染，避免缓冲区共享问题
     """
-    
+
     def __init__(self, xml_path: str, camera_names: List[str], width: int = 640, height: int = 480, object_body_name: str = "cube"):
         self._xml_path = xml_path
         self._camera_names = camera_names
         self._width = width
         self._height = height
         self._object_body_name = object_body_name or "cube"
-        
+
         self._command_queue: Optional[mp.Queue] = None
         self._result_queue: Optional[mp.Queue] = None
         self._joint_queue: Optional[mp.Queue] = None
@@ -193,40 +206,40 @@ class SimuRenderProcess:
         )
         self._process.start()
         self._running = True
-        print(f"[SimuRenderProcess] Started with cameras: {self._camera_names}")
-    
+        logger.info(f"Started with cameras: {self._camera_names}")
+
     def stop(self):
         """停止渲染进程"""
         if not self._running:
             return
-        
+
         try:
             self._command_queue.put("stop")
-        except:
-            pass
-        
+        except Exception:
+            logger.debug("Failed to send stop command", exc_info=True)
+
         self._process.join(timeout=2.0)
         if self._process.is_alive():
             self._process.terminate()
-        
+
         try:
             self._command_queue.close()
             self._result_queue.close()
             self._joint_queue.close()
             self._object_queue.close()
             self._gripper_queue.close()
-        except:
-            pass
-        
+        except Exception:
+            logger.debug("Failed to close queues", exc_info=True)
+
         self._command_queue = None
         self._result_queue = None
         self._joint_queue = None
         self._object_queue = None
         self._gripper_queue = None
-        
+
         self._running = False
-        print("[SimuRenderProcess] Stopped")
-    
+        logger.info("Stopped")
+
     def update_joints(self, joint_positions: np.ndarray):
         """更新关节位置"""
         if self._running:
@@ -234,10 +247,10 @@ class SimuRenderProcess:
             try:
                 while not self._joint_queue.empty():
                     self._joint_queue.get_nowait()
-            except:
-                pass
+            except Exception:
+                logger.debug("Failed to drain joint queue", exc_info=True)
             self._joint_queue.put(joint_positions.copy())
-    
+
     def update_object_position(self, position: np.ndarray):
         """更新物块位置"""
         if self._running and self._object_queue is not None:
@@ -245,8 +258,8 @@ class SimuRenderProcess:
             try:
                 while not self._object_queue.empty():
                     self._object_queue.get_nowait()
-            except:
-                pass
+            except Exception:
+                logger.debug("Failed to drain object queue", exc_info=True)
             self._object_queue.put(position.copy())
 
     def update_gripper(self, gripper_position: float):
@@ -256,43 +269,43 @@ class SimuRenderProcess:
             try:
                 while not self._gripper_queue.empty():
                     self._gripper_queue.get_nowait()
-            except:
-                pass
+            except Exception:
+                logger.debug("Failed to drain gripper queue", exc_info=True)
             self._gripper_queue.put(gripper_position)
-    
+
     def render(self) -> Optional[Dict[str, np.ndarray]]:
         """
         请求渲染一帧
-        
+
         Returns:
             字典 {camera_name: image_array} 或 None
         """
         if not self._running:
             return None
-        
+
         # 清空旧结果
         try:
             while not self._result_queue.empty():
                 self._result_queue.get_nowait()
-        except:
-            pass
-        
+        except Exception:
+            logger.debug("Failed to drain result queue", exc_info=True)
+
         # 发送渲染命令
         self._command_queue.put("render")
-        
+
         # 等待结果
         try:
             return self._result_queue.get(timeout=1.0)
-        except:
+        except Exception:
             return None
-    
+
     def get_images(self) -> Dict[str, np.ndarray]:
         """获取图像 - 兼容接口"""
         result = self.render()
         if result is None:
-            return {name: np.zeros((self._height, self._width, 3), dtype=np.uint8) 
+            return {name: np.zeros((self._height, self._width, 3), dtype=np.uint8)
                     for name in self._camera_names}
         return result
-    
+
     def is_running(self) -> bool:
         return self._running and self._process.is_alive()

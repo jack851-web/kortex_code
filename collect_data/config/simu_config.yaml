@@ -122,3 +122,42 @@ tasks:
     object_position: random
     plate_position: [0.35, -0.15, 0.44]
     description: "Pick up the red mug and put it on the white plate"
+
+# ================================================================
+# 遥操作（手机 ARCore 远程控制）配置
+# ================================================================
+teleop:
+  # 位置/姿态增量放大倍数
+  position_scale: 1.0
+  orientation_scale: 0.5
+  # 速度限幅（保证安全）
+  max_linear_speed: 0.5        # 米/秒
+  max_angular_speed: 30.0      # 度/秒
+  # ARCore 增量位姿预计频率（用于把"每帧增量"换算为"速度"做限幅）
+  delta_frequency: 30.0
+  # 工作空间限制 [min, max]，单位米；超出会被裁剪
+  workspace_limits:
+    x: [-0.3, 0.5]
+    y: [-0.35, 0.35]
+    z: [0.1, 0.55]
+  # ---- vr-teleop-kit 风格(v2 优化) ----
+  # Reach Limit:增量累积的目标与当前 EE 距离超过该值,被截断并吸收,
+  # 反向运动立即响应(无需先回追越界)。None 或 0 禁用。
+  pos_reach_limit: 0.25        # 米
+  rot_reach_limit: 0.6         # 弧度(~34°)
+  # 控制循环频率(Hz):原 20Hz → 默认 50Hz 跟手更紧
+  control_rate_hz: 50.0
+  # 每 tick 关节 Δq 限幅(弧度):防止奇异/边界处追跑
+  max_dq_pos: 0.04             # 关节 1-3 ≈ 2 rad/s @ 50Hz
+  max_dq_rot: 0.10             # 关节 4-6 ≈ 5 rad/s @ 50Hz
+  # IK 连续失败 N 次自动重置目标到 engage 基准,避免永久卡死
+  ik_fail_reset: 30
+  # WebSocket 服务端配置
+  websocket:
+    # 关键：必须为 PC 局域网 IP（或 0.0.0.0 监听所有网卡），
+    # 不能用 127.0.0.1（手机无法访问回环地址）
+    host: "0.0.0.0"
+    port: 8765
+    # 心跳与超时（秒），需与 App 端 AppConstants 保持一致
+    heartbeat_interval: 3.0
+    heartbeat_timeout: 15.0

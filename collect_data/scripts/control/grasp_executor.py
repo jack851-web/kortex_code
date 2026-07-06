@@ -1,6 +1,9 @@
 import numpy as np
 import time
+import logging
 from typing import List, Tuple, Optional, Callable, Dict, Union, Any
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -83,6 +86,7 @@ class GraspExecutor:
         self._current_task_id = 0
         self._is_executing = False
         self._waypoint_delay = 0.1
+        self._object_position = np.zeros(3)
 
         # 初始关节位置（任务完成后回到此位置）
         if initial_joints is not None:
@@ -132,7 +136,7 @@ class GraspExecutor:
         self._current_task_id = task_id
         self._object_position = np.array(object_position)
         self._target_position = np.array(target_position)
-        print(f"[GraspExecutor] object z source: config_z={self._object_position[2]:.6f}")
+        logger.info(f"object z source: config_z={self._object_position[2]:.6f}")
 
 
 
@@ -158,7 +162,7 @@ class GraspExecutor:
                 pos = self._simu.get_object_position(self._sim_object_body_name)
                 return pos[2]
         except Exception as e:
-            print(f"[GraspExecutor] Warning: Could not get object z from XML: {e}")
+            logger.info(f"Warning: Could not get object z from XML: {e}")
         return 0.02
 
     def _get_orientation_for_object(self, object_type: Optional[str] = None) -> np.ndarray:
@@ -209,17 +213,17 @@ class GraspExecutor:
         if hasattr(self._simu, 'get_object_position'):
             try:
                 object_actual_pos = self._simu.get_object_position(self._sim_object_body_name)
-                print(f"[GraspExecutor] 从仿真获取物体实际位置: {object_actual_pos}")
+                logger.info(f"从仿真获取物体实际位置: {object_actual_pos}")
             except Exception as e:
-                print(f"[GraspExecutor] Warning: 无法从仿真获取物体位置: {e}")
+                logger.info(f"Warning: 无法从仿真获取物体位置: {e}")
         
         # 使用实际位置或配置位置
         if object_actual_pos is not None:
             object_pos = np.array(object_actual_pos[:3])
-            print(f"[GraspExecutor] 使用仿真实际位置作为抓取目标")
+            logger.info(f"使用仿真实际位置作为抓取目标")
         else:
             object_pos = self._object_position.copy()
-            print(f"[GraspExecutor] 回退使用配置位置作为抓取目标: {object_pos}")
+            logger.info(f"回退使用配置位置作为抓取目标: {object_pos}")
         
         pre_grasp_offset = self._get_pre_grasp_offset_for_object()
 
@@ -250,8 +254,8 @@ class GraspExecutor:
             (self._make_cartesian_pose(target_lift_pos), "move"),
             (self._make_cartesian_pose(target_place_pos), "place"),
         ]
-        print(
-            f"[GraspExecutor] waypoint z: pre_grasp={pre_grasp[2]:.6f}, "
+        logger.debug(
+            f"waypoint z: pre_grasp={pre_grasp[2]:.6f}, "
             f"grasp={grasp_pos[2]:.6f}, lift={lift_pos[2]:.6f}, place={target_place_pos[2]:.6f}"
         )
 
@@ -273,24 +277,24 @@ class GraspExecutor:
                 if progress_callback:
                     progress_callback(name, i + 1, len(waypoints))
 
-                print(f"[GraspExecutor] Moving to {name}: {pose[:3]}")
+                logger.info(f"Moving to {name}: {pose[:3]}")
                 arrived = self._move_to_position(pose)
 
                 if arrived:
-                    print(f"[GraspExecutor] ✓ Arrived at {name}")
+                    logger.info(f"✓ Arrived at {name}")
                 else:
-                    print(f"[GraspExecutor] ⚠ Not exactly at {name}, but continuing...")
+                    logger.info(f"[WARNING] Not exactly at {name}, but continuing...")
                     # 不 abort，继续执行后续步骤
 
                 if name == "pre_grasp":
                     self._open_gripper()
-                    print(f"[GraspExecutor] Gripper opened for pre_grasp")
+                    logger.info(f"Gripper opened for pre_grasp")
                 elif name == "grasp":
                     self._close_gripper()
-                    print(f"[GraspExecutor] Gripper closed for grasp")
+                    logger.info(f"Gripper closed for grasp")
                 elif name == "place":
                     # 放置时：先微抬，再缓慢松开，避免弹开物体
-                    print(f"[GraspExecutor] Place: lifting {self._micro_lift_height*100:.1f}cm before release...")
+                    logger.info(f"Place: lifting {self._micro_lift_height*100:.1f}cm before release...")
                     current_pose = self._simu.get_tcp_position() if self._use_simulation else self._real.get_cartesian_pose()
                     micro_lift = np.array(current_pose[:6]) if len(current_pose) >= 6 else np.zeros(6)
                     micro_lift[2] += self._micro_lift_height  # 微抬
@@ -299,14 +303,14 @@ class GraspExecutor:
 
                     # 缓慢松开夹爪
                     self._open_gripper(gradual=True)
-                    print(f"[GraspExecutor] Gripper opened for place (gradual)")
+                    logger.info(f"Gripper opened for place (gradual)")
 
                     # 松开后垂直抬升
                     time.sleep(0.2)  # 等夹爪完全松开
                     current_pose = self._simu.get_tcp_position() if self._use_simulation else self._real.get_cartesian_pose()
                     lift_after_release = np.array(current_pose[:6]) if len(current_pose) >= 6 else np.zeros(6)
                     lift_after_release[2] += self._release_lift_height
-                    print(f"[GraspExecutor] Lifting {self._release_lift_height*100:.1f}cm after release...")
+                    logger.info(f"Lifting {self._release_lift_height*100:.1f}cm after release...")
                     self._move_to_position(lift_after_release)
 
                 time.sleep(self._waypoint_delay)
@@ -320,30 +324,30 @@ class GraspExecutor:
                     z_diff = abs(object_pos[2] - self._target_position[2])
                     distance_3d = np.linalg.norm(object_pos[:3] - self._target_position[:3])  # 3D总距离
                     
-                    print(f"[GraspExecutor] ========== 任务判断 ==========")
-                    print(f"[GraspExecutor] Object position: {object_pos}")
-                    print(f"[GraspExecutor] Target position: {self._target_position}")
-                    print(f"[GraspExecutor] Distance: xy={distance_xy:.4f}m, z={z_diff:.4f}m, 3d={distance_3d:.4f}m")
+                    logger.info(f"========== 任务判断 ==========")
+                    logger.info(f"Object position: {object_pos}")
+                    logger.info(f"Target position: {self._target_position}")
+                    logger.info(f"Distance: xy={distance_xy:.4f}m, z={z_diff:.4f}m, 3d={distance_3d:.4f}m")
                     
                     # 判断标准放宽：xy距离<8cm 且 z偏差<5cm（物体放置有一定误差是正常的）
                     xy_threshold = 0.08  # 8cm
                     z_threshold = 0.05   # 5cm
                     
                     if distance_xy < xy_threshold and z_diff < z_threshold:
-                        print(f"[GraspExecutor] ✓ Task SUCCESS: object reached target position")
-                        print(f"[GraspExecutor]   (xy={distance_xy*100:.1f}cm < {xy_threshold*100:.0f}cm, z={z_diff*100:.1f}cm < {z_threshold*100:.0f}cm)")
+                        logger.info(f"✓ Task SUCCESS: object reached target position")
+                        logger.info(f"  (xy={distance_xy*100:.1f}cm < {xy_threshold*100:.0f}cm, z={z_diff*100:.1f}cm < {z_threshold*100:.0f}cm)")
                         return True
                     else:
-                        print(f"[GraspExecutor] ✗ Task FAILED: object not at target position")
-                        print(f"[GraspExecutor]   (xy={distance_xy*100:.1f}cm >= {xy_threshold*100:.0f}cm or z={z_diff*100:.1f}cm >= {z_threshold*100:.0f}cm)")
+                        logger.info(f"✗ Task FAILED: object not at target position")
+                        logger.info(f"  (xy={distance_xy*100:.1f}cm >= {xy_threshold*100:.0f}cm or z={z_diff*100:.1f}cm >= {z_threshold*100:.0f}cm)")
                         return False
                 except Exception as e:
-                    print(f"[GraspExecutor] Error getting object position: {e}")
-                    print(f"[GraspExecutor] Assuming task success (cannot verify)")
+                    logger.info(f"Error getting object position: {e}")
+                    logger.info(f"Assuming task success (cannot verify)")
                     return True
             else:
-                print(f"[GraspExecutor] Warning: cannot verify object position (no get_object_position method)")
-                print(f"[GraspExecutor] Assuming task success")
+                logger.info(f"Warning: cannot verify object position (no get_object_position method)")
+                logger.info(f"Assuming task success")
                 return True
         finally:
             self._is_executing = False
@@ -368,8 +372,8 @@ class GraspExecutor:
 
         # 仿真模式下 IK 必须可用，否则无法移动
         if self._use_simulation and not (hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()):
-            print("[GraspExecutor] ERROR: Simulation mode requires IK but IK is not available!")
-            print(f"  _use_simulation={self._use_simulation}, is_ik_available={self._simu.is_ik_available() if hasattr(self._simu, 'is_ik_available') else 'N/A'}")
+            logger.error("Simulation mode requires IK but IK is not available!")
+            logger.error(f"  _use_simulation={self._use_simulation}, is_ik_available={self._simu.is_ik_available() if hasattr(self._simu, 'is_ik_available') else 'N/A'}")
             return False
 
         if use_simu_ik:
@@ -381,9 +385,10 @@ class GraspExecutor:
 
             for attempt in range(1, max_attempts + 1):
                 # 第一次严格带姿态；后续失败重试退化为仅位置，避免姿态不可达导致整体卡死
+                # 注意：退化为仅位置时末端姿态不受控，可能存在碰撞风险
                 attempt_orientation = target_ori if (target_ori is not None and attempt == 1) else None
                 if target_ori is not None and attempt > 1:
-                    print("[GraspExecutor] Retry with position-only IK (orientation relaxed)")
+                    logger.info("Retry with position-only IK (orientation relaxed)")
 
                 success = self._simu.move_to_cartesian(
                     target_pos,
@@ -397,18 +402,18 @@ class GraspExecutor:
 
                 tcp_pos = self._simu.get_tcp_position() if hasattr(self._simu, 'get_tcp_position') else None
                 if tcp_pos is None:
-                    print(f"[GraspExecutor] ⚠ Failed to read TCP pose (attempt {attempt}/{max_attempts})")
+                    logger.info(f"[WARNING] Failed to read TCP pose (attempt {attempt}/{max_attempts})")
                     continue
 
                 pos_diff = np.linalg.norm(np.asarray(tcp_pos) - target_pos)
-                print(f"  Current: [{tcp_pos[0]:.3f}, {tcp_pos[1]:.3f}, {tcp_pos[2]:.3f}]")
-                print(f"  Target:  [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
-                print(f"  Diff: pos={pos_diff:.4f}m")
+                logger.debug(f"  Current: [{tcp_pos[0]:.3f}, {tcp_pos[1]:.3f}, {tcp_pos[2]:.3f}]")
+                logger.debug(f"  Target:  [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
+                logger.debug(f"  Diff: pos={pos_diff:.4f}m")
 
                 if success and pos_diff <= tolerance:
                     return True
 
-                print(f"[GraspExecutor] ⚠ IK not within tolerance (attempt {attempt}/{max_attempts}, tol={tolerance:.4f}m)")
+                logger.info(f"[WARNING] IK not within tolerance (attempt {attempt}/{max_attempts}, tol={tolerance:.4f}m)")
 
             return False
 
@@ -425,19 +430,19 @@ class GraspExecutor:
                 self._simu.set_joint_target(joint_state)
 
             if pos_diff < tolerance:
-                print(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
-                print(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
-                print(f"  Diff: pos={pos_diff:.4f}m")
+                logger.debug(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
+                logger.debug(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
+                logger.debug(f"  Diff: pos={pos_diff:.4f}m")
                 return True
 
             time.sleep(0.01)
 
         current_pose = self._real.get_cartesian_pose()
         pos_diff = np.linalg.norm(current_pose[:3] - pose[:3])
-        print(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
-        print(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
-        print(f"  Diff: pos={pos_diff:.4f}m")
-        print(f"[GraspExecutor] ⚠ Timeout waiting to reach target")
+        logger.debug(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
+        logger.debug(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
+        logger.debug(f"  Diff: pos={pos_diff:.4f}m")
+        logger.info(f"[WARNING] Timeout waiting to reach target")
         return False
 
     def _set_simu_gripper_best_effort(self, desired_position: float, timeout: float = 0.6) -> float:
@@ -460,13 +465,13 @@ class GraspExecutor:
                 interp_cmd = start_state + (cmd - start_state) * alpha
                 self._simu.set_gripper(float(np.clip(interp_cmd, 0.0, 1.0)))
                 if hasattr(self._simu, 'step'):
-                    self._simu.step(8)
+                    self._simu.step(3)  # 每步少量仿真，避免长时间持锁
 
             start_time = time.time()
             current_state = self._simu.get_gripper_state()
             while time.time() - start_time < timeout:
                 if hasattr(self._simu, 'step'):
-                    self._simu.step(5)
+                    self._simu.step(2)
                 current_state = self._simu.get_gripper_state()
                 if abs(current_state - desired_position) < 0.08:
                     return current_state
@@ -488,7 +493,7 @@ class GraspExecutor:
         Args:
             gradual: 是否缓慢分阶段闭合（默认True，避免弹开物体）
         """
-        print(f"[GraspExecutor] _close_gripper called, target={self._gripper_close_position}, gradual={gradual}")
+        logger.info(f"_close_gripper called, target={self._gripper_close_position}, gradual={gradual}")
         use_simu_ik = hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
 
         if use_simu_ik:
@@ -501,7 +506,7 @@ class GraspExecutor:
                     target = current_gripper + (self._gripper_close_position - current_gripper) * alpha
                     self._simu.set_gripper(float(target))
                     if hasattr(self._simu, 'step'):
-                        self._simu.step(12)  # 每步多仿真几帧让物理稳定
+                        self._simu.step(3)  # 每步少量仿真，避免长时间持锁
                     time.sleep(0.04)
                 current_gripper = self._simu.get_gripper_state()
             else:
@@ -516,7 +521,7 @@ class GraspExecutor:
                 time.sleep(0.1)
             current_gripper = self._real.get_gripper_state()
 
-        print(f"[GraspExecutor] After close, Gripper state: {current_gripper:.2f} (target: {self._gripper_close_position:.2f})")
+        logger.info(f"After close, Gripper state: {current_gripper:.2f} (target: {self._gripper_close_position:.2f})")
 
     def _open_gripper(self, gradual: bool = False):
         """打开夹爪
@@ -524,7 +529,7 @@ class GraspExecutor:
         Args:
             gradual: 是否缓慢分阶段松开（放置物体时使用，避免弹开）
         """
-        print(f"[GraspExecutor] Opening gripper to {self._gripper_open_position} (gradual={gradual})")
+        logger.info(f"Opening gripper to {self._gripper_open_position} (gradual={gradual})")
         use_simu_ik = hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
 
         if use_simu_ik:
@@ -537,7 +542,7 @@ class GraspExecutor:
                     target = current_gripper + (self._gripper_open_position - current_gripper) * alpha
                     self._simu.set_gripper(float(target))
                     if hasattr(self._simu, 'step'):
-                        self._simu.step(10)  # 每步多仿真几帧让物理稳定
+                        self._simu.step(3)  # 每步少量仿真，避免长时间持锁
                     time.sleep(0.05)
                 current_gripper = self._simu.get_gripper_state()
             else:
@@ -552,7 +557,7 @@ class GraspExecutor:
                 time.sleep(0.1)
             current_gripper = self._real.get_gripper_state()
 
-        print(f"[GraspExecutor] After open, Gripper state: {current_gripper:.2f} (target: {self._gripper_open_position:.2f})")
+        logger.info(f"After open, Gripper state: {current_gripper:.2f} (target: {self._gripper_open_position:.2f})")
 
 
 
@@ -565,14 +570,14 @@ class GraspExecutor:
         实机模式：发送关节目标并等待到达
         仿真模式：直接设置关节位置
         """
-        print(f"[GraspExecutor] Moving to initial joints: {self._initial_joints.tolist()}, gripper={self._initial_gripper}")
+        logger.info(f"Moving to initial joints: {self._initial_joints.tolist()}, gripper={self._initial_gripper}")
         use_simu_ik = self._use_simulation or (
             hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
         )
 
         if use_simu_ik:
             self._simu.set_joint_positions(self._initial_joints, gripper=self._initial_gripper)
-            self._simu.step(60)
+            self._simu.step(10)
         else:
             # 实机：发送关节角度目标
             self._real.set_joint_target(self._initial_joints)
@@ -583,16 +588,39 @@ class GraspExecutor:
                 current_joints = self._real.get_joint_state()
                 diff = np.max(np.abs(current_joints - self._initial_joints))
                 if diff < tolerance:
-                    print(f"[GraspExecutor] ✓ Reached initial joints (diff={diff:.1f}°)")
+                    logger.info(f"✓ Reached initial joints (diff={diff:.1f}°)")
                     return
                 time.sleep(0.1)
 
             final_joints = self._real.get_joint_state()
             final_diff = np.max(np.abs(final_joints - self._initial_joints))
-            print(f"[GraspExecutor] Initial joint timeout (diff={final_diff:.1f}°, tol={tolerance}°)")
+            logger.info(f"Initial joint timeout (diff={final_diff:.1f}°, tol={tolerance}°)")
 
     def is_executing(self) -> bool:
         return self._is_executing
+
+    @property
+    def initial_joints(self) -> np.ndarray:
+        """初始关节角度（度）"""
+        return self._initial_joints.copy()
+
+    @property
+    def initial_gripper(self) -> float:
+        """初始夹爪位置"""
+        return self._initial_gripper
+
+    @property
+    def gripper_close_position(self) -> float:
+        """夹爪闭合位置"""
+        return self._gripper_close_position
+
+    def euler_xyz_deg_to_rotmat(self, euler_deg: np.ndarray) -> np.ndarray:
+        """欧拉角(XYZ)转旋转矩阵的公共接口"""
+        return self._euler_xyz_deg_to_rotmat(euler_deg)
+
+    def move_to_position(self, pose: np.ndarray, timeout: float = 10.0, tolerance: float = 0.05) -> bool:
+        """移动到指定位姿的公共接口"""
+        return self._move_to_position(pose, timeout=timeout, tolerance=tolerance)
 
     def set_waypoint_delay(self, delay: float):
         self._waypoint_delay = max(0.01, delay)
@@ -606,13 +634,13 @@ class GraspExecutor:
         """
         self._micro_lift_height = max(0.005, micro_lift)  # 最小 5mm
         self._release_lift_height = max(0.01, release_lift)  # 最小 1cm
-        print(f"[GraspExecutor] Release lift heights set: micro={self._micro_lift_height*100:.1f}cm, release={self._release_lift_height*100:.1f}cm")
+        logger.info(f"Release lift heights set: micro={self._micro_lift_height*100:.1f}cm, release={self._release_lift_height*100:.1f}cm")
 
     def set_gripper_positions(self, open_pos: float, close_pos: float):
-        print(f"[GraspExecutor] set_gripper_positions called: open={open_pos}, close={close_pos}")
+        logger.info(f"set_gripper_positions called: open={open_pos}, close={close_pos}")
         self._gripper_open_position = np.clip(open_pos, 0.0, 1.0)
         self._gripper_close_position = np.clip(close_pos, 0.0, 1.0)
-        print(f"[GraspExecutor] After clip: open={self._gripper_open_position}, close={self._gripper_close_position}")
+        logger.info(f"After clip: open={self._gripper_open_position}, close={self._gripper_close_position}")
     
     def set_object_type(self, object_type: str):
         """设置物体类型，用于调整抓取策略
@@ -638,16 +666,16 @@ class GraspExecutor:
             pre_grasp_offset = self._get_pre_grasp_offset_for_object(object_type)
             grasp_offset = self._get_grasp_offset()
 
-            print(f"[GraspExecutor] Object type set to: {object_type}")
+            logger.info(f"Object type set to: {object_type}")
 
-            print(f"[GraspExecutor] Grasp offset: {grasp_offset.tolist()}, {offset_info['description']}")
+            logger.info(f"Grasp offset: {grasp_offset.tolist()}, {offset_info['description']}")
 
-            print(f"[GraspExecutor] Gripper config: open={gripper_open}, close={gripper_close}")
-            print(f"[GraspExecutor] End-effector orientation: {orientation.tolist()}")
-            print(f"[GraspExecutor] Pre-grasp offset: {pre_grasp_offset.tolist()}")
+            logger.info(f"Gripper config: open={gripper_open}, close={gripper_close}")
+            logger.info(f"End-effector orientation: {orientation.tolist()}")
+            logger.info(f"Pre-grasp offset: {pre_grasp_offset.tolist()}")
 
         else:
-            print(f"[GraspExecutor] Warning: Unknown object type '{object_type}', using default 'cube'")
+            logger.info(f"Warning: Unknown object type '{object_type}', using default 'cube'")
             self._object_type = self.OBJECT_TYPE_CUBE
     
     def _get_grasp_offset(self) -> np.ndarray:
@@ -740,8 +768,8 @@ class GraspExecutor:
         if gripper_map:
             self.set_gripper_positions_by_object(gripper_map)
 
-        print(
-            "[GraspExecutor] Object profiles applied: "
+        logger.info(
+            "Object profiles applied: "
             f"orientation={list(orientation_map.keys())}, "
             f"pre_grasp_offset={list(pre_grasp_map.keys())}, "
             f"grasp_offset={list(grasp_offset_map.keys())}, "
@@ -775,8 +803,8 @@ class GraspExecutor:
         self._object_grasp_offsets = {k: v for k, v in parsed_map.items() if k != "default"}
         self._default_grasp_offset = parsed_map.get("default", None)
 
-        print(
-            f"[GraspExecutor] Grasp offsets configured: default="
+        logger.info(
+            f"Grasp offsets configured: default="
             f"{None if self._default_grasp_offset is None else self._default_grasp_offset.tolist()}, "
             f"per_object={list(self._object_grasp_offsets.keys())}"
         )
@@ -824,8 +852,8 @@ class GraspExecutor:
             self._default_gripper_open = default_pair[0]
             self._default_gripper_close = default_pair[1]
 
-        print(
-            f"[GraspExecutor] Gripper positions configured: default="
+        logger.info(
+            f"Gripper positions configured: default="
             f"{None if default_pair is None else {'open': default_pair[0], 'close': default_pair[1]}}, "
             f"per_object={list(self._object_gripper_positions.keys())}"
         )
@@ -850,8 +878,8 @@ class GraspExecutor:
             self._default_pre_grasp_offset = np.array(offset[:3], dtype=float)
             self._object_pre_grasp_offsets = {}
 
-        print(
-            f"[GraspExecutor] Pre-grasp offset configured: default={self._default_pre_grasp_offset.tolist()}, "
+        logger.info(
+            f"Pre-grasp offset configured: default={self._default_pre_grasp_offset.tolist()}, "
             f"per_object={list(self._object_pre_grasp_offsets.keys())}"
         )
 
@@ -874,8 +902,8 @@ class GraspExecutor:
             self._default_orientation = np.array(orientation[:3], dtype=float)
             self._object_orientations = {}
 
-        print(
-            f"[GraspExecutor] Orientation configured: default={self._default_orientation.tolist()}, "
+        logger.info(
+            f"Orientation configured: default={self._default_orientation.tolist()}, "
             f"per_object={list(self._object_orientations.keys())}"
         )
 
@@ -916,23 +944,59 @@ class GraspExecutorWithInterpolation(GraspExecutor):
         self._interpolation_steps = interpolation_steps
 
     def _move_to_position(self, pose: np.ndarray) -> bool:
-        start_pose = self._real.get_cartesian_pose()
-        for i in range(self._interpolation_steps):
-            alpha = (i + 1) / self._interpolation_steps
-            interpolated = start_pose * (1 - alpha) + pose * alpha
-            self._real.move_cartesian(interpolated)
-            joint_state = self._real.get_joint_state()
-            self._simu.set_joint_target(joint_state)
-            time.sleep(0.01)
-        
-        current_pose = self._real.get_cartesian_pose()
-        pos_diff = np.linalg.norm(current_pose[:3] - pose[:3])
-        ori_diff = np.linalg.norm(current_pose[3:6] - pose[3:6])
-        print(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
-        print(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
-        print(f"  Diff: pos={pos_diff:.4f}m, ori={ori_diff:.2f}°")
-        
-        return True
+        use_simu_ik = self._use_simulation or (
+            hasattr(self._simu, 'is_ik_available') and self._simu.is_ik_available()
+        )
+
+        if use_simu_ik:
+            # 仿真模式：使用 IK 插值移动
+            target_pos = np.asarray(pose[:3], dtype=float)
+            target_ori = None
+            if len(pose) >= 6:
+                target_ori = self._euler_xyz_deg_to_rotmat(np.asarray(pose[3:6], dtype=float))
+
+            start_pos = self._simu.get_tcp_position()[0] if hasattr(self._simu, 'get_tcp_position') else target_pos
+            for i in range(self._interpolation_steps):
+                alpha = (i + 1) / self._interpolation_steps
+                interp_pos = start_pos * (1 - alpha) + target_pos * alpha
+                interp_ori = target_ori  # 姿态保持目标姿态
+                success = self._simu.move_to_cartesian(
+                    interp_pos,
+                    orientation=interp_ori,
+                    duration=0.02,
+                    steps=2,
+                )
+                if not success:
+                    break
+                time.sleep(0.01)
+
+            tcp_result = self._simu.get_tcp_position() if hasattr(self._simu, 'get_tcp_position') else None
+            if tcp_result is not None:
+                current_pos = tcp_result[0]
+                pos_diff = np.linalg.norm(current_pos - target_pos)
+                logger.debug(f"  Current: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
+                logger.debug(f"  Target:  [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
+                logger.debug(f"  Diff: pos={pos_diff:.4f}m")
+            return True
+        else:
+            # 实机模式：笛卡尔空间插值
+            start_pose = self._real.get_cartesian_pose()
+            for i in range(self._interpolation_steps):
+                alpha = (i + 1) / self._interpolation_steps
+                interpolated = start_pose * (1 - alpha) + pose * alpha
+                self._real.move_cartesian(interpolated)
+                joint_state = self._real.get_joint_state()
+                self._simu.set_joint_target(joint_state)
+                time.sleep(0.01)
+
+            current_pose = self._real.get_cartesian_pose()
+            pos_diff = np.linalg.norm(current_pose[:3] - pose[:3])
+            ori_diff = np.linalg.norm(current_pose[3:6] - pose[3:6])
+            logger.debug(f"  Current: [{current_pose[0]:.3f}, {current_pose[1]:.3f}, {current_pose[2]:.3f}]")
+            logger.debug(f"  Target:  [{pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}]")
+            logger.debug(f"  Diff: pos={pos_diff:.4f}m, ori={ori_diff:.2f}°")
+
+            return True
 
     def set_interpolation_steps(self, steps: int):
         self._interpolation_steps = max(1, steps)

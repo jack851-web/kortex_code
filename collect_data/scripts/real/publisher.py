@@ -6,6 +6,7 @@
 """
 import threading
 import time
+import logging
 import numpy as np
 from typing import Optional, Dict
 
@@ -14,6 +15,8 @@ from scripts.core.topic_defs import (
     REAL_IMAGES, REAL_JOINTS, REAL_CARTESIAN, REAL_GRIPPER, REAL_STATUS,
     ALL_REAL_TOPICS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RealPublisher:
@@ -46,7 +49,7 @@ class RealPublisher:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._publish_loop, daemon=True, name="RealPublisher")
         self._thread.start()
-        print(f"[RealPublisher] Started (fps={self._fps})")
+        logger.info(f"[RealPublisher] Started (fps={self._fps})")
 
     def stop(self):
         """停止发布线程"""
@@ -57,9 +60,9 @@ class RealPublisher:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             if self._thread.is_alive():
-                print("[RealPublisher] WARNING: thread did not stop within timeout")
+                logger.warning("[RealPublisher] WARNING: thread did not stop within timeout")
             self._thread = None
-        print("[RealPublisher] Stopped")
+        logger.info("[RealPublisher] Stopped")
 
     @property
     def is_running(self) -> bool:
@@ -83,7 +86,7 @@ class RealPublisher:
                 self._error_count += 1
                 self._broker.publish(REAL_STATUS, f"error: {e}")
                 if self._error_count <= 3:
-                    print(f"[RealPublisher] Error in publish loop: {e}")
+                    logger.error(f"[RealPublisher] Error in publish loop: {e}")
                 self._stop_event.wait(0.1)
 
     def _publish_once(self):
@@ -105,21 +108,21 @@ class RealPublisher:
                 joints = real.get_joint_state()
                 self._broker.publish(REAL_JOINTS, joints)
             except Exception:
-                pass
+                logger.debug("Failed to publish joints", exc_info=True)
 
             # 笛卡尔位姿
             try:
                 cartesian = real.get_cartesian_pose()
                 self._broker.publish(REAL_CARTESIAN, cartesian)
             except Exception:
-                pass
+                logger.debug("Failed to publish cartesian", exc_info=True)
 
             # 夹爪状态
             try:
                 gripper = real.get_gripper_state()
                 self._broker.publish(REAL_GRIPPER, gripper)
             except Exception:
-                pass
+                logger.debug("Failed to publish gripper", exc_info=True)
 
             self._broker.publish(REAL_STATUS, "connected")
 

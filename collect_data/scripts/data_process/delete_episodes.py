@@ -24,6 +24,8 @@
     from scripts.data_process.delete_episodes import delete_episodes_from_dataset
     delete_episodes_from_dataset("D:/VLA/data/simu_data", [3], "D:/VLA/data/simu_data_cleaned")
 """
+from __future__ import annotations
+
 import argparse
 import os
 import shutil

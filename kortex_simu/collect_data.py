@@ -1,11 +1,22 @@
 """
 使用 MuJoCo 官方库的数据收集脚本
+
+单位约定：
+  - 关节角度：度
+  - 夹爪：0.0=完全张开, 1.0=完全闭合
+
+注意：本脚本为最小可运行示例，action 为随机动作（伪实现），
+      仅用于验证数据集写入流程，不可用于实际训练数据采集。
 """
 import sys
 import random
 import numpy as np
 import os
+import logging
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # 添加 lerobot 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
@@ -112,22 +123,29 @@ class MujocoEnv:
         return self.get_state()
     
     def get_state(self):
-        """获取当前状态"""
-        # 获取关节角度 (使用正确的 qpos 地址)
-        qpos = np.array([self.data.qpos[addr] for addr in self.joint_qpos_addrs])
-        
+        """获取当前状态
+
+        Returns:
+            dict: 其中 qpos 统一为度数，tcp_euler 为度数，tcp_pos 为米
+        """
+        # 获取关节角度 (MuJoCo qpos 为弧度，统一转换为度数)
+        qpos_rad = np.array([self.data.qpos[addr] for addr in self.joint_qpos_addrs])
+        qpos_deg = np.rad2deg(qpos_rad)
+
         # 获取 TCP 位置和姿态
         tcp_pos = self.data.site_xpos[self.tcp_site_id].copy()
         tcp_rot = self.data.site_xmat[self.tcp_site_id].reshape(3, 3).copy()
-        
-        # 转换为欧拉角 (简化)
-        euler = self._rot2euler(tcp_rot)
-        
+
+        # 转换为欧拉角（度）
+        euler_rad = self._rot2euler(tcp_rot)
+        euler_deg = np.rad2deg(euler_rad)
+
         return {
-            'qpos': qpos,
-            'tcp_pos': tcp_pos,
+            'qpos': qpos_deg,           # 度
+            'qpos_rad': qpos_rad,       # 弧度（保留以便调试）
+            'tcp_pos': tcp_pos,         # 米
             'tcp_rot': tcp_rot,
-            'tcp_euler': euler,
+            'tcp_euler': euler_deg,     # 度
             'obj_pos': self.data.xpos[self.cube_body_id].copy(),
         }
     
@@ -148,28 +166,30 @@ class MujocoEnv:
     def step(self, action, n_steps=50):
         """
         执行动作
-        action: [6个关节角度 + 1个夹爪开合]
-        n_steps: 仿真步数（默认50步，约0.1秒）
+
+        Args:
+            action: [6个关节角度(度) + 1个夹爪开合(0.0=张开, 1.0=闭合)]
+            n_steps: 仿真步数（默认50步，约0.1秒）
         """
-        # 直接设置关节位置 (类似 test_physics.py 的方式)
+        # 输入为度数，转换为弧度写入 qpos
         for i, addr in enumerate(self.joint_qpos_addrs):
-            self.data.qpos[addr] = action[i]
-        
-        # 设置夹爪位置
+            self.data.qpos[addr] = np.deg2rad(action[i])
+
+        # 设置夹爪位置（0.0=张开, 1.0=闭合）
         gripper_cmd = action[6] if len(action) > 6 else 0.0
         for addr in self.gripper_qpos_addrs:
             self.data.qpos[addr] = gripper_cmd
-        
+
         # 前向运动学更新位置
         mujoco.mj_forward(self.model, self.data)
-        
+
         # 执行多步仿真，让物理特性生效
         for _ in range(n_steps):
             mujoco.mj_step(self.model, self.data)
             # 同步更新查看器
             if self.viewer is not None and self.viewer.is_running():
                 self.viewer.sync()
-        
+
         return self.get_state()
     
     def close(self):
@@ -180,11 +200,11 @@ class MujocoEnv:
     def get_camera_image(self, camera_name):
         """获取相机图像"""
         try:
-            cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
             self.renderer.update_scene(self.data, camera=camera_name)
             img = self.renderer.render()
             return img
-        except:
+        except Exception as e:
+            logger.warning(f"get_camera_image({camera_name}) failed: {e}")
             return None
     
     def check_success(self):
@@ -213,7 +233,7 @@ def main():
             shutil.rmtree(ROOT)
         else:
             create_new = False
-    
+
     if create_new:
         dataset = LeRobotDataset.create(
             repo_id=REPO_NAME,
@@ -228,13 +248,13 @@ def main():
                 },
                 "observation.state": {
                     "dtype": "float32",
-                    "shape": (6,),
-                    "names": ["state"],
+                    "shape": (10,),  # 6关节角(度) + 1夹爪 + 3末端位姿(米)
+                    "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper", "ee_x", "ee_y", "ee_z"],
                 },
                 "action": {
                     "dtype": "float32",
-                    "shape": (7,),
-                    "names": ["action"],
+                    "shape": (7,),  # 6关节角(度) + 1夹爪
+                    "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper"],
                 },
                 "obj_init": {
                     "dtype": "float32",
@@ -247,58 +267,70 @@ def main():
         )
     else:
         dataset = LeRobotDataset(REPO_NAME, root=ROOT)
-    
+
     print("\n使用 MuJoCo 官方库")
     print("按 Ctrl+C 退出")
-    
+
     episode_id = 0
     record_flag = False
-    
-    # 简单的随机动作示例
+
+    # 简单的随机动作示例（伪实现：仅用于验证数据集写入流程）
     try:
         while episode_id < NUM_DEMO:
-            # 随机动作
-            action = np.random.randn(7) * 0.1
-            action[6] = np.random.rand()  # 夹爪
-            
+            # 随机动作：6 关节角度增量（度） + 1 夹爪（0=张开, 1=闭合）
+            action = np.random.randn(7) * 5.0  # 关节增量，单位度
+            action[6] = float(np.random.rand())  # 夹爪
+
             # 执行动作
             state = env.step(action)
-            
+
             # 获取图像
             img = env.get_camera_image('agentview')
             if img is None:
                 img = np.zeros((256, 256, 3), dtype=np.uint8)
-            
+
             # 调整图像大小
             img = np.ascontiguousarray(Image.fromarray(img).resize((256, 256)))
-            
+
             # 检查成功
             if env.check_success():
                 print(f"Episode {episode_id} completed!")
                 dataset.save_episode()
                 env.reset()
                 episode_id += 1
-            
+
             # 记录数据
             if record_flag:
+                # 构建 state: 6 关节角(度) + 1 夹爪 + 3 末端位姿(米)
+                state_vec = np.array(
+                    list(state['qpos']) +
+                    [float(action[6])] +
+                    list(state['tcp_pos']),
+                    dtype=np.float32,
+                )
                 dataset.add_frame({
                     "observation.image": img,
-                    "observation.state": state['tcp_euler'].astype(np.float32),
+                    "observation.state": state_vec,
                     "action": action.astype(np.float32),
                     "obj_init": env.obj_init_pos.astype(np.float32),
                 }, task=TASK_NAME)
-            
+
             # 开始记录
             if not record_flag:
                 record_flag = True
                 print("Start recording!")
-                
+
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     finally:
         # 关闭环境
         env.close()
-    
+        # 终结数据集写入
+        try:
+            dataset.finalize()
+        except Exception as e:
+            logger.warning(f"dataset.finalize() failed: {e}")
+
     print("Cleanup completed.")
 
 

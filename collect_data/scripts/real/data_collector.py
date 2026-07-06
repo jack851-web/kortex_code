@@ -12,10 +12,17 @@
 import json
 import time
 import gc
+import os
+import shutil
+import logging
+import traceback
 import numpy as np
 import threading
 from typing import Dict, List, Any
 from pathlib import Path
+from scripts.core.data_utils import parse_task_description, save_progress, load_progress
+
+logger = logging.getLogger(__name__)
 
 
 MAX_EPISODE_FRAMES = 5000
@@ -108,7 +115,8 @@ class RealDataCollector:
             self._broker.subscribe(REAL_CARTESIAN, self._on_broker_cartesian)
             self._broker.subscribe(REAL_GRIPPER, self._on_broker_gripper)
 
-        self._save_progress()
+        # 恢复已有进度（不主动创建文件）
+        self._episode_count = load_progress(self._data_root)
 
     # ================================================================
     # Broker 回调
@@ -132,8 +140,6 @@ class RealDataCollector:
 
     def _init_lerobot_dataset(self):
         """创建或恢复 LeRobot 数据集（纯本地模式，不连接 HuggingFace）"""
-        import os
-        import shutil
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         # 强制离线模式：覆盖已有设置，禁止任何 HF 网络请求
@@ -163,11 +169,11 @@ class RealDataCollector:
         if needs_create:
             # 清理旧目录后重新创建
             if self._data_root.exists():
-                print(f"[RealDataCollector] Removing incomplete dataset: {self._data_root}")
+                logger.info(f"[RealDataCollector] Removing incomplete dataset: {self._data_root}")
                 try:
                     shutil.rmtree(self._data_root)
                 except Exception as e:
-                    print(f"[RealDataCollector] Warning: Failed to remove: {e}")
+                    logger.warning(f"[RealDataCollector] Failed to remove: {e}")
 
             self._dataset = LeRobotDataset.create(
                 repo_id=self._repo_id,
@@ -181,9 +187,9 @@ class RealDataCollector:
                 metadata_buffer_size=10,
                 encoder_queue_maxsize=30,
             )
-            print(f"[RealDataCollector] LeRobot dataset created at {self._data_root}")
+            logger.info(f"[RealDataCollector] LeRobot dataset created at {self._data_root}")
         else:
-            print(f"[RealDataCollector] Loading existing LeRobot dataset from {self._data_root}")
+            logger.info(f"[RealDataCollector] Loading existing LeRobot dataset from {self._data_root}")
             self._dataset = LeRobotDataset(
                 repo_id=self._repo_id,
                 root=self._data_root,
@@ -202,7 +208,7 @@ class RealDataCollector:
                     preset=None,
                     queue_maxsize=30,
                 )
-                print(f"[RealDataCollector] Re-initialized streaming encoder for existing dataset")
+                logger.info(f"[RealDataCollector] Re-initialized streaming encoder for existing dataset")
 
     def start_collection(self):
         """开始数据收集：初始化 LeRobot 数据集 + 启动采集线程"""
@@ -217,7 +223,7 @@ class RealDataCollector:
         self._is_collecting = True
         self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
         self._collect_thread.start()
-        print("[RealDataCollector] Started (LeRobot mode)")
+        logger.info("[RealDataCollector] Started (LeRobot mode)")
 
     def stop_collection(self):
         if not self._is_collecting:
@@ -234,19 +240,19 @@ class RealDataCollector:
             if self._dataset.episode_buffer.get("size", 0) > 0:
                 try:
                     self._dataset.save_episode()
-                    print("[RealDataCollector] Saved remaining episode buffer on stop")
+                    logger.info("[RealDataCollector] Saved remaining episode buffer on stop")
                 except Exception as e:
-                    print(f"[RealDataCollector] Warning: failed to save remaining buffer: {e}")
+                    logger.warning(f"[RealDataCollector] failed to save remaining buffer: {e}")
             try:
                 self._dataset.finalize()
             except Exception as e:
-                print(f"[RealDataCollector] Warning: finalize error: {e}")
+                logger.warning(f"[RealDataCollector] finalize error: {e}")
             self._dataset = None
 
-        print("[RealDataCollector] Stopped")
+        logger.info("[RealDataCollector] Stopped")
 
     def _collect_loop(self):
-        print(f"[RealDataCollector] Loop started (target FPS: {self._fps})")
+        logger.info(f"[RealDataCollector] Loop started (target FPS: {self._fps})")
 
         while not self._stop_event.is_set():
             loop_start = time.time()
@@ -318,15 +324,14 @@ class RealDataCollector:
 
                     # 诊断：前5帧打印关节值，确认是原始范围还是0-1
                     if self._frame_count <= 5:
-                        print(f"[RealDataCollector] Frame {self._frame_count} raw state: "
+                        logger.info(f"[RealDataCollector] Frame {self._frame_count} raw state: "
                               f"j1={state_vec[0]:.1f}° j2={state_vec[1]:.1f}° "
                               f"j5={state_vec[4]:.1f}° j6={state_vec[5]:.1f}° "
                               f"gripper={state_vec[6]:.3f} ee_z={state_vec[9]:.4f}m")
 
             except Exception as e:
-                print(f"[RealDataCollector] Error: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"[RealDataCollector] Error: {e}")
+                logger.debug(traceback.format_exc())
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, (1.0 / self._fps) - elapsed)
@@ -344,7 +349,7 @@ class RealDataCollector:
         self._camera_names = camera_names
 
         # 解析任务描述
-        self._task_description = self._parse_task_description(task_info)
+        self._task_description = parse_task_description(task_info)
 
         with self._data_lock:
             self._frame_count = 0
@@ -362,227 +367,19 @@ class RealDataCollector:
 
             self._dataset.episode_buffer = self._dataset.create_episode_buffer()
 
-        print(f"[RealDataCollector] Episode {episode_id} started (LeRobot mode, task: {self._task_description})")
+        logger.info(f"[RealDataCollector] Episode {episode_id} started (LeRobot mode, task: {self._task_description})")
 
     def start_recording(self):
         with self._data_lock:
             self._task_save_point = self._frame_count
         self._is_recording = True
-        print(f"[RealDataCollector] Recording started, save point: frame={self._task_save_point}")
+        logger.info(f"[RealDataCollector] Recording started, save point: frame={self._task_save_point}")
 
     def stop_recording(self):
         self._is_recording = False
         with self._data_lock:
             self._last_task_end_point = self._frame_count
-        print("[RealDataCollector] Recording stopped")
-
-    def delete_last_episode(self) -> bool:
-        """删除最后一个已保存的 episode（用于重做任务时清理旧数据）
-
-        注意：此方法会重新编码视频文件，确保数据一致性。
-
-        Returns:
-            bool: 是否成功删除
-        """
-        import pandas as pd
-        import av
-        import shutil
-
-        with self._data_lock:
-            if self._dataset is None:
-                print("[RealDataCollector] No dataset to delete from")
-                return False
-
-            # 获取当前 episode 数量
-            total_episodes = self._dataset.meta.total_episodes
-            if total_episodes == 0:
-                print("[RealDataCollector] No episodes to delete")
-                return False
-
-            last_episode_idx = total_episodes - 1
-            print(f"[RealDataCollector] Deleting episode {last_episode_idx} (with video re-encoding)...")
-
-            try:
-                # 1. 从 parquet 数据中删除该 episode 的行
-                data_dir = self._data_root / "data" / "chunk-000"
-                if data_dir.exists():
-                    for parquet_file in data_dir.glob("*.parquet"):
-                        try:
-                            df = pd.read_parquet(parquet_file)
-                        except Exception as e:
-                            print(f"[RealDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
-                            try:
-                                parquet_file.unlink()
-                                print(f"[RealDataCollector] Deleted corrupted file: {parquet_file.name}")
-                            except Exception:
-                                pass
-                            continue
-                        if "episode_index" in df.columns:
-                            original_len = len(df)
-                            df = df[df["episode_index"] != last_episode_idx]
-                            if len(df) < original_len:
-                                df.to_parquet(parquet_file, index=False)
-                                print(f"[RealDataCollector] Removed episode {last_episode_idx} from {parquet_file.name}")
-
-                # 2. 重新编码视频（移除被删除episode的帧）
-                self._reencode_videos_without_episode(last_episode_idx)
-
-                # 3. 更新 meta/info.json
-                info_path = self._data_root / "meta" / "info.json"
-                if info_path.exists():
-                    with open(info_path, "r") as f:
-                        info = json.load(f)
-                    info["total_episodes"] = total_episodes - 1
-                    # 重新计算 total_frames
-                    total_frames = 0
-                    if data_dir.exists():
-                        for pf in data_dir.glob("*.parquet"):
-                            try:
-                                pdf = pd.read_parquet(pf)
-                                total_frames += len(pdf)
-                            except Exception:
-                                pass
-                    info["total_frames"] = total_frames
-                    with open(info_path, "w") as f:
-                        json.dump(info, f, indent=2)
-                    print(f"[RealDataCollector] Updated info.json: total_episodes = {total_episodes - 1}")
-
-                # 4. 更新 meta/tasks.parquet
-                tasks_path = self._data_root / "meta" / "tasks.parquet"
-                if tasks_path.exists():
-                    try:
-                        tasks_df = pd.read_parquet(tasks_path)
-                        if "episode" in tasks_df.columns:
-                            tasks_df = tasks_df[tasks_df["episode"] != last_episode_idx]
-                            tasks_df.to_parquet(tasks_path, index=False)
-                            print(f"[RealDataCollector] Removed episode {last_episode_idx} from tasks.parquet")
-                    except Exception as e:
-                        print(f"[RealDataCollector] Warning: Failed to update tasks.parquet: {e}")
-
-                # 5. 更新 meta/episodes parquet
-                self._update_episodes_parquet_after_delete(last_episode_idx)
-
-                # 6. 更新 dataset 元数据
-                self._dataset.meta.total_episodes = total_episodes - 1
-
-                print(f"[RealDataCollector] Episode {last_episode_idx} deleted successfully")
-                return True
-
-            except Exception as e:
-                print(f"[RealDataCollector] Failed to delete episode: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
-
-    def _reencode_videos_without_episode(self, episode_to_delete: int):
-        """重新编码视频，移除指定episode的帧"""
-        import av
-        import shutil
-        import pandas as pd
-
-        # 获取所有视频目录
-        videos_dir = self._data_root / "videos"
-        if not videos_dir.exists():
-            return
-
-        # 读取parquet获取每个episode的帧范围
-        data_dir = self._data_root / "data" / "chunk-000"
-        if not data_dir.exists():
-            return
-
-        # 收集所有episode的帧范围
-        episode_frames = {}  # episode_index -> list of frame indices
-        for parquet_file in sorted(data_dir.glob("*.parquet")):
-            try:
-                df = pd.read_parquet(parquet_file)
-            except Exception:
-                continue  # 跳过损坏的文件
-            if "episode_index" in df.columns and "frame_index" in df.columns:
-                for ep_idx in df["episode_index"].unique():
-                    if ep_idx not in episode_frames:
-                        episode_frames[ep_idx] = []
-                    ep_df = df[df["episode_index"] == ep_idx]
-                    episode_frames[ep_idx].extend(ep_df["frame_index"].tolist())
-
-        if not episode_frames:
-            return
-
-        # 确定要保留的帧索引（全局）
-        frames_to_keep = set()
-        for ep_idx, frames in episode_frames.items():
-            if ep_idx != episode_to_delete:
-                frames_to_keep.update(frames)
-
-        # 对每个视频key进行处理
-        for video_key_dir in videos_dir.iterdir():
-            if not video_key_dir.is_dir():
-                continue
-            video_key = video_key_dir.name
-
-            # 处理每个视频文件
-            for chunk_dir in video_key_dir.glob("chunk-*"):
-                for video_file in sorted(chunk_dir.glob("*.mp4")):
-                    print(f"[RealDataCollector] Re-encoding {video_file}...")
-
-                    # 创建临时文件
-                    temp_video = video_file.with_suffix(".temp.mp4")
-
-                    try:
-                        # 使用PyAV解码和重新编码
-                        with av.open(str(video_file)) as input_container:
-                            input_stream = input_container.streams.video[0]
-
-                            # 创建输出容器
-                            with av.open(str(temp_video), 'w') as output_container:
-                                output_stream = output_container.add_stream('libx264', rate=30)
-                                output_stream.width = input_stream.width
-                                output_stream.height = input_stream.height
-                                output_stream.pix_fmt = 'yuv420p'
-                                output_stream.options = {'crf': '23'}
-
-                                frame_idx = 0
-                                for packet in input_container.demux(input_stream):
-                                    for frame in packet.decode():
-                                        if frame_idx in frames_to_keep:
-                                            # 重新编码这帧
-                                            frame.pict_type = None  # 重置帧类型让编码器决定
-                                            output_container.mux(output_stream.encode(frame))
-                                        frame_idx += 1
-
-                                # 刷新编码器
-                                for packet in output_stream.encode():
-                                    output_container.mux(packet)
-
-                        # 替换原文件
-                        temp_video.replace(video_file)
-                        print(f"[RealDataCollector] Re-encoded {video_file.name} ({frame_idx} frames, kept {len(frames_to_keep)})")
-
-                    except Exception as e:
-                        print(f"[RealDataCollector] Failed to re-encode {video_file}: {e}")
-                        if temp_video.exists():
-                            temp_video.unlink()
-
-    def _update_episodes_parquet_after_delete(self, deleted_episode_idx: int):
-        """删除episode后更新meta/episodes parquet文件"""
-        import pandas as pd
-
-        episodes_dir = self._data_root / "meta" / "episodes"
-        if not episodes_dir.exists():
-            return
-
-        for chunk_dir in episodes_dir.glob("chunk-*"):
-            for parquet_file in sorted(chunk_dir.glob("*.parquet")):
-                try:
-                    df = pd.read_parquet(parquet_file)
-                except Exception as e:
-                    print(f"[RealDataCollector] Warning: Failed to read {parquet_file.name}: {e}")
-                    continue
-                if "episode_index" in df.columns:
-                    original_len = len(df)
-                    df = df[df["episode_index"] != deleted_episode_idx]
-                    if len(df) < original_len:
-                        df.to_parquet(parquet_file, index=False)
-                        print(f"[RealDataCollector] Updated {parquet_file.name}")
+        logger.info("[RealDataCollector] Recording stopped")
 
     def discard_current_task(self):
         """丢弃当前任务的数据"""
@@ -595,7 +392,7 @@ class RealDataCollector:
                 ep_idx = self._dataset.meta.total_episodes
                 self._dataset.episode_buffer = self._dataset.create_episode_buffer(ep_idx)
 
-            print(f"[RealDataCollector] Current task data discarded, reverted to frame={save_point}")
+            logger.info(f"[RealDataCollector] Current task data discarded, reverted to frame={save_point}")
 
     def end_episode(self, episode_id: int, success: bool = True):
         """结束 episode，保存到 LeRobot 数据集"""
@@ -612,16 +409,15 @@ class RealDataCollector:
                 try:
                     self._dataset.save_episode()
                     self._patch_info_json()  # 补全 total_videos 等字段
-                    print(f"[RealDataCollector] Episode {episode_id} saved to LeRobot ({num_frames} frames)")
+                    logger.info(f"[RealDataCollector] Episode {episode_id} saved to LeRobot ({num_frames} frames)")
                 except Exception as e:
-                    print(f"[RealDataCollector] Save error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    logger.error(f"[RealDataCollector] Save error: {e}")
+                    logger.debug(traceback.format_exc())
             elif num_frames == 0:
-                print(f"[RealDataCollector] Episode {episode_id}: No frames collected, skipping save")
+                logger.info(f"[RealDataCollector] Episode {episode_id}: No frames collected, skipping save")
 
             elapsed = time.time() - t0
-            print(f"[RealDataCollector] Episode {episode_id} completed in {elapsed:.1f}s")
+            logger.info(f"[RealDataCollector] Episode {episode_id} completed in {elapsed:.1f}s")
 
             self._frame_count = 0
             self._prev_state = None
@@ -667,13 +463,13 @@ class RealDataCollector:
             if patched:
                 with open(info_path, "w") as f:
                     json.dump(info, f, indent=2)
-                print(f"[RealDataCollector] Patched info.json")
+                logger.info(f"[RealDataCollector] Patched info.json")
 
             # 生成 episodes parquet（rerun 需要）
             self._write_episodes_parquet()
 
         except Exception as e:
-            print(f"[RealDataCollector] Warning: failed to patch metadata: {e}")
+            logger.warning(f"[RealDataCollector] failed to patch metadata: {e}")
 
     def _write_episodes_parquet(self):
         """生成 meta/episodes/chunk-000/file-000.parquet（v3 格式，rerun 可视化需要）"""
@@ -716,9 +512,9 @@ class RealDataCollector:
             if legacy_jsonl.exists():
                 legacy_jsonl.unlink()
 
-            print(f"[RealDataCollector] Generated {episodes_path} ({total_episodes} episodes)")
+            logger.info(f"[RealDataCollector] Generated {episodes_path} ({total_episodes} episodes)")
         except Exception as e:
-            print(f"[RealDataCollector] Warning: failed to generate episodes parquet: {e}")
+            logger.warning(f"[RealDataCollector] failed to generate episodes parquet: {e}")
 
     def _estimate_episode_length(self, episode_index, total_episodes):
         """估算单个 episode 的帧数"""
@@ -731,7 +527,7 @@ class RealDataCollector:
                 if state_key in stats:
                     return stats[state_key].get("count", 0) // total_episodes
             except Exception:
-                pass
+                logger.debug("Failed to read stats for frames_per_episode", exc_info=True)
         return 0
 
     def finalize(self):
@@ -739,39 +535,17 @@ class RealDataCollector:
         if self._dataset is not None:
             try:
                 self._dataset.finalize()
-                print("[RealDataCollector] Dataset finalized")
+                logger.info("[RealDataCollector] Dataset finalized")
             except Exception as e:
-                print(f"[RealDataCollector] Finalize error: {e}")
+                logger.info(f"[RealDataCollector] Finalize error: {e}")
             # 补全 rerun 需要的字段
             self._patch_info_json()
             self._dataset = None
 
-    def _parse_task_description(self, task_info: Dict[str, Any]) -> str:
-        """从 task_info 解析出任务描述字符串"""
-        if "tasks" in task_info:
-            tasks = task_info["tasks"]
-            if isinstance(tasks, list) and len(tasks) > 0:
-                last_task = tasks[-1]
-                desc = last_task.get("task_name", "") or last_task.get("description", "")
-                if desc:
-                    return desc
-
-        desc = task_info.get("task_name", "") or task_info.get("description", "")
-        return desc if desc else "Grasp the object"
-
     def save_progress(self):
         """保存收集进度（公共接口）"""
-        self._save_progress()
-
-    def _save_progress(self):
-        self._data_root.mkdir(parents=True, exist_ok=True)
-        progress_file = self._data_root / "progress.json"
-        with open(progress_file, "w") as f:
-            json.dump({"episode_count": self._episode_count}, f, indent=2)
+        save_progress(self._data_root, self._episode_count)
 
     def load_progress(self) -> int:
-        progress_file = self._data_root / "progress.json"
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                self._episode_count = json.load(f).get("episode_count", 0)
+        self._episode_count = load_progress(self._data_root)
         return self._episode_count

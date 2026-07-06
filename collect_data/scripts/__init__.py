@@ -23,14 +23,14 @@ from scripts.core import (
 
 # 真实机器人模块
 from scripts.real import (
-    RealInterface, MockRealInterface, RobotNotConnectedError,
+    RealInterface, RealStubInterface, RobotNotConnectedError,
     RealPublisher, RealDataCollector,
     SimpleCamera, CameraManager,
 )
 
 # 仿真模块
 from scripts.simu import (
-    SimuInterface, MockSimuInterface,
+    SimuInterface, SimuStubInterface,
     SimuPublisher, SimuDataCollector,
     SimuManager, SimuRenderProcess,
 )
@@ -55,11 +55,11 @@ __all__ = [
     'ALL_COLLECT_TOPICS',
     'resolve_path', 'resolve_config_paths',
     # Real
-    'RealInterface', 'MockRealInterface', 'RobotNotConnectedError',
+    'RealInterface', 'RealStubInterface', 'RobotNotConnectedError',
     'RealPublisher', 'RealDataCollector',
     'SimpleCamera', 'CameraManager',
     # Simu
-    'SimuInterface', 'MockSimuInterface',
+    'SimuInterface', 'SimuStubInterface',
     'SimuPublisher', 'SimuDataCollector',
     'SimuManager', 'SimuRenderProcess',
     # Control

@@ -85,26 +85,52 @@ def create_robot_config() -> Gen3LiteConfig:
     )
 
 
-def keyboard_control(action: np.ndarray, gripper_state: bool) -> tuple[np.ndarray, bool, bool, bool]:
+def keyboard_control(action: np.ndarray, gripper_state: float) -> tuple[np.ndarray, bool, bool, float]:
     """
     键盘控制机械臂
-    
+
+    单位约定：
+      - 关节角度增量：度
+      - gripper_state: 0.0=完全张开, 1.0=完全闭合
+
     Returns:
         (action, reset, exit, gripper_state)
     """
-    import msvcrt  # Windows 专用
-    
-    delta = np.zeros(6)
     reset = False
     exit_flag = False
-    
-    # 检测按键 (非阻塞)
-    if msvcrt.kbhit():
-        key = msvcrt.getch()
-        key_char = key.decode('utf-8', errors='ignore').lower()
-        
-        step = 0.1  # 关节移动步长 (弧度)
-        
+    delta = np.zeros(6)
+
+    # 跨平台非阻塞键盘读取
+    key_char = ""
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                key_char = key.decode('utf-8', errors='ignore').lower()
+        except ImportError:
+            pass
+    else:
+        # POSIX 终端非阻塞读取（select + termios）
+        try:
+            import select
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                if rlist:
+                    key_char = sys.stdin.read(1).lower()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            pass
+
+    if key_char:
+        step = 5.0  # 关节移动步长（度）
+
         if key_char == 'w':
             delta[0] = -step
         elif key_char == 's':
@@ -130,13 +156,15 @@ def keyboard_control(action: np.ndarray, gripper_state: bool) -> tuple[np.ndarra
         elif key_char == 'h':
             delta[5] = step
         elif key_char == ' ':
-            gripper_state = not gripper_state
+            # 切换夹爪：0.0(张开) <-> 1.0(闭合)
+            gripper_state = 0.0 if gripper_state > 0.5 else 1.0
         elif key_char == 'z':
             reset = True
         elif key_char == 'x':
             exit_flag = True
-    
-    action = np.concatenate([delta, [float(gripper_state), float(gripper_state)]])  # 6 joints + 2 fingers
+
+    # action: 6 joints(deg) + finger1 + finger2，双指同值
+    action = np.concatenate([delta, [gripper_state, gripper_state]])
     return action, reset, exit_flag, gripper_state
 
 
@@ -165,7 +193,7 @@ def main():
             },
             "observation.state": {
                 "dtype": "float32",
-                "shape": (22,),  # 6 pos + 6 vel + 6 ee + 3 gripper (finger1, finger2, avg)
+                "shape": (21,),  # 6 pos + 6 vel + 6 ee + 3 gripper (finger1, finger2, avg)
             },
             "action": {
                 "dtype": "float32",
@@ -208,7 +236,7 @@ def main():
     print("-" * 40)
     
     episode_id = 0
-    gripper_state = False
+    gripper_state = 0.0  # 0.0=张开, 1.0=闭合
     action = np.zeros(8)  # 6 joints + 2 fingers
     recording = False
     frame_count = 0
@@ -232,10 +260,10 @@ def main():
                     state.append(obs[f"{joint}.pos"])
                 if f"{joint}.vel" in obs:
                     state.append(obs[f"{joint}.vel"])
-            # 末端位姿
+            # 末端位姿（位置米，姿态度）
             for key in ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz"]:
                 state.append(obs.get(key, 0.0))
-            # 双指夹爪
+            # 双指夹爪（0.0=张开, 1.0=闭合）
             state.append(obs.get("gripper.finger_1.pos", 0.0))
             state.append(obs.get("gripper.finger_2.pos", 0.0))
             state.append(obs.get("gripper.pos", 0.0))
@@ -275,7 +303,7 @@ def main():
                 frame = {
                     "observation.image": images.get("observation.image", np.zeros((480, 640, 3), dtype=np.uint8)),
                     "observation.wrist_image": images.get("observation.wrist_image", np.zeros((480, 640, 3), dtype=np.uint8)),
-                    "observation.state": np.array(state[:19], dtype=np.float32),
+                    "observation.state": np.array(state[:21], dtype=np.float32),  # 21 维
                     "action": action.astype(np.float32),
                 }
                 dataset.add_frame(frame)

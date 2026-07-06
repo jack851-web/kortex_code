@@ -1,27 +1,12 @@
 from __future__ import annotations
 
-# Apply protobuf compatibility fix at the very beginning
+# Apply protobuf compatibility fix at the very beginning (单次修复，避免重复)
 import collections
 if not hasattr(collections, 'MutableSequence'):
     import collections.abc
     collections.MutableSequence = collections.abc.MutableSequence
 
 # Fix other potential missing attributes for complete compatibility
-missing_attrs = [
-    'MutableMapping', 'MutableSet', 'MutableSequence',
-    'Mapping', 'Set', 'Sequence', 'ByteString'
-]
-
-for attr in missing_attrs:
-    if not hasattr(collections, attr):
-        import collections.abc
-        setattr(collections, attr, getattr(collections.abc, attr))
-
-import collections
-if not hasattr(collections, 'MutableSequence'):
-    import collections.abc
-    collections.MutableSequence = collections.abc.MutableSequence
-
 missing_attrs = [
     'MutableMapping', 'MutableSet', 'MutableSequence',
     'Mapping', 'Set', 'Sequence', 'ByteString'
@@ -64,17 +49,26 @@ from kortex_api.Exceptions.KServerException import KServerException
 
 from .config_gen3_lite import Gen3LiteConfig
 
+# 模块级 logger
+logger = logging.getLogger(__name__)
+
+# 单位约定：
+#   - 关节角度统一使用"度"（degree），范围按 Kinova Gen3 Lite 实际硬件规格
+#   - 夹爪位置统一使用 0.0=完全张开, 1.0=完全闭合
+# Kinova Gen3 Lite 实际关节限位（度）— 来源：Kinova 官方规格书
 JOINT_LIMITS = {
-    "joint_1": {"min": 0.0, "max": 360.0},
-    "joint_2": {"min": 0.0, "max": 360.0},
-    "joint_3": {"min": 0.0, "max": 360.0},
-    "joint_4": {"min": 0.0, "max": 360.0},
-    "joint_5": {"min": 0.0, "max": 360.0},
-    "joint_6": {"min": 0.0, "max": 360.0},
+    "joint_1": {"min": -180.0, "max": 180.0},
+    "joint_2": {"min": -89.0, "max": 89.0},
+    "joint_3": {"min": -180.0, "max": 180.0},
+    "joint_4": {"min": -157.5, "max": 157.5},
+    "joint_5": {"min": -180.0, "max": 180.0},
+    "joint_6": {"min": -180.0, "max": 180.0},
 }
 
+# 夹爪限位：0.0=完全张开, 1.0=完全闭合
 GRIPPER_LIMITS = {"min": 0.0, "max": 1.0}
 
+# Home 位置（度）
 HOME_POSITION = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
@@ -141,13 +135,18 @@ class Gen3Lite(Robot):
     
     @property
     def is_connected(self) -> bool:
-        return self.router is not None and all(cam.is_connected for cam in self.cameras.values())
+        # 路由器必须存在；相机若配置了则必须全部连接（空字典时不强制要求）
+        if self.router is None:
+            return False
+        if self.cameras:
+            return all(cam.is_connected for cam in self.cameras.values())
+        return True
     
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         # 创建连接
         self.transport = TCPTransport()
-        self.error_callback = lambda e: print('[--ERROR--] {}'.format(e))
+        self.error_callback = lambda e: logger.error('[Kortex] %s', e)
         self.router = RouterClient(self.transport, self.error_callback)
         self.transport.connect(self.config.ip_address, 10000)
 
@@ -163,15 +162,15 @@ class Gen3Lite(Robot):
         # 创建服务
         self.base = BaseClient(self.router)
         self.base_cyclic = BaseCyclicClient(self.router)
-        
+
         # 连接相机
         for cam in self.cameras.values():
             cam.connect()
-        
+
         # 配置机器人
         self.configure()
-        
-        print(f"{self} connected.")
+
+        logger.info("%s connected.", self)
     
     @property
     def is_calibrated(self) -> bool:
@@ -206,16 +205,16 @@ class Gen3Lite(Robot):
     def get_observation(self) -> RobotObservation:
         obs = {}
         
-        # 获取关节状态
+        # 获取关节状态（Kortex API 返回角度，单位：度）
         try:
             joint_angles = self.base.GetMeasuredJointAngles()
             for i, joint_angle in enumerate(joint_angles.joint_angles):
                 joint_name = self.joint_names[i]
                 obs[f"{joint_name}.pos"] = joint_angle.value
         except KServerException as ex:
-            print(f"Error getting joint angles: {ex}")
-        
-        # 获取笛卡尔空间状态
+            logger.error("Error getting joint angles: %s", ex)
+
+        # 获取笛卡尔空间状态（位置单位：米；姿态单位：度）
         try:
             feedback = self.base_cyclic.RefreshFeedback()
             obs["ee.x"] = feedback.base.tool_pose_x
@@ -225,9 +224,10 @@ class Gen3Lite(Robot):
             obs["ee.wy"] = feedback.base.tool_pose_theta_y
             obs["ee.wz"] = feedback.base.tool_pose_theta_z
         except KServerException as ex:
-            print(f"Error getting cartesian pose: {ex}")
-        
+            logger.error("Error getting cartesian pose: %s", ex)
+
         # 获取夹爪状态 (2-Finger 夹爪有两个手指)
+        # 语义：0.0=完全张开, 1.0=完全闭合
         if self.config.gripper_enabled:
             try:
                 grip_request = Base_pb2.GripperRequest()
@@ -244,7 +244,7 @@ class Gen3Lite(Robot):
                     obs["gripper.finger_1.pos"] = grip_measure.finger[0].value
                     obs["gripper.finger_2.pos"] = grip_measure.finger[0].value
             except KServerException as ex:
-                print(f"Error getting gripper position: {ex}")
+                logger.error("Error getting gripper position: %s", ex)
         
         # 获取相机图像
         for cam_key, cam in self.cameras.items():
@@ -352,10 +352,10 @@ class Gen3Lite(Robot):
             self.base.ExecuteAction(action)
             finished = e.wait(self.action_timeout)
             if not finished:
-                print(f"Warning: Action '{action_name}' timeout")
+                logger.warning("Action '%s' timeout", action_name)
             return finished
         except KServerException as ex:
-            print(f"Error executing cartesian action: {ex}")
+            logger.error("Error executing cartesian action: %s", ex)
             self.arm_stop()
             return False
         finally:
@@ -395,10 +395,10 @@ class Gen3Lite(Robot):
             self.base.ExecuteAction(action)
             finished = e.wait(self.action_timeout)
             if not finished:
-                print(f"Warning: Action '{action_name}' timeout")
+                logger.warning("Action '%s' timeout", action_name)
             return finished
         except KServerException as ex:
-            print(f"Error executing action: {ex}")
+            logger.error("Error executing action: %s", ex)
             self.arm_stop()
             return False
         finally:
@@ -406,10 +406,10 @@ class Gen3Lite(Robot):
     
     def _check_joint_limits(self, jointangles: list) -> bool:
         """检查关节角度是否在安全限位内
-        
+
         Args:
-            jointangles: 关节角度列表
-            
+            jointangles: 关节角度列表（单位：度）
+
         Returns:
             bool: 是否在限位内
         """
@@ -417,44 +417,48 @@ class Gen3Lite(Robot):
             if i >= len(self.joint_names):
                 break
             joint_name = self.joint_names[i]
-            limits = JOINT_LIMITS.get(joint_name, {"min": 0.0, "max": 360.0})
+            limits = JOINT_LIMITS.get(joint_name, {"min": -180.0, "max": 180.0})
             if not (limits["min"] <= angle <= limits["max"]):
-                print(f"Warning: {joint_name} angle {angle:.4f} exceeds limits [{limits['min']}, {limits['max']}]")
+                logger.warning("%s angle %.4f exceeds limits [%.2f, %.2f]",
+                               joint_name, angle, limits['min'], limits['max'])
                 return False
         return True
-    
+
     def _check_gripper_limits(self, position: float) -> bool:
         """检查夹爪位置是否在安全限位内
-        
+
         Args:
-            position: 夹爪位置
-            
+            position: 夹爪位置（0.0=张开, 1.0=闭合）
+
         Returns:
             bool: 是否在限位内
         """
         if not (GRIPPER_LIMITS["min"] <= position <= GRIPPER_LIMITS["max"]):
-            print(f"Warning: Gripper position {position:.4f} exceeds limits [{GRIPPER_LIMITS['min']}, {GRIPPER_LIMITS['max']}]")
+            logger.warning("Gripper position %.4f exceeds limits [%.2f, %.2f]",
+                           position, GRIPPER_LIMITS['min'], GRIPPER_LIMITS['max'])
             return False
         return True
-    
+
     def _action_notification_callback(self, event: threading.Event):
         """动作通知回调函数
-        
+
         Args:
             event: 线程事件对象
         """
         def callback(notification):
-            print(f"[--EVENT--] {Base_pb2.ActionEvent.Name(notification.action_event)}")
+            logger.debug("[Kortex Event] %s",
+                         Base_pb2.ActionEvent.Name(notification.action_event))
             if notification.action_event in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
                 event.set()
         return callback
 
-    def arm_move_angular_speed(self, speeds):
+    def arm_move_angular_speed(self, speeds, duration: float = 0.1):
         """关节速度控制
-        
+
         Args:
-            speeds: 关节速度列表 [speed1, speed2, speed3, speed4, speed5, speed6]
-        
+            speeds: 关节速度列表 [speed1, speed2, speed3, speed4, speed5, speed6]（单位：度/秒）
+            duration: 速度指令持续时间（秒），默认 0.1s
+
         Returns:
             bool: 命令是否成功发送
         """
@@ -462,13 +466,13 @@ class Gen3Lite(Robot):
 
         for i, speed in enumerate(speeds):
             joint_speed = joint_speeds.joint_speeds.add()
-            joint_speed.joint_identifier = i 
+            joint_speed.joint_identifier = i
             joint_speed.value = speed
-            joint_speed.duration = 0
-        
+            joint_speed.duration = int(duration * 1000)  # 转为毫秒
+
         self.base.SendJointSpeedsCommand(joint_speeds)
         return True
-    
+
     def arm_stop(self):
         """停止机械臂运动"""
         self.base.Stop()
@@ -480,17 +484,19 @@ class Gen3Lite(Robot):
             time.sleep(0.5)
             self.base.ClearFaults()
             time.sleep(1.0)
-            print("Faults cleared successfully")
+            logger.info("Faults cleared successfully")
             return True
         except Exception as e:
-            print(f"Failed to clear faults: {e}")
+            logger.error("Failed to clear faults: %s", e)
             return False
 
     def gripper_move_position(self, position, finger_id: int = None):
         """控制夹爪位置 (2-Finger 夹爪)
-        
+
+        语义约定：0.0=完全张开, 1.0=完全闭合
+
         Args:
-            position: 夹爪位置，范围通常为 0.0-1.0
+            position: 夹爪位置，范围 0.0(张开) ~ 1.0(闭合)
             finger_id: 手指ID，1=手指1, 2=手指2, None=两个手指同时
         """
         grip_command = Base_pb2.GripperCommand()
@@ -512,10 +518,12 @@ class Gen3Lite(Robot):
     
     def gripper_move_individual(self, finger1_pos: float, finger2_pos: float):
         """分别控制两个手指的位置
-        
+
+        语义约定：0.0=完全张开, 1.0=完全闭合
+
         Args:
-            finger1_pos: 手指1位置 (0.0-1.0)
-            finger2_pos: 手指2位置 (0.0-1.0)
+            finger1_pos: 手指1位置 (0.0=张开, 1.0=闭合)
+            finger2_pos: 手指2位置 (0.0=张开, 1.0=闭合)
         """
         grip_command = Base_pb2.GripperCommand()
         grip_command.mode = Base_pb2.GRIPPER_POSITION
@@ -561,5 +569,5 @@ class Gen3Lite(Robot):
         
         for cam in self.cameras.values():
             cam.disconnect()
-        
-        print(f"{self} disconnected.")
+
+        logger.info("%s disconnected.", self)

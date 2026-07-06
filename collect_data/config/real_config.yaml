@@ -74,4 +74,25 @@ tasks:
     object_position: [0.07, 0.4, 0.01]
     plate_position: [0.358, 0.329, 0.02]
     description: "grasp mug and place to right side"
- 
+
+# ============================================================
+# 遥操作（手机 ARCore 远程控制）配置
+# ============================================================
+teleop:
+  # 位置/姿态增量放大倍数
+  position_scale: 1.0
+  orientation_scale: 0.5
+  # 速度限幅（保证安全）
+  max_linear_speed: 0.5        # 米/秒
+  max_angular_speed: 30.0      # 度/秒
+  # ARCore 增量位姿预计频率（用于把"每帧增量"换算为"速度"做限幅）
+  delta_frequency: 30.0
+  # WebSocket 服务端配置
+  websocket:
+    # 关键：必须为 PC 局域网 IP（或 0.0.0.0 监听所有网卡），
+    # 不能用 127.0.0.1（手机无法访问回环地址）
+    host: "0.0.0.0"
+    port: 8765
+    # 心跳与超时（秒），需与 App 端 AppConstants 保持一致
+    heartbeat_interval: 3.0
+    heartbeat_timeout: 15.0

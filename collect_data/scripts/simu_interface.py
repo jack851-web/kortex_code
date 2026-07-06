@@ -10,12 +10,16 @@ import mujoco.viewer
 import glfw
 import time
 import gc
+import logging
+import traceback
 import threading
 import xml.etree.ElementTree as ET
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
 from pathlib import Path
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Qt 延迟导入（仅在需要时使用）
 try:
@@ -28,10 +32,10 @@ except ImportError:
 # 添加 IK 模块路径
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'kortex_simu'))
 try:
-    from ik import MuJoCoIK, SimulationController
+    from ik import MuJoCoIK, SimulationController, DecoupledIKSolver
     IK_AVAILABLE = True
 except ImportError as e:
-    print(f"[SimuInterface] IK module not available: {e}")
+    logger.warning(f"[SimuInterface] IK module not available: {e}")
     IK_AVAILABLE = False
 
 
@@ -51,6 +55,12 @@ class SimuInterface:
         self._data = None
         self._xml_path = xml_path
         self._viewer = None
+
+        # 仿真步进计数器（参考 lerobot-mujoco-tutorial 设计）
+        # tick 是应用层计数器，与 MuJoCo 的 data.time 分离
+        # sim_time = data.time - _init_sim_time，reset 时重置基准
+        self._tick = 0
+        self._init_sim_time = 0.0  # data.time 的基准偏移量
         
         # GLFW 查看器 (用于 Mock 模式)
         self._glfw_window = None
@@ -70,6 +80,7 @@ class SimuInterface:
         self._joint_indices = []
         self._gripper_indices = []
         self._gripper_tip_indices = []
+        self._gripper_max_open = 0.8  # 从 actuator ctrlrange 动态更新
         self._body_names = []
         self._camera_names = camera_names or []
         self._camera_viewer_running = False
@@ -99,6 +110,12 @@ class SimuInterface:
         self._use_ik = use_ik and IK_AVAILABLE
         self._ik_solver: Optional[MuJoCoIK] = None
         self._sim_controller: Optional[SimulationController] = None
+        # v3: 解耦 IK(仿 vr-teleop-kit/ik/decoupled_ik.py)
+        # 位置子问题在 wrist-invariant 锚点跟踪,只动关节 1-3
+        # 姿态子问题在 tcp 处跟踪,只动关节 4-6
+        # 两子问题都是 3x3 DLS + 自适应阻尼
+        self._decoupled_ik: Optional["DecoupledIKSolver"] = None
+        self._use_decoupled_ik = True  # 默认开启,失败回退到旧 IK
         self._tcp_site_name = "tcp"
 
         # 动态物体配置
@@ -143,14 +160,14 @@ class SimuInterface:
                     try:
                         renderer._mjr_context.free()
                     except Exception:
-                        pass
+                        logger.debug("Failed to free mjr_context", exc_info=True)
                     renderer._mjr_context = None
                 if hasattr(renderer, '_scene') and renderer._scene is not None:
                     renderer._scene = None
                 if hasattr(renderer, '_gl_context'):
                     renderer._gl_context = None
             except Exception as e:
-                print(f"[SimuInterface] Error cleaning thread renderer (tid={tid}): {e}")
+                logger.warning(f"[SimuInterface] Error cleaning thread renderer (tid={tid}): {e}")
         self._thread_renderers.clear()
 
     def _build_scene_with_object(self, base_scene_xml: str, object_model_xml: str, object_body_name: Optional[str] = None) -> Optional[str]:
@@ -176,35 +193,6 @@ class SimuInterface:
 
         return result
 
-    def reload_scene_with_objects(
-        self, 
-        base_scene_xml: str, 
-        object_model_xml: str, 
-        object_body_name: Optional[str] = None,
-        plate_model_xml: Optional[str] = None,
-        plate_body_name: Optional[str] = None,
-        show_viewer: bool = False
-    ) -> bool:
-        """加载场景同时包含抓取物体和放置目标（碟子）"""
-        generated_xml = self._build_scene_with_objects(
-            base_scene_xml, object_model_xml, object_body_name,
-            plate_model_xml, plate_body_name
-        )
-        if not generated_xml:
-            return False
-
-        if object_body_name:
-            self._active_object_body_name = object_body_name
-
-        glfw_was_running = self._glfw_viewer_running
-        
-        result = self.initialize(generated_xml, show_viewer=False)
-        
-        if result and glfw_was_running:
-            self.start_glfw_viewer()
-        
-        return result
-
     def _build_scene_with_objects(
         self, 
         base_scene_xml: str, 
@@ -227,19 +215,19 @@ class SimuInterface:
             self._xml_path = xml_path
 
         if self._xml_path is None:
-            print("[SimuInterface] Error: No XML path provided")
+            logger.warning("[SimuInterface] Error: No XML path provided")
             return False
 
         init_thread_name = threading.current_thread().name
-        print(f"[SimuInterface] === initialize() starting on thread [{init_thread_name}] ===", flush=True)
+        logger.info(f"[SimuInterface] === initialize() starting on thread [{init_thread_name}] ===")
 
         try:
             # ============================================================
             # 阶段0：关闭 GLFW 查看器（必须在替换 model/data 之前）
             # ============================================================
-            print(f"[SimuInterface] >>> PHASE-0: closing GLFW viewer...", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-0: closing GLFW viewer...")
             self.close_glfw_viewer()
-            print(f"[SimuInterface] >>> PHASE-0: GLFW viewer closed", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-0: GLFW viewer closed")
 
             # 清理旧的 IK 求解器和模拟控制器（必须在加载新模型前，因为它们持有旧 MjData 引用）
             self._ik_solver = None
@@ -248,9 +236,9 @@ class SimuInterface:
             # ============================================================
             # 阶段1：安全释放旧的模型/渲染资源（全部在锁内完成）
             # ============================================================
-            print(f"[SimuInterface] >>> PHASE-1: acquiring lock for resource cleanup...", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-1: acquiring lock for resource cleanup...")
             with self._lock:
-                print(f"[SimuInterface] >>> PHASE-1: lock acquired", flush=True)
+                logger.info(f"[SimuInterface] >>> PHASE-1: lock acquired")
                 
                 # 显式释放旧的 MuJoCo 模型和数据
                 old_model = self._model
@@ -277,11 +265,11 @@ class SimuInterface:
                 # 跨线程调用 .close() 会触发跨线程 glfw 操作 → Windows C 层 segfault。
                 # 只清空引用，让 Python GC 安全回收（GLFW 窗口会随进程退出自动关闭）。
                 if self._viewer is not None:
-                    print(f"[SimuInterface] WARNING: Dropping old passive viewer reference "
-                          f"(was created on another thread, cannot safely close here)", flush=True)
+                    logger.warning(f"[SimuInterface] WARNING: Dropping old passive viewer reference "
+                          f"(was created on another thread, cannot safely close here)")
                     self._viewer = None
 
-            print(f"[SimuInterface] >>> PHASE-1: resource cleanup done, lock released", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-1: resource cleanup done, lock released")
 
             # 短暂等待 + 强制 GC，确保 OpenGL 和 MuJoCo 旧资源完全释放
             import time as _time
@@ -291,10 +279,13 @@ class SimuInterface:
             # ============================================================
             # 阶段2：加载新模型
             # ============================================================
-            print(f"[SimuInterface] >>> PHASE-2: loading model from {self._xml_path}", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-2: loading model from {self._xml_path}")
             self._model = mujoco.MjModel.from_xml_path(self._xml_path)
             self._data = mujoco.MjData(self._model)
-            print(f"[SimuInterface] >>> PHASE-2: model loaded OK", flush=True)
+            # 重置 tick 和 sim_time 基准（参考 lerobot-mujoco-tutorial 设计）
+            self._tick = 0
+            self._init_sim_time = self._data.time
+            logger.info(f"[SimuInterface] >>> PHASE-2: model loaded OK, tick reset to 0, init_sim_time={self._init_sim_time:.4f}")
             
             # 获取关节索引
             self._joint_indices = []
@@ -304,31 +295,31 @@ class SimuInterface:
                     self._joint_indices.append(idx)
                     qpos_idx = self._model.jnt_qposadr[idx]
                     current_val = self._data.qpos[qpos_idx]
-                    print(f"[SimuInterface] Joint {name}: id={idx}, qpos_idx={qpos_idx}, current_val={current_val:.4f} ({np.rad2deg(current_val):.2f} deg)")
-            print(f"[SimuInterface] Joint indices: {self._joint_indices}")
+                    logger.debug(f"[SimuInterface] Joint {name}: id={idx}, qpos_idx={qpos_idx}, current_val={current_val:.4f} ({np.rad2deg(current_val):.2f} deg)")
+            logger.debug(f"[SimuInterface] Joint indices: {self._joint_indices}")
             
             # 打印所有关节信息
-            print(f"[SimuInterface] Total joints: {self._model.njnt}, nq: {self._model.nq}")
+            logger.info(f"[SimuInterface] Total joints: {self._model.njnt}, nq: {self._model.nq}")
             try:
                 for i in range(self._model.njnt):
                     name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_JOINT, i)
                     qpos_idx = self._model.jnt_qposadr[i]
                     jnt_type = self._model.jnt_type[i]
-                    print(f"[SimuInterface] Joint[{i}]: name={name}, type={jnt_type}, qpos_idx={qpos_idx}")
+                    logger.debug(f"[SimuInterface] Joint[{i}]: name={name}, type={jnt_type}, qpos_idx={qpos_idx}")
             except Exception as e:
-                print(f"[SimuInterface] Error printing joint info: {e}")
+                logger.debug(f"[SimuInterface] Error printing joint info: {e}")
             
             # 打印前 20 个 qpos 值
             try:
-                print(f"[SimuInterface] First 20 qpos values: {self._data.qpos[:min(20, self._model.nq)]}")
+                logger.debug(f"[SimuInterface] First 20 qpos values: {self._data.qpos[:min(20, self._model.nq)]}")
             except Exception as e:
-                print(f"[SimuInterface] Error printing qpos: {e}")
+                logger.debug(f"[SimuInterface] Error printing qpos: {e}")
             
             # 打印执行器映射
             try:
                 self.print_actuator_mapping()
             except Exception as e:
-                print(f"[SimuInterface] Error printing actuator mapping: {e}")
+                logger.debug(f"[SimuInterface] Error printing actuator mapping: {e}")
             
             # 获取夹爪关节索引
             self._gripper_indices = []
@@ -336,7 +327,20 @@ class SimuInterface:
                 idx = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, name)
                 if idx >= 0:
                     self._gripper_indices.append(idx)
-            print(f"[SimuInterface] Gripper indices: {self._gripper_indices}")
+            logger.info(f"[SimuInterface] Gripper indices: {self._gripper_indices}")
+
+            # 从 actuator ctrlrange 动态读取夹爪最大开合值
+            if self._gripper_indices:
+                gripper_act_idx = None
+                for act_id in range(self._model.nu):
+                    act_trnid = self._model.actuator_trnid[act_id]
+                    if act_trnid[0] == self._gripper_indices[0]:
+                        gripper_act_idx = act_id
+                        break
+                if gripper_act_idx is not None:
+                    ctrl_range = self._model.actuator_ctrlrange[gripper_act_idx]
+                    self._gripper_max_open = float(ctrl_range[1])
+                    logger.info(f"[SimuInterface] Gripper max open from ctrlrange: {self._gripper_max_open}")
 
             # 获取夹爪指尖关节索引
             self._gripper_tip_indices = []
@@ -344,7 +348,7 @@ class SimuInterface:
                 idx = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, name)
                 if idx >= 0:
                     self._gripper_tip_indices.append(idx)
-            print(f"[SimuInterface] Gripper tip indices: {self._gripper_tip_indices}")
+            logger.info(f"[SimuInterface] Gripper tip indices: {self._gripper_tip_indices}")
 
             # 获取所有body名称
             self._body_names = []
@@ -359,60 +363,71 @@ class SimuInterface:
                 name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_CAMERA, i)
                 if name:
                     camera_names.append(name)
-            print(f"[SimuInterface] Found cameras: {camera_names}", flush=True)
+            logger.info(f"[SimuInterface] Found cameras: {camera_names}")
             
             # ============================================================
             # 阶段3：mj_forward + IK 初始化
             # ============================================================
-            print("[SimuInterface] >>> PHASE-3: mj_forward start", flush=True)
+            logger.info("[SimuInterface] >>> PHASE-3: mj_forward start")
             mujoco.mj_forward(self._model, self._data)
-            print("[SimuInterface] >>> PHASE-3: mj_forward done", flush=True)
+            logger.info("[SimuInterface] >>> PHASE-3: mj_forward done")
             
-            print(f"[SimuInterface] >>> PHASE-3: IK init, _use_ik={self._use_ik}, IK_AVAILABLE={IK_AVAILABLE}", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-3: IK init, _use_ik={self._use_ik}, IK_AVAILABLE={IK_AVAILABLE}")
             if self._use_ik and IK_AVAILABLE:
                 try:
-                    print("[SimuInterface] >>> PHASE-3: Creating MuJoCoIK...", flush=True)
+                    logger.info("[SimuInterface] >>> PHASE-3: Creating MuJoCoIK...")
                     self._ik_solver = MuJoCoIK(self._model, self._data, self._tcp_site_name)
-                    print(f"[SimuInterface] IK solver initialized", flush=True)
-                    print(f"[SimuInterface] IK joints: {self._ik_solver.joint_names}", flush=True)
+                    logger.info(f"[SimuInterface] IK solver initialized")
+                    logger.info(f"[SimuInterface] IK joints: {self._ik_solver.joint_names}")
                 except Exception as e:
-                    print(f"[SimuInterface] Failed to initialize IK: {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
+                    logger.warning(f"[SimuInterface] Failed to initialize IK: {e}")
+                    logger.debug(traceback.format_exc())
                     self._use_ik = False
+
+            # v3: 解耦 IK(与 MuJoCoIK 并存,默认走这条路径)
+            if self._use_ik and IK_AVAILABLE and self._use_decoupled_ik:
+                try:
+                    self._decoupled_ik = DecoupledIKSolver(
+                        self._model, self._data,
+                        tcp_site_name=self._tcp_site_name,
+                        j4_anchor_site_name="j4_anchor",
+                    )
+                    logger.info("[SimuInterface] DecoupledIK initialized")
+                except Exception as e:
+                    logger.warning(f"[SimuInterface] Failed to init DecoupledIK: {e}")
+                    self._decoupled_ik = None
             else:
-                print("[SimuInterface] >>> PHASE-3: SKIPPED (IK disabled)", flush=True)
-            print("[SimuInterface] >>> PHASE-3: IK init done", flush=True)
+                logger.info("[SimuInterface] >>> PHASE-3: SKIPPED (IK disabled)")
+            logger.info("[SimuInterface] >>> PHASE-3: IK init done")
             
             # ============================================================
             # 阶段4：启动查看器（仅在明确请求时）
             # ============================================================
-            print(f"[SimuInterface] >>> PHASE-4: start_viewer, show_viewer={show_viewer}", flush=True)
+            logger.info(f"[SimuInterface] >>> PHASE-4: start_viewer, show_viewer={show_viewer}")
             if show_viewer:
-                print("[SimuInterface] >>> PHASE-4: Calling start_viewer()...", flush=True)
+                logger.info("[SimuInterface] >>> PHASE-4: Calling start_viewer()...")
                 self.start_viewer()
-                print("[SimuInterface] >>> PHASE-4: start_viewer() returned", flush=True)
+                logger.info("[SimuInterface] >>> PHASE-4: start_viewer() returned")
             else:
-                print("[SimuInterface] >>> PHASE-4: SKIPPED (show_viewer=False)", flush=True)
+                logger.info("[SimuInterface] >>> PHASE-4: SKIPPED (show_viewer=False)")
             
-            print(f"[SimuInterface] Model initialized successfully", flush=True)
-            print(f"[SimuInterface] Bodies: {self._model.nbody}, Joints: {self._model.njnt}")
-            print(f"[SimuInterface] IK mode: {self._use_ik}")
+            logger.info(f"[SimuInterface] Model initialized successfully")
+            logger.info(f"[SimuInterface] Bodies: {self._model.nbody}, Joints: {self._model.njnt}")
+            logger.info(f"[SimuInterface] IK mode: {self._use_ik}")
 
             # 若进程渲染器已启用（如动态换物体后），重启以加载新的XML
             if self._use_process_renderer:
                 cam_names = list(self._camera_names)
                 self.stop_process_renderer()
                 self.start_process_renderer(cam_names)
-                print("[SimuInterface] Render process restarted for new scene")
+                logger.info("[SimuInterface] Render process restarted for new scene")
             
             return True
 
             
         except Exception as e:
-            print(f"[SimuInterface] Error initializing model: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[SimuInterface] Error initializing model: {e}")
+            logger.debug(traceback.format_exc())
             return False
     
     def start_viewer(self):
@@ -423,11 +438,10 @@ class SimuInterface:
             self._viewer.cam.azimuth = 45
             self._viewer.cam.elevation = -30
             self._viewer.cam.distance = 2.0
-            print("[SimuInterface] MuJoCo viewer started (passive mode)")
+            logger.info("[SimuInterface] MuJoCo viewer started (passive mode)")
         except Exception as e:
-            print(f"[SimuInterface] Failed to start viewer: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[SimuInterface] Failed to start viewer: {e}")
+            logger.debug(traceback.format_exc())
             self._viewer = None
     
     def start_glfw_viewer(self, width: int = 1200, height: int = 900, 
@@ -436,15 +450,15 @@ class SimuInterface:
         
         使用独立线程运行 GLFW 渲染循环，避免与 Qt 主线程冲突
         """
-        print(f"[SimuInterface] start_glfw_viewer called: width={width}, height={height}, title={title}")
-        print(f"[SimuInterface] _model={self._model is not None}, _data={self._data is not None}, _glfw_viewer_running={self._glfw_viewer_running}")
+        logger.info(f"[SimuInterface] start_glfw_viewer called: width={width}, height={height}, title={title}")
+        logger.debug(f"[SimuInterface] _model={self._model is not None}, _data={self._data is not None}, _glfw_viewer_running={self._glfw_viewer_running}")
         
         if self._model is None or self._data is None:
-            print("[SimuInterface] Cannot start viewer: model or data not initialized")
+            logger.warning("[SimuInterface] Cannot start viewer: model or data not initialized")
             return False
         
         if self._glfw_viewer_running:
-            print("[SimuInterface] GLFW viewer already running, skipping")
+            logger.warning("[SimuInterface] GLFW viewer already running, skipping")
             return True
         
         # 保存参数供线程使用
@@ -469,25 +483,25 @@ class SimuInterface:
             time.sleep(0.05)
         
         if self._glfw_viewer_running:
-            print(f"[SimuInterface] GLFW viewer started in separate thread: {width}x{height}")
+            logger.info(f"[SimuInterface] GLFW viewer started in separate thread: {width}x{height}")
             return True
         else:
-            print("[SimuInterface] GLFW viewer failed to start within timeout")
+            logger.warning("[SimuInterface] GLFW viewer failed to start within timeout")
             return False
     
     def _glfw_viewer_loop(self):
         """GLFW 查看器的主循环（在独立线程中运行）"""
         try:
-            print("[SimuInterface] [_glfw_viewer_loop] Starting...")
+            logger.info("[SimuInterface] [_glfw_viewer_loop] Starting...")
             
             # 初始化 GLFW（必须在创建窗口的线程中）
             # 注意：disconnect() 可能调用了 glfw.terminate()，需要重新 init
             if not SimuInterface._glfw_initialized:
                 if not glfw.init():
-                    print("[SimuInterface] Failed to initialize GLFW")
+                    logger.warning("[SimuInterface] Failed to initialize GLFW")
                     return
                 SimuInterface._glfw_initialized = True
-                print("[SimuInterface] GLFW initialized")
+                logger.info("[SimuInterface] GLFW initialized")
             
             # 设置窗口提示（在创建窗口前）
             glfw.window_hint(glfw.VISIBLE, glfw.TRUE)  # 确保窗口可见
@@ -499,15 +513,15 @@ class SimuInterface:
             )
             
             if not self._glfw_window:
-                print("[SimuInterface] Failed to create GLFW window")
+                logger.warning("[SimuInterface] Failed to create GLFW window")
                 return
             
-            print("[SimuInterface] GLFW window created")
+            logger.info("[SimuInterface] GLFW window created")
             glfw.make_context_current(self._glfw_window)
             glfw.swap_interval(1)
             
             framebuffer_width, framebuffer_height = glfw.get_framebuffer_size(self._glfw_window)
-            print(f"[SimuInterface] Framebuffer: {framebuffer_width}x{framebuffer_height}")
+            logger.info(f"[SimuInterface] Framebuffer: {framebuffer_width}x{framebuffer_height}")
             
             # 创建 MuJoCo 渲染资源（必须在 GL 上下文所在的线程）
             self._glfw_ctx = mujoco.MjrContext(self._model, mujoco.mjtFontScale.mjFONTSCALE_150)
@@ -531,9 +545,9 @@ class SimuInterface:
             
             # 显式显示窗口
             glfw.show_window(self._glfw_window)
-            print("[SimuInterface] GLFW window shown")
+            logger.info("[SimuInterface] GLFW window shown")
             
-            print("[SimuInterface] GLFW viewer running, entering render loop...")
+            logger.info("[SimuInterface] GLFW viewer running, entering render loop...")
             
             # 渲染循环
             import time as _time
@@ -549,17 +563,16 @@ class SimuInterface:
                 
                 # 每60帧打印一次状态
                 if self._render_frame_count % 60 == 0:
-                    print(f"[SimuInterface] Rendered {self._render_frame_count} frames")
+                    logger.info(f"[SimuInterface] Rendered {self._render_frame_count} frames")
                 
                 # 控制渲染频率 (~30 FPS，减少资源占用)
                 _time.sleep(0.033)
             
-            print(f"[SimuInterface] Exiting GLFW render loop, total frames: {self._render_frame_count}")
+            logger.info(f"[SimuInterface] Exiting GLFW render loop, total frames: {self._render_frame_count}")
             
         except Exception as e:
-            print(f"[SimuInterface] _glfw_viewer_loop error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[SimuInterface] _glfw_viewer_loop error: {e}")
+            logger.debug(traceback.format_exc())
         finally:
             self._glfw_viewer_running = False
             # 显式释放 MuJoCo GPU 资源（内部已调用 gc.collect()）
@@ -569,10 +582,10 @@ class SimuInterface:
                 try:
                     glfw.destroy_window(self._glfw_window)
                 except Exception:
-                    pass
+                    logger.debug("Failed to destroy GLFW window", exc_info=True)
                 self._glfw_window = None
             
-            print("[SimuInterface] GLFW viewer thread exited")
+            logger.info("[SimuInterface] GLFW viewer thread exited")
 
     def _glfw_render_frame(self):
         """渲染一帧（在线程渲染循环中调用）- 多视口布局
@@ -604,9 +617,10 @@ class SimuInterface:
             glfw.make_context_current(self._glfw_window)
             
             # 非阻塞锁：IK/step 持锁期间直接跳过帧，不阻塞等待
-            if not self._lock.acquire(blocking=False):
-                # 锁被占用，跳过此帧（只 poll 保持窗口响应，不 swap 旧画面避免闪烁）
+            if not self._lock.acquire(timeout=0.005):
+                # 锁被占用超过5ms，跳过渲染但仍然 poll 和 swap 保持窗口响应
                 glfw.poll_events()
+                glfw.swap_buffers(self._glfw_window)
                 return
             
             # === 诊断日志：前3帧打印每步状态 ===
@@ -617,27 +631,27 @@ class SimuInterface:
                 # 检查模型和数据是否有效
                 if self._model is None or self._data is None:
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: model/data is None, SKIP")
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: model/data is None, SKIP")
                     return
 
                 try:
                     mujoco.mj_forward(self._model, self._data)
                 except Exception as e:
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: mj_forward FAILED: {e}")
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: mj_forward FAILED: {e}")
                     return  # 模型可能已被重新加载，跳过此帧
                 
                 if do_diag:
-                    print(f"[GLFW-RENDER] tick={tick}: mj_forward OK")
+                    logger.debug(f"[GLFW-RENDER] tick={tick}: mj_forward OK")
 
                 viewport_width, viewport_height = glfw.get_framebuffer_size(self._glfw_window)
                 if viewport_width <= 0 or viewport_height <= 0:
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: bad viewport {viewport_width}x{viewport_height}, SKIP")
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: bad viewport {viewport_width}x{viewport_height}, SKIP")
                     return
                 
                 if do_diag:
-                    print(f"[GLFW-RENDER] tick={tick}: viewport={viewport_width}x{viewport_height}")
+                    logger.debug(f"[GLFW-RENDER] tick={tick}: viewport={viewport_width}x{viewport_height}")
 
                 overlay_w = int(viewport_width * 0.22)
                 overlay_h = int(viewport_height * 0.22)
@@ -650,16 +664,15 @@ class SimuInterface:
                         self._glfw_cam, mujoco.mjtCatBit.mjCAT_ALL, self._glfw_scn
                     )
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: mjv_updateScene OK (ngeom={self._glfw_scn.ngeom})")
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: mjv_updateScene OK (ngeom={self._glfw_scn.ngeom})")
                     
                     mujoco.mjr_render(main_viewport, self._glfw_scn, self._glfw_ctx)
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: mjr_render OK (main)")
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: mjr_render OK (main)")
                 except Exception as e:
                     if do_diag:
-                        print(f"[GLFW-RENDER] tick={tick}: render FAILED: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
+                        logger.debug(f"[GLFW-RENDER] tick={tick}: render FAILED: {e}")
+                        logger.debug(traceback.format_exc())
                     return  # 渲染失败，跳过此帧
 
                 # 使用 set_display_cameras() 设置的相机名称，分布于四角
@@ -690,19 +703,20 @@ class SimuInterface:
                             )
                             mujoco.mjr_render(overlay_viewport, self._glfw_scn, self._glfw_ctx)
                     except Exception:
-                        pass
+                        logger.debug("Overlay render failed", exc_info=True)
 
                 import time as _time
                 current_time = _time.time()
                 if not hasattr(self, '_start_time'):
                     self._start_time = current_time
 
-                sim_time = self._data.time if self._data else 0
+                # 使用应用层 tick 和 sim_time（避免 data.time 回溯）
+                sim_time = self.get_sim_time()
                 wall_time = current_time - self._start_time
                 self._render_tick = tick + 1
 
                 info_lines = [
-                    f"tick:        {tick:>6}",
+                    f"tick:        {self._tick:>6}",
                     f"sim time:    {sim_time:>8.2f}sec",
                     f"wall time:   {wall_time:>8.2f}sec",
                 ]
@@ -713,13 +727,13 @@ class SimuInterface:
                                      main_viewport,
                                      "\n".join(info_lines), "", self._glfw_ctx)
                 except Exception:
-                    pass
+                    logger.debug("Info text overlay failed", exc_info=True)
 
                 if do_diag:
-                    print(f"[GLFW-RENDER] tick={tick}: calling swap_buffers...", flush=True)
+                    logger.debug(f"[GLFW-RENDER] tick={tick}: calling swap_buffers...")
                 glfw.swap_buffers(self._glfw_window)
                 if do_diag:
-                    print(f"[GLFW-RENDER] tick={tick}: DONE", flush=True)
+                    logger.debug(f"[GLFW-RENDER] tick={tick}: DONE")
             finally:
                 self._lock.release()
 
@@ -730,9 +744,8 @@ class SimuInterface:
             if not hasattr(self, '_last_render_error_time') or \
                (hasattr(self, '_last_render_error_time') and 
                 (time.time() - self._last_render_error_time) > 1.0):
-                print(f"[SimuInterface] GLFW render frame error: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.warning(f"[SimuInterface] GLFW render frame error: {e}")
+                logger.debug(traceback.format_exc())
                 self._last_render_error_time = time.time()
 
     def _free_glfw_mujoco_resources(self):
@@ -747,7 +760,7 @@ class SimuInterface:
             try:
                 del self._glfw_ctx
             except Exception:
-                pass
+                logger.debug("Failed to delete _glfw_ctx", exc_info=True)
             self._glfw_ctx = None
         
         # MjvScene: 持有渲染缓冲区
@@ -755,7 +768,7 @@ class SimuInterface:
             try:
                 del self._glfw_scn
             except Exception:
-                pass
+                logger.debug("Failed to delete _glfw_scn", exc_info=True)
             self._glfw_scn = None
         
         # 其他 Mjv* 对象体积较小，直接置空即可
@@ -773,12 +786,12 @@ class SimuInterface:
         注意：GLFW 窗口必须在创建它的线程中销毁。
         这里只设置停止标志，让渲染线程自行清理资源。
         """
-        print(f"[SimuInterface] close_glfw_viewer called, _glfw_viewer_running={self._glfw_viewer_running}")
+        logger.info(f"[SimuInterface] close_glfw_viewer called, _glfw_viewer_running={self._glfw_viewer_running}")
         
         if not self._glfw_viewer_running:
             # 即使查看器未运行，也要确保残留资源被清理
             self._free_glfw_mujoco_resources()
-            print("[SimuInterface] GLFW viewer already stopped, resources cleaned")
+            logger.info("[SimuInterface] GLFW viewer already stopped, resources cleaned")
             return
         
         # 通知线程停止（线程会在 finally 块中清理所有资源）
@@ -790,7 +803,7 @@ class SimuInterface:
         if hasattr(self, '_glfw_thread') and self._glfw_thread and self._glfw_thread.is_alive():
             self._glfw_thread.join(timeout=5.0)
             if self._glfw_thread.is_alive():
-                print("[SimuInterface] Warning: GLFW thread did not stop within timeout")
+                logger.warning("[SimuInterface] Warning: GLFW thread did not stop within timeout")
                 # 线程超时未退出，强制清理 MuJoCo 资源（可能导致渲染线程崩溃，但避免资源泄漏）
                 self._free_glfw_mujoco_resources()
         
@@ -803,7 +816,7 @@ class SimuInterface:
         self._glfw_stop_event = None
         self._glfw_thread = None
         
-        print("[SimuInterface] GLFW viewer closed")
+        logger.info("[SimuInterface] GLFW viewer closed")
     
     def sync_viewer(self):
         """同步更新查看器 (被动模式)"""
@@ -822,18 +835,23 @@ class SimuInterface:
     
     def print_actuator_mapping(self):
         """打印执行器映射信息"""
-        print(f"[SimuInterface] Total actuators: {self._model.nu}")
+        logger.info(f"[SimuInterface] Total actuators: {self._model.nu}")
         for i in range(self._model.nu):
             actuator_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
-            print(f"[SimuInterface] Actuator[{i}]: {actuator_name}")
+            logger.info(f"[SimuInterface] Actuator[{i}]: {actuator_name}")
         
-        print(f"[SimuInterface] Joint to actuator mapping:")
+        logger.debug(f"[SimuInterface] Joint to actuator mapping:")
         for i, joint_idx in enumerate(self._joint_indices):
             joint_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint_idx)
             ctrl_idx = self._get_ctrl_idx_for_joint(joint_idx)
-            print(f"[SimuInterface] Joint {joint_name} (idx={joint_idx}) -> Actuator idx={ctrl_idx}")
+            logger.debug(f"[SimuInterface] Joint {joint_name} (idx={joint_idx}) -> Actuator idx={ctrl_idx}")
 
     def get_joint_state(self) -> np.ndarray:
+        """获取关节状态。
+
+        Returns:
+            np.ndarray: 6 维关节角度，单位：度（与 set_joint_target 输入单位一致）
+        """
         with self._lock:
             # 在锁内检查，避免并发问题
             if self._model is None or self._data is None:
@@ -843,11 +861,11 @@ class SimuInterface:
                 for joint_idx in self._joint_indices:
                     qpos_idx = self._model.jnt_qposadr[joint_idx]
                     joint_positions.append(self._data.qpos[qpos_idx])
-                result = np.array(joint_positions)
-                # print(f"[SimuInterface] get_joint_state: {np.rad2deg(result)}")
+                # MuJoCo 内部 qpos 单位为弧度，统一转换为度数返回
+                result = np.rad2deg(np.array(joint_positions))
                 return result
             except Exception as e:
-                print(f"[SimuInterface] get_joint_state error: {e}")
+                logger.warning(f"[SimuInterface] get_joint_state error: {e}")
                 return np.zeros(6)
 
     def set_joint_positions(self, positions: np.ndarray, gripper: float = None) -> bool:
@@ -893,7 +911,7 @@ class SimuInterface:
                 mujoco.mj_forward(self._model, self._data)
                 return True
             except Exception as e:
-                print(f"[SimuInterface] set_joint_positions error: {e}")
+                logger.warning(f"[SimuInterface] set_joint_positions error: {e}")
                 return False
 
     def set_joint_target(self, positions: np.ndarray) -> bool:
@@ -916,10 +934,10 @@ class SimuInterface:
                             clipped_val = np.clip(positions_rad[i], ctrl_range[0], ctrl_range[1])
                             self._data.ctrl[ctrl_idx] = clipped_val
                         else:
-                            print(f"[SimuInterface] Warning: No actuator found for joint {i} (idx={joint_idx})")
+                            logger.warning(f"[SimuInterface] Warning: No actuator found for joint {i} (idx={joint_idx})")
                 return True
             except Exception as e:
-                print(f"[SimuInterface] set_joint_target error: {e}")
+                logger.warning(f"[SimuInterface] set_joint_target error: {e}")
                 return False
 
     def get_gripper_state(self) -> float:
@@ -932,9 +950,9 @@ class SimuInterface:
                 if len(self._gripper_indices) > 0:
                     qpos_idx = self._model.jnt_qposadr[self._gripper_indices[0]]
                     joint_pos = self._data.qpos[qpos_idx]
-                    # RIGHT_BOTTOM: 0.8 (张开) -> 0 (闭合)
-                    # 映射回 0-1: position = 1 - joint_pos / 0.8
-                    return np.clip(1 - joint_pos / 0.8, 0.0, 1.0)
+                    # RIGHT_BOTTOM: max_open (张开) -> 0 (闭合)
+                    # 映射回 0-1: position = 1 - joint_pos / max_open
+                    return np.clip(1 - joint_pos / self._gripper_max_open, 0.0, 1.0)
                 return 0.0
             except Exception:
                 return 0.0
@@ -986,7 +1004,7 @@ class SimuInterface:
                     self._data.ctrl[ctrl_idx] = np.clip(joint_pos, ctrl_range[0], ctrl_range[1])
                 return True
             except Exception as e:
-                print(f"[SimuInterface] sync_control_to_current_state error: {e}")
+                logger.warning(f"[SimuInterface] sync_control_to_current_state error: {e}")
                 return False
 
 
@@ -1057,7 +1075,7 @@ class SimuInterface:
                             current_bottom_z = min(bottom_site_z_list)
                             dz = float(position[2]) - current_bottom_z
                             self._data.qpos[qpos_adr+2] += dz
-                            print(f"[SimuInterface] set_object_position bottom-align(site): target_bottom_z={position[2]:.4f}, current_bottom_z={current_bottom_z:.4f}, dz={dz:.4f}")
+                            logger.debug(f"[SimuInterface] set_object_position bottom-align(site): target_bottom_z={position[2]:.4f}, current_bottom_z={current_bottom_z:.4f}, dz={dz:.4f}")
                         else:
                             subtree_geom_ids = []
                             for g in range(self._model.ngeom):
@@ -1072,7 +1090,7 @@ class SimuInterface:
                                 )
                                 dz = float(position[2]) - current_bottom_z
                                 self._data.qpos[qpos_adr+2] += dz
-                                print(f"[SimuInterface] set_object_position bottom-align(geom): target_bottom_z={position[2]:.4f}, current_bottom_z={current_bottom_z:.4f}, dz={dz:.4f}")
+                                logger.debug(f"[SimuInterface] set_object_position bottom-align(geom): target_bottom_z={position[2]:.4f}, current_bottom_z={current_bottom_z:.4f}, dz={dz:.4f}")
                             else:
                                 # 兜底：没有site/geom时直接设置 z
                                 self._data.qpos[qpos_adr+2] = position[2]
@@ -1090,35 +1108,70 @@ class SimuInterface:
 
                 return True
             except Exception as e:
-                print(f"[SimuInterface] set_object_position error: {e}")
+                logger.warning(f"[SimuInterface] set_object_position error: {e}")
                 return False
 
-    def enable_object_physics(self, enabled: bool = True):
-        """启用或禁用物块物理控制。启用后，物块由物理引擎控制，不再强制设置位置。"""
-        self._object_physics_enabled = enabled
-        print(f"[SimuInterface] Object physics enabled: {enabled}")
+    def step(self, n_steps: int = 1):
+        """推进仿真 n_steps 步
 
-    def step(self, n_steps: int = 1000):
+        参考 lerobot-mujoco-tutorial 设计：
+        - 一次性调用 mj_step(model, data, nstep=n_steps)，避免分段锁的上下文切换开销
+        - 每次 step 后增加 _tick 计数器
+        - sim_time 通过 data.time - _init_sim_time 计算，避免回溯
+
+        Args:
+            n_steps: 推进步数，默认 1
+        """
         if self._model is None or self._data is None:
             return
 
-        # 分段执行：每 _lock_chunk 步释放一次锁，让 GLFW viewer 和
-        # SimuPublisher 有机会获取锁更新画面/采集数据
-        _lock_chunk = 20  # 每次持锁执行的步数
-        steps_done = 0
-
-        while steps_done < n_steps:
-            chunk = min(_lock_chunk, n_steps - steps_done)
+        # 分段执行：n_steps > 10 时分两次，中间释放锁让 GLFW 渲染线程能获取锁
+        # 避免长时间持锁导致 GLFW 渲染卡顿
+        if n_steps <= 10:
             with self._lock:
-                if steps_done == 0:
-                    self._sync_gripper_tips()
-                for _ in range(chunk):
-                    mujoco.mj_step(self._model, self._data)
-                self.sync_viewer()
-            steps_done += chunk
-            # 每个 chunk 之间让出，给 GLFW viewer 和 SimuPublisher 获取锁的机会
-            if steps_done < n_steps:
-                time.sleep(0.001)
+                self._sync_gripper_tips()
+                mujoco.mj_step(self._model, self._data, nstep=n_steps)
+                self._tick += n_steps
+                if self._viewer is not None and not self._glfw_viewer_running:
+                    try:
+                        self._viewer.sync()
+                    except Exception:
+                        pass
+        else:
+            # 分两段执行
+            half = n_steps // 2
+            remaining = n_steps - half
+            # 第一段
+            with self._lock:
+                self._sync_gripper_tips()
+                mujoco.mj_step(self._model, self._data, nstep=half)
+                self._tick += half
+                if self._viewer is not None and not self._glfw_viewer_running:
+                    try:
+                        self._viewer.sync()
+                    except Exception:
+                        pass
+            # 短暂释放锁，让 GLFW 渲染线程有机会获取锁
+            # 注意：不调用 time.sleep(0)，避免不必要的调度开销
+            # 第二段
+            with self._lock:
+                mujoco.mj_step(self._model, self._data, nstep=remaining)
+                self._tick += remaining
+                if self._viewer is not None and not self._glfw_viewer_running:
+                    try:
+                        self._viewer.sync()
+                    except Exception:
+                        pass
+
+    def get_sim_time(self) -> float:
+        """获取仿真经过时间（相对于 init_sim_time，避免回溯）
+
+        参考 lerobot-mujoco-tutorial: sim_time = data.time - init_sim_time
+        """
+        with self._lock:
+            if self._data is None:
+                return 0.0
+            return self._data.time - self._init_sim_time
 
     def _sync_gripper_tips(self):
         """同步夹爪指尖关节位置（TIP 始终保持为 0）"""
@@ -1152,7 +1205,7 @@ class SimuInterface:
                 try:
                     renderer._mjr_context.free()
                 except Exception:
-                    pass
+                    logger.debug("Failed to free mjr_context", exc_info=True)
                 renderer._mjr_context = None
             # 释放 MjvScene（渲染缓冲区）
             if hasattr(renderer, '_scene') and renderer._scene is not None:
@@ -1163,7 +1216,7 @@ class SimuInterface:
                     try:
                         renderer._gl_context.free()
                     except Exception:
-                        pass
+                        logger.debug("Failed to free gl_context", exc_info=True)
                     renderer._gl_context = None
             else:
                 # 线程切换/initialize 场景：不能跨线程调用 glfw.destroy_window()
@@ -1176,7 +1229,7 @@ class SimuInterface:
                         gl_ctx._context = None
                     renderer._gl_context = None
         except Exception:
-            pass
+            logger.debug("Renderer cleanup failed", exc_info=True)
 
     def _ensure_renderer_for_current_thread(self):
         """确保当前线程有可用的 Renderer
@@ -1200,11 +1253,11 @@ class SimuInterface:
         self._thread_renderers.clear()
 
         # 创建新的全局 renderer
-        print(f"[SimuInterface] Creating new Renderer (thread: {threading.current_thread().name})")
+        logger.info(f"[SimuInterface] Creating new Renderer (thread: {threading.current_thread().name})")
         try:
             self._renderer = mujoco.Renderer(self._model, height=self._render_height, width=self._render_width)
         except Exception as e:
-            print(f"[SimuInterface] Failed to create renderer: {e}")
+            logger.warning(f"[SimuInterface] Failed to create renderer: {e}")
             self._renderer = None
             return
         self._renderer_thread_id = threading.get_ident()
@@ -1237,7 +1290,7 @@ class SimuInterface:
 
                 
             except Exception as e:
-                print(f"[SimuInterface] Render error: {e}")
+                logger.warning(f"[SimuInterface] Render error: {e}")
                 return np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)
 
     def get_camera_images(self, camera_names: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
@@ -1249,13 +1302,14 @@ class SimuInterface:
                 # 每次渲染前同步关节/夹爪/物体状态，避免首任务未加载和帧错位
                 with self._lock:
                     try:
-                        joints_rad = self.get_joint_state()
-                        self._render_process.update_joints(np.rad2deg(joints_rad))
+                        # get_joint_state 已返回度数
+                        joints_deg = self.get_joint_state()
+                        self._render_process.update_joints(joints_deg)
                         self._render_process.update_gripper(self.get_gripper_state())
                         obj_pos = self.get_object_position(self._active_object_body_name)
                         self._render_process.update_object_position(obj_pos)
                     except Exception as e:
-                        print(f"[SimuInterface] process-render sync error: {e}")
+                        logger.warning(f"[SimuInterface] process-render sync error: {e}")
 
                 proc_images = self._render_process.get_images()
                 # 仅返回请求相机，防止字典残留/错配
@@ -1270,10 +1324,14 @@ class SimuInterface:
 
         images = {}
 
-        # 采集期间：非采集线程的渲染请求直接返回空帧，避免 GL context 跨线程竞争
-        if self._collecting_active and threading.current_thread() != getattr(self, '_collector_thread_id', None):
+        # 采集期间：非采集线程的渲染请求直接返回空帧，避免 GL context 跨线程竞争。
+        # 注意：data_collector 通过 collect_frame 在控制循环线程中调用 get_camera_images，
+        # 该线程会被记录为 _collector_thread_id，从而允许获取真实图像。
+        # 但 _collector_thread_id 可能未设置（旧路径），此时不阻断，避免录制黑帧。
+        collector_tid = getattr(self, '_collector_thread_id', None)
+        if self._collecting_active and collector_tid is not None and threading.current_thread() != collector_tid:
             if do_diag:
-                print(f"[GET-CAM] #{diag_cnt}: collecting active + non-collector -> empty frames", flush=True)
+                logger.debug(f"[GET-CAM] #{diag_cnt}: collecting active + non-collector -> empty frames")
             self._get_cam_diag_cnt = diag_cnt + 1
             return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
@@ -1282,23 +1340,23 @@ class SimuInterface:
             try:
                 if self._model is None or self._data is None:
                     if do_diag:
-                        print(f"[GET-CAM] #{diag_cnt}: model/data None -> empty", flush=True)
+                        logger.debug(f"[GET-CAM] #{diag_cnt}: model/data None -> empty")
                     self._get_cam_diag_cnt = diag_cnt + 1
                     return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
                 mujoco.mj_forward(self._model, self._data)
 
                 if do_diag:
-                    print(f"[GET-CAM] #{diag_cnt}: mj_forward OK, ensure_renderer...", flush=True)
+                    logger.debug(f"[GET-CAM] #{diag_cnt}: mj_forward OK, ensure_renderer...")
 
                 self._ensure_renderer_for_current_thread()
 
                 if do_diag:
-                    print(f"[GET-CAM] #{diag_cnt}: renderer={'OK' if self._renderer else 'NONE'}", flush=True)
+                    logger.debug(f"[GET-CAM] #{diag_cnt}: renderer={'OK' if self._renderer else 'NONE'}")
 
                 if self._renderer is None:
                     if do_diag:
-                        print(f"[GET-CAM] #{diag_cnt}: renderer NONE -> empty", flush=True)
+                        logger.debug(f"[GET-CAM] #{diag_cnt}: renderer NONE -> empty")
                     self._get_cam_diag_cnt = diag_cnt + 1
                     return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
@@ -1313,14 +1371,13 @@ class SimuInterface:
 
                     if do_diag:
                         img_min, img_max = img.min(), img.max()
-                        print(f"[GET-CAM] #{diag_cnt}: cam={name} shape={img.shape} min={img_min} max={img_max} mean={img.mean():.1f}", flush=True)
+                        logger.debug(f"[GET-CAM] #{diag_cnt}: cam={name} shape={img.shape} min={img_min} max={img_max} mean={img.mean():.1f}")
 
                     images[name] = np.copy(img)
 
             except Exception as e:
-                print(f"[SimuInterface] get_camera_images error: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+                logger.warning(f"[SimuInterface] get_camera_images error: {e}")
+                logger.debug(traceback.format_exc())
                 self._get_cam_diag_cnt = diag_cnt + 1
                 return {name: np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8) for name in cam_names}
 
@@ -1357,7 +1414,7 @@ class SimuInterface:
         )
         self._render_process.start()
         self._use_process_renderer = True
-        print(f"[SimuInterface] Render process started (object_body={self._active_object_body_name})")
+        logger.info(f"[SimuInterface] Render process started (object_body={self._active_object_body_name})")
 
 
     def start_render_process(self, camera_names: Optional[List[str]] = None):
@@ -1373,7 +1430,7 @@ class SimuInterface:
         """实机同步模式: 接收真实机器人数据并更新仿真"""
         self.set_joint_target(joint_positions)
         self.set_gripper(gripper_position)
-        self.step(1000)
+        self.step(1)
 
     def update_render_state(self, joints: np.ndarray, gripper: float, obj_pos: Optional[np.ndarray] = None):
         """更新进程渲染器的状态（封装对 _render_process 的直接访问）
@@ -1411,25 +1468,27 @@ class SimuInterface:
             是否成功
         """
         if not self._use_ik or self._ik_solver is None:
-            print("[SimuInterface] IK not available, cannot move to cartesian position")
-            print(f"  _use_ik={self._use_ik}, _ik_solver={'None' if self._ik_solver is None else 'initialized'}, IK_AVAILABLE={IK_AVAILABLE}")
+            logger.warning("[SimuInterface] IK not available, cannot move to cartesian position")
+            logger.debug(f"  _use_ik={self._use_ik}, _ik_solver={'None' if self._ik_solver is None else 'initialized'}, IK_AVAILABLE={IK_AVAILABLE}")
             return False
         
-        print(f"[SimuInterface] Starting move_to_cartesian to {position}")
+        logger.info(f"[SimuInterface] Starting move_to_cartesian to {position}")
         
         try:
             # 获取当前关节角度和位置
             with self._lock:
-                current_q = self.get_joint_state()
+                # get_joint_state 返回度数，IK 求解器需要弧度
+                current_q_deg = self.get_joint_state()
+                current_q = np.deg2rad(current_q_deg)
                 current_pos = self._ik_solver.forward_kinematics(current_q)
-            print(f"[SimuInterface] Current joints: {np.rad2deg(current_q)}")
-            print(f"[SimuInterface] Current position: {current_pos}")
+            logger.debug(f"[SimuInterface] Current joints (deg): {current_q_deg}")
+            logger.debug(f"[SimuInterface] Current position: {current_pos}")
             
             target_pos = np.array(position)
             target_ori = np.array(orientation, dtype=float) if orientation is not None else None
-            print(f"[SimuInterface] Target position: {target_pos}")
+            logger.debug(f"[SimuInterface] Target position: {target_pos}")
             if target_ori is not None:
-                print(f"[SimuInterface] Target orientation matrix enabled")
+                logger.debug(f"[SimuInterface] Target orientation matrix enabled")
             
             # 生成轨迹中间点 (笛卡尔空间插值)
             # 优化：减少轨迹点数量以提高性能
@@ -1441,7 +1500,7 @@ class SimuInterface:
                 interp_pos = current_pos + alpha * (target_pos - current_pos)
                 trajectory_points.append(interp_pos)
             
-            print(f"[SimuInterface] Generated {len(trajectory_points)} trajectory points (optimized)")
+            logger.info(f"[SimuInterface] Generated {len(trajectory_points)} trajectory points (optimized)")
             
             # 逐点执行：对每个中间点求解 IK 并执行一步仿真
             q = current_q.copy()
@@ -1466,7 +1525,7 @@ class SimuInterface:
 
                         ik_time = time.time() - ik_start_time
                         # 每步都打印 IK 信息（调试）
-                        print(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter}, err={ik_pos_err:.4f}m")
+                        logger.debug(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter}, err={ik_pos_err:.4f}m")
 
                         # 注意：inverse_kinematics 总会返回 q，不会返回 None
                         # 若姿态约束不可达，退化为位置IK，避免路径长时间偏离目标
@@ -1528,7 +1587,7 @@ class SimuInterface:
                     
                     ik_time = time.time() - ik_start_time
                     if step_idx % 5 == 0:
-                        print(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter+1}, err={error_norm:.4f}m")
+                        logger.debug(f"[SimuInterface] Step {step_idx}: IK time={ik_time*1000:.1f}ms, iter={ik_iter+1}, err={error_norm:.4f}m")
 
                 
                 # 只在访问MuJoCo资源时加锁
@@ -1544,6 +1603,7 @@ class SimuInterface:
                     
                     for _ in range(10):  # 每个轨迹点执行 10 步仿真
                         mujoco.mj_step(self._model, self._data)
+                    self._tick += 10  # 同步更新 tick 计数器
                     self.sync_viewer()
                 
                 # 每个轨迹点后短暂让出，给 GLFW viewer 和 SimuPublisher 获取锁的机会
@@ -1553,55 +1613,22 @@ class SimuInterface:
                     try:
                         step_callback()
                     except Exception as cb_e:
-                        print(f"[SimuInterface] step_callback error: {cb_e}")
+                        logger.warning(f"[SimuInterface] step_callback error: {cb_e}")
 
                 if step_idx % 20 == 0:
                     final_pos = self._ik_solver.forward_kinematics(q)
                     final_error = np.linalg.norm(target_pos - final_pos)
-                    print(f"[SimuInterface] Step {step_idx}/{steps}, target: {traj_pos}, current: {final_pos}, error to final: {final_error:.4f}m")
+                    logger.debug(f"[SimuInterface] Step {step_idx}/{steps}, target: {traj_pos}, current: {final_pos}, error to final: {final_error:.4f}m")
 
             
-            print(f"[SimuInterface] Moved to position: {position}")
+            logger.info(f"[SimuInterface] Moved to position: {position}")
             return True
             
         except Exception as e:
-            print(f"[SimuInterface] move_to_cartesian error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[SimuInterface] move_to_cartesian error: {e}")
+            logger.debug(traceback.format_exc())
             return False
-    
-    def move_to_cartesian_no_ik(self, position: np.ndarray) -> bool:
-        """
-        临时测试版本：不使用 IK，直接设置关节角度
-        用于调试卡死问题
-        """
-        print(f"[SimuInterface] move_to_cartesian_no_ik to {position}")
-        
-        try:
-            with self._lock:
-                current_q = self.get_joint_state()
-                print(f"[SimuInterface] Current joints: {np.rad2deg(current_q)}")
-                
-                current_pos = self._ik_solver.forward_kinematics(current_q)
-                print(f"[SimuInterface] Current position: {current_pos}")
-                
-                target_pos = np.array(position)
-                print(f"[SimuInterface] Target position: {target_pos}")
-                
-                diff = target_pos - current_pos
-                print(f"[SimuInterface] Position diff: {diff}")
-                
-                print("[SimuInterface] IK disabled for testing, skipping IK solving")
-                print("[SimuInterface] Test mode: returning True immediately without moving")
-                
-                return True
-                
-        except Exception as e:
-            print(f"[SimuInterface] move_to_cartesian_no_ik error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
+
     def get_tcp_pose(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """获取末端执行器 (TCP) 的位置和旋转矩阵"""
         with self._lock:
@@ -1617,7 +1644,7 @@ class SimuInterface:
                 rot = self._data.site_xmat[site_id].reshape(3, 3).copy()
                 return pos, rot
             except Exception as e:
-                print(f"[SimuInterface] get_tcp_pose error: {e}")
+                logger.warning(f"[SimuInterface] get_tcp_pose error: {e}")
                 return None, None
 
     def get_tcp_position(self) -> Optional[np.ndarray]:
@@ -1626,56 +1653,92 @@ class SimuInterface:
         return pos
 
     
-    def joint_to_cartesian(self, joint_angles: np.ndarray) -> Optional[np.ndarray]:
-        """
-        将关节角度转换为笛卡尔坐标 (正运动学)
-        
-        Args:
-            joint_angles: 关节角度 (弧度)
-            
-        Returns:
-            末端执行器位置 [x, y, z]
-        """
-        if self._ik_solver is None:
-            print("[SimuInterface] IK solver not available")
-            return None
-        
-        with self._lock:
-            try:
-                return self._ik_solver.forward_kinematics(joint_angles)
-            except Exception as e:
-                print(f"[SimuInterface] joint_to_cartesian error: {e}")
-                return None
-    
-    def cartesian_to_joint(self, position: np.ndarray, 
+    def cartesian_to_joint(self, position: np.ndarray,
                            orientation: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], bool]:
         """
         将笛卡尔坐标转换为关节角度 (逆运动学)
-        
+
+        v3 改造:优先使用解耦 IK(单步 DLS,3-5ms,失败回退到旧 IK)
+
         Args:
             position: 目标位置 [x, y, z]
             orientation: 目标姿态 (可选)
-            
+
         Returns:
             (joint_angles, success) - 关节角度和是否成功
         """
-        if self._ik_solver is None:
-            print("[SimuInterface] IK solver not available")
+        # 缓存 ik_solver 引用，避免在调用过程中被其他线程置 None（退出标定时）
+        ik_solver = self._ik_solver
+        if ik_solver is None:
+            logger.warning("[SimuInterface] IK solver not available")
             return None, False
-        
-        with self._lock:
-            try:
-                current_q = self.get_joint_state()
-                joint_angles = self._ik_solver.inverse_kinematics(
-                    position, orientation, initial_guess=current_q
-                )
-                is_valid, _ = self._ik_solver.check_joint_limits(joint_angles)
-                solve_info = self._ik_solver.get_last_solve_info() if hasattr(self._ik_solver, 'get_last_solve_info') else {}
-                return joint_angles, (is_valid and solve_info.get('success', True))
 
-            except Exception as e:
-                print(f"[SimuInterface] cartesian_to_joint error: {e}")
+        # 先获取当前关节状态（短暂持锁）
+        with self._lock:
+            if self._model is None or self._data is None:
                 return None, False
+            # get_joint_state 返回度数，IK 求解器期待弧度
+            current_q_deg = self.get_joint_state()
+            current_q = np.deg2rad(current_q_deg)
+
+        # ---- v3: 优先走解耦 IK(单步) ----
+        if self._decoupled_ik is not None:
+            try:
+                # 解耦 IK 需要目标姿态:有就用,没有就读当前 tcp 姿态(纯位置调用)
+                if orientation is not None:
+                    target_R = np.asarray(orientation, dtype=float).reshape(3, 3)
+                else:
+                    _, cur_R = self.get_tcp_pose()
+                    target_R = np.asarray(cur_R, dtype=float).reshape(3, 3)
+                target_quat = self._rotmat_to_quat_wxyz(target_R)
+                q6, success = self._decoupled_ik.solve(
+                    np.asarray(position, dtype=float).reshape(3),
+                    target_quat,
+                    current_q[:6],
+                )
+                if success:
+                    return q6, True
+                # 失败回退:不再立刻抛错,继续用旧 IK
+            except Exception as e:
+                logger.debug(f"[SimuInterface] decoupled_ik failed: {e}", exc_info=True)
+
+        # ---- 回退:旧 IK 路径(fast → 完整) ----
+        # IK 计算不需要持锁（只读操作，不修改 model/data）
+        try:
+            # 优先使用快速 IK（Jacobian DLS，迭代次数适中，5-15ms）
+            # 支持位置+姿态软约束（姿态权重0.3，位置优先）
+            # 遥操作对实时性要求高，先用 fast 求解，误差过大再降级到完整 IK
+            if hasattr(ik_solver, 'inverse_kinematics_fast'):
+                joint_angles = ik_solver.inverse_kinematics_fast(
+                    position, target_orientation=orientation, initial_guess=current_q,
+                    max_iterations=15,  # 5→15：5次迭代对累积位移不够收敛
+                )
+                is_valid, _ = ik_solver.check_joint_limits(joint_angles)
+                # 检查 fast IK 误差，过大则降级到完整 IK
+                fast_info = ik_solver.get_last_solve_info() if hasattr(ik_solver, 'get_last_solve_info') else {}
+                fast_pos_err = fast_info.get('position_error', float('inf'))
+                if is_valid and fast_pos_err < 0.03:  # 3cm 内可接受
+                    return joint_angles, True
+
+            # 降级：完整 IK（30次迭代，精度更高但慢，约50-90ms）
+            joint_angles = ik_solver.inverse_kinematics(
+                position, target_orientation=orientation, initial_guess=current_q
+            )
+            is_valid, _ = ik_solver.check_joint_limits(joint_angles)
+            solve_info = ik_solver.get_last_solve_info() if hasattr(ik_solver, 'get_last_solve_info') else {}
+            if is_valid and solve_info.get('success', True):
+                return joint_angles, True
+
+            return None, False
+
+        except Exception as e:
+            logger.warning(f"[SimuInterface] cartesian_to_joint error: {e}")
+            return None, False
+
+    def _rotmat_to_quat_wxyz(self, R: np.ndarray) -> np.ndarray:
+        """3x3 旋转矩阵 → wxyz 四元数(转调 kortex_simu.ik.quat_utils)"""
+        from kortex_simu.ik.quat_utils import R_to_quat_wxyz
+        return R_to_quat_wxyz(R)
     
     def is_ik_available(self) -> bool:
         """检查 IK 是否可用"""
@@ -1727,7 +1790,7 @@ class SimuInterface:
                 try:
                     del self._glfw_ctx
                 except Exception:
-                    pass
+                    logger.debug("Failed to delete _glfw_ctx in __del__", exc_info=True)
                 self._glfw_ctx = None
             
             if hasattr(self, '_thread_renderers') and self._thread_renderers:
@@ -1741,25 +1804,43 @@ class SimuInterface:
             # 注意：不在 __del__ 中调用 glfw.terminate()
             # 原因同 disconnect()：可能导致延迟 GC 的 GLContext 析构崩溃
         except Exception:
-            pass
+            logger.debug("__del__ cleanup failed", exc_info=True)
 
 
-class MockSimuInterface:
-    """模拟仿真接口 - 用于测试"""
+class SimuStubInterface:
+    """仿真接口桩 - 用于测试（不依赖 MuJoCo 运行）"""
     
-    def __init__(self, xml_path: Optional[str] = None, camera_names: Optional[List[str]] = None):
+    def __init__(self, xml_path: Optional[str] = None, camera_names: Optional[List[str]] = None, use_ik: bool = False, **kwargs):
         self._xml_path = xml_path
         self._joint_state = np.zeros(6)
         self._gripper_state = 0.0
         self._camera_names = camera_names or ['agentview', 'top']
         self._connected = False
+        self._collecting_active = False
+        self._tcp_position = np.array([0.3, 0.0, 0.2])
+        # MuJoCo 兼容属性
+        self._model = None
+        self._data = None
+        self._lock = threading.Lock()
+        self._render_height = 480
+        self._render_width = 640
+        self._use_process_renderer = False
+        self._render_process = None
+        self._renderer = None
+        self._renderer_thread_id = None
+        self._gripper_indices = []
+        self._gripper_max_open = 0.8
+        self._tcp_site_name = "tcp"
+        self._active_object_body_name = "cube"
+        self._use_ik = use_ik
 
-    def initialize(self, xml_path: Optional[str] = None) -> bool:
+    def initialize(self, xml_path: Optional[str] = None, show_viewer: bool = False, **kwargs) -> bool:
         self._connected = True
-        print("[MockSimuInterface] Initialized")
+        logger.info("[SimuStubInterface] Initialized")
         return True
 
     def get_joint_state(self) -> np.ndarray:
+        """返回关节角度（度），与真实接口保持一致"""
         return self._joint_state
 
     def set_joint_target(self, positions: np.ndarray) -> bool:
@@ -1779,7 +1860,20 @@ class MockSimuInterface:
     def set_object_position(self, object_name: str, position: np.ndarray) -> bool:
         return True
 
-    def step(self, n_steps: int = 1000):
+    def step(self, n_steps: int = 1):
+        """空实现 - Stub 不推进仿真状态，仅用于接口兼容"""
+        pass
+
+    def get_tick(self) -> int:
+        return 0
+
+    def get_sim_time(self) -> float:
+        return 0.0
+
+    def reset_sim_time(self):
+        pass
+
+    def sync_viewer(self):
         pass
 
     def render(self, camera_name: Optional[str] = None) -> np.ndarray:
@@ -1809,17 +1903,70 @@ class MockSimuInterface:
         return self._collecting_active
 
     def start_process_renderer(self, camera_names: Optional[List[str]] = None):
+        """空实现 - Mock 不启动渲染进程，仅用于接口兼容"""
         pass
 
     def start_render_process(self, camera_names: Optional[List[str]] = None):
         self.start_process_renderer(camera_names)
 
     def stop_process_renderer(self):
+        """空实现 - Mock 无渲染进程需要停止，仅用于接口兼容"""
         pass
 
     def update_from_real(self, joint_positions: np.ndarray, gripper_position: float):
         self._joint_state = np.array(joint_positions[:6])
         self._gripper_state = gripper_position
+
+    def get_tcp_pose(self):
+        """返回 (position, rotation_matrix)"""
+        pos = getattr(self, '_tcp_position', np.array([0.3, 0.0, 0.2]))
+        rot = np.eye(3)
+        return pos, rot
+
+    def get_tcp_position(self):
+        """返回 TCP 位置 [x, y, z]"""
+        return getattr(self, '_tcp_position', np.array([0.3, 0.0, 0.2]))
+
+    def set_joint_positions(self, positions: np.ndarray, gripper: float = 0.0):
+        """直接设置关节位置（用于初始位姿）"""
+        self._joint_state = np.array(positions[:6])
+        self._gripper_state = float(gripper)
+
+    def is_ik_available(self) -> bool:
+        return True
+
+    def get_active_object_body_name(self) -> str:
+        return "cube"
+
+    def update_render_state(self, joints, gripper, obj_pos):
+        """更新渲染状态（接口兼容）"""
+        pass
+
+    def update_viewer(self):
+        """更新查看器（接口兼容）"""
+        pass
+
+    def close_glfw_viewer(self):
+        """关闭 GLFW 查看器（接口兼容）"""
+        pass
+
+    def has_thread_renderer(self, tid):
+        return False
+
+    def get_thread_renderer(self, tid):
+        return None
+
+    def set_thread_renderer(self, tid, renderer):
+        pass
+
+    def pop_thread_renderer(self, tid):
+        pass
+
+    def clear_thread_renderers(self):
+        pass
+
+    def get_thread_renderer_tids(self):
+        return []
 
     def disconnect(self):
         self._connected = False
@@ -1832,6 +1979,8 @@ class MockSimuInterface:
 def build_scene_with_object(base_scene_xml: str, object_model_xml: str, object_body_name: Optional[str] = None) -> Optional[str]:
     """构建包含单个物体的场景 XML
 
+    委托给 build_scene_with_objects 实现，不传 plate 参数。
+
     Args:
         base_scene_xml: 基础场景 XML 路径（需包含 DYNAMIC_OBJECT_ASSET/BODY 占位符）
         object_model_xml: 物体模型 XML 路径
@@ -1840,56 +1989,11 @@ def build_scene_with_object(base_scene_xml: str, object_model_xml: str, object_b
     Returns:
         生成的 XML 文件路径，失败返回 None
     """
-    try:
-        base_text = Path(base_scene_xml).read_text(encoding="utf-8")
-        object_root = ET.parse(object_model_xml).getroot()
-
-        asset_elem = object_root.find("asset")
-        worldbody_elem = object_root.find("worldbody")
-        if worldbody_elem is None:
-            print(f"[build_scene_with_object] Invalid object xml (missing worldbody): {object_model_xml}")
-            return None
-
-        selected_body = None
-        if object_body_name:
-            selected_body = worldbody_elem.find(f".//body[@name='{object_body_name}']")
-
-        if selected_body is None:
-            selected_body = worldbody_elem.find("body")
-
-        if selected_body is None:
-            print(f"[build_scene_with_object] Invalid object xml (no body found): {object_model_xml}")
-            return None
-
-        asset_xml = ""
-        if asset_elem is not None:
-            object_root_dir = Path(object_model_xml).parent
-            for child in list(asset_elem):
-                file_attr = child.attrib.get("file")
-                if file_attr:
-                    file_path = Path(file_attr)
-                    if not file_path.is_absolute():
-                        child.set("file", str((object_root_dir / file_path).resolve()).replace("\\", "/"))
-
-            asset_children = [ET.tostring(child, encoding="unicode") for child in list(asset_elem)]
-            asset_xml = "\n".join(asset_children)
-
-        body_xml = ET.tostring(selected_body, encoding="unicode")
-
-        if "<!-- DYNAMIC_OBJECT_ASSET -->" not in base_text or "<!-- DYNAMIC_OBJECT_BODY -->" not in base_text:
-            print("[build_scene_with_object] Base scene xml missing DYNAMIC_OBJECT placeholders")
-            return None
-
-        composed_xml = base_text.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
-        composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
-
-        generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
-        generated_path.write_text(composed_xml, encoding="utf-8")
-        return str(generated_path)
-
-    except Exception as e:
-        print(f"[build_scene_with_object] failed: {e}")
-        return None
+    return build_scene_with_objects(
+        base_scene_xml=base_scene_xml,
+        object_model_xml=object_model_xml,
+        object_body_name=object_body_name,
+    )
 
 
 def build_scene_with_objects(
@@ -1947,7 +2051,7 @@ def build_scene_with_objects(
         plate_body_xml = ""
         if plate_model_xml:
             if not Path(plate_model_xml).exists():
-                print(f"[build_scene_with_objects] WARNING: Plate model file not found: {plate_model_xml}")
+                logger.warning(f"Plate model file not found: {plate_model_xml}")
             else:
                 try:
                     plate_root = ET.parse(plate_model_xml).getroot()
@@ -1975,36 +2079,37 @@ def build_scene_with_objects(
 
                             plate_body_xml = ET.tostring(plate_selected_body, encoding="unicode")
                         else:
-                            print("[build_scene_with_objects] WARNING: No plate body found in model")
+                            logger.warning("No plate body found in model")
                     else:
-                        print("[build_scene_with_objects] WARNING: No worldbody in plate model")
+                        logger.warning("No worldbody in plate model")
                 except Exception as e:
-                    print(f"[build_scene_with_objects] ERROR parsing plate model: {e}")
+                    logger.error(f"ERROR parsing plate model: {e}")
 
         composed_xml = base_text
         if "<!-- DYNAMIC_OBJECT_ASSET -->" in composed_xml:
             composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_ASSET -->", asset_xml)
         else:
-            print("[build_scene_with_objects] WARNING: DYNAMIC_OBJECT_ASSET not found in base XML")
+            logger.warning("DYNAMIC_OBJECT_ASSET not found in base XML")
         if "<!-- DYNAMIC_OBJECT_BODY -->" in composed_xml:
             composed_xml = composed_xml.replace("<!-- DYNAMIC_OBJECT_BODY -->", body_xml)
         else:
-            print("[build_scene_with_objects] WARNING: DYNAMIC_OBJECT_BODY not found in base XML")
+            logger.warning("DYNAMIC_OBJECT_BODY not found in base XML")
         if "<!-- PLATE_OBJECT_ASSET -->" in composed_xml:
             composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_ASSET -->", plate_asset_xml)
         else:
-            print("[build_scene_with_objects] WARNING: PLATE_OBJECT_ASSET not found in base XML")
+            logger.warning("PLATE_OBJECT_ASSET not found in base XML")
         if "<!-- PLATE_OBJECT_BODY -->" in composed_xml:
             composed_xml = composed_xml.replace("<!-- PLATE_OBJECT_BODY -->", plate_body_xml)
         else:
-            print("[build_scene_with_objects] WARNING: PLATE_OBJECT_BODY not found in base XML")
+            logger.warning("PLATE_OBJECT_BODY not found in base XML")
 
-        generated_path = Path(base_scene_xml).with_name("task_pick_place.generated.xml")
+        generated_path = Path(base_scene_xml).with_name(
+            f"task_pick_place.{Path(object_model_xml).stem}.generated.xml"
+        )
         generated_path.write_text(composed_xml, encoding="utf-8")
         return str(generated_path)
 
     except Exception as e:
-        print(f"[build_scene_with_objects] failed: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"build_scene_with_objects failed: {e}")
+        logger.debug(traceback.format_exc())
         return None

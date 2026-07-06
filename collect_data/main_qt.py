@@ -3,12 +3,18 @@
 """
 import sys
 import argparse
+import socket
 import time
+import logging
+import traceback
 import threading
 import yaml
 import numpy as np
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+
+logger = logging.getLogger(__name__)
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -21,7 +27,7 @@ from gui import MainWindow, MockTaskTunerWindow
 from PyQt5.QtWidgets import QApplication
 from scripts import (
     RealInterface,
-    SimuInterface, MockSimuInterface,
+    SimuInterface, SimuStubInterface,
     SyncController, GraspExecutor,
     RealDataCollector, SimuDataCollector,
     MessageBroker,
@@ -32,16 +38,18 @@ from scripts import (
 
 class DataCollectionSystem:
     """数据收集系统 - Qt 版本
-    
-    支持两种模式:
+
+    支持三种模式:
     1. 实机模式 (--real): 仅采集真实机器人数据
     2. 模拟模式 (--mock): 使用仿真接口测试
+    3. 遥操作模式 (--teleop): 手机ARCore遥操作控制
     """
-    
-    def __init__(self, config_path: str, use_real: bool = True, show_simu_viewer: bool = False):
+
+    def __init__(self, config_path: str, use_real: bool = True, show_simu_viewer: bool = False, teleop_mode: bool = False):
         self._config_path = config_path
         self._use_real = use_real
         self._show_simu_viewer = bool(show_simu_viewer)
+        self._teleop_mode = teleop_mode
         self._config = None
         
         # 消息总线（全局单例）
@@ -101,16 +109,14 @@ class DataCollectionSystem:
         self._task_in_progress: bool = False
         self._active_task_info: Dict[str, Any] = {}
         self._finish_lock = threading.Lock()  # 防 finish_current_task 重入
-        
-        # Mock模式吸附机制
-        self._mock_adhesion_enabled: bool = False
-        self._mock_adhesion_attached: bool = False
-        self._mock_adhesion_object_body_name: str = "cube"
-        self._mock_adhesion_object_pos: np.ndarray = np.zeros(3, dtype=float)
-        self._mock_adhesion_plate_pos: np.ndarray = np.zeros(3, dtype=float)
-        self._mock_attach_distance: float = 0.06
-        self._mock_detach_distance: float = 0.05
-        self._mock_gripper_close_threshold: float = 0.3
+
+        # 遥操作模式
+        self._ws_server = None
+        self._teleop_controller = None
+        self._teleop_axis_mapping: Dict[str, str] = {}  # 缓存手机端标定结果
+        self._teleop_rot_mapping: Dict[str, str] = {}  # 缓存手机端姿态标定结果
+        self._calibration_mode = False  # 标定模式标志
+        self._state_sync_timer: Optional[threading.Timer] = None  # 定期状态同步定时器
     
     def _transform_position(self, position: np.ndarray) -> np.ndarray:
         """将用户坐标系位置转换到MuJoCo坐标系"""
@@ -143,8 +149,7 @@ class DataCollectionSystem:
         Returns:
             [x, y, z] 随机位置数组
         """
-        if seed is not None:
-            np.random.seed(seed)
+        rng = np.random.RandomState(seed)
         
         # 从配置获取工作空间参数（支持新旧两种格式）
         workspace = self._config.get('workspace', {})
@@ -172,9 +177,9 @@ class DataCollectionSystem:
 
         max_attempts = 100
         for _ in range(max_attempts):
-            x = np.random.uniform(x_min, x_max)
-            y = np.random.uniform(y_min, y_max)
-            z = np.random.uniform(z_min, z_max) if z_min != z_max else z_min
+            x = rng.uniform(x_min, x_max)
+            y = rng.uniform(y_min, y_max)
+            z = rng.uniform(z_min, z_max) if z_min != z_max else z_min
 
             new_pos = np.array([x, y, z])
 
@@ -325,31 +330,15 @@ class DataCollectionSystem:
             self._simu = None
             self._log("实机模式：不启动仿真", "INFO")
         else:
-            # 仿真独立模式: 启用 IK，不依赖实机同步
+            # 仿真独立模式: 不立即启动仿真，等待标定或任务开始时再启动
+            # 这样启动时不会显示关节状态，只有在标定/任务时才会有
             self._log("使用仿真独立模式（IK）", "INFO")
             self._real = None
+            self._simu = None
+            self._log("仿真将在标定或任务开始时启动", "INFO")
 
-            # 使用 SimuManager 管理仿真（启用 IK）
-            if not self._simu_manager.start_simulation(
-                simu_config.get('xml_path', ''),
-                camera_names=self._simu_camera_names,
-                use_ik=True,
-                fps=20,
-                show_viewer=False,
-            ):
-                self._log("初始化仿真失败", "ERROR")
-                return False
-            self._simu = self._simu_manager.simu
-            self._log(f"仿真已初始化，IK可用: {self._simu.is_ik_available()}", "SUCCESS")
-
-        # 仅仿真模式需要
-        if self._simu is not None:
-            self._apply_sim_initial_joints()
-            self._simu.set_display_cameras(self._simu_camera_names)
         # 读取坐标变换参数（仅仿真模式使用）
         self._coord_rotation_z = simu_config.get('coord_rotation_z', 0.0)
-        if self._simu is not None:
-            self._log(f"坐标变换: 绕Z轴旋转 {self._coord_rotation_z}°", "INFO")
 
         # 计算视频帧率
         video_fps = 30
@@ -395,11 +384,11 @@ class DataCollectionSystem:
                 initial_gripper=init_gripper,
             )
         else:
-            # 仿真模式：仅仿真数据收集器
+            # 仿真模式：仅仿真数据收集器（延迟绑定simu接口，等仿真启动后再设置）
             simu_data_root = dataset_config.get('mock_simu_data_root', dataset_config.get('simu_data_root', './data/Simu/simu_data'))
             self._real_data_collector = None
             self._simu_data_collector = SimuDataCollector(
-                self._simu_manager.simu,
+                None,  # 初始化时simu还未启动，后续启动仿真后再绑定
                 data_root=simu_data_root,
                 fps=dataset_config.get('fps', 20),
                 video_fps=video_fps,
@@ -409,15 +398,15 @@ class DataCollectionSystem:
             self._sync_controller = None
 
             pre_grasp_offs = [0, 0, float(grasp_config.get('pre_grasp_height', 0.05))]
-            # 创建抓取执行器（仿真模式：使用 IK）
+            # 创建抓取执行器（仿真模式：使用 IK，simu接口延迟绑定）
             self._grasp_executor = GraspExecutor(
                 self._real,
-                self._simu,
+                None,  # 初始化时simu还未启动，后续启动仿真后再绑定
                 home_position=[0, 0, 0, 0, 0, 0],
                 pre_grasp_offset=pre_grasp_offs,
                 lift_height=grasp_config.get('lift_height', 0.20),
                 approach_height=grasp_config.get('approach_height', 0.05),
-                use_simulation=(not self._real_connected),
+                use_simulation=True,
             )
 
         # 设置每物体抓取参数
@@ -439,7 +428,11 @@ class DataCollectionSystem:
         if saved_count > 0:
             self._current_episode = saved_count + 1
             self._log(f"从进度恢复，下一个 Episode 将为 {self._current_episode} (已有 {saved_count} 条)", "INFO")
-        
+
+        # 遥操作模式初始化
+        if self._teleop_mode:
+            self._init_teleop_mode()
+
         return True
     
     def set_callbacks(self, log_callback=None, status_callback=None, task_callback=None):
@@ -447,6 +440,717 @@ class DataCollectionSystem:
         self._log_callback = log_callback
         self._status_callback = status_callback
         self._task_callback = task_callback
+
+    # ========== 遥操作模式 ==========
+
+    def _init_teleop_mode(self):
+        """初始化遥操作模式（WebSocket服务端 + TeleopController）"""
+        from scripts.phone_remote import WebSocketServer, TeleopController
+
+        teleop_config = self._config.get('teleop', {})
+
+        # 工作空间限制：将字典格式转换为扁平数组 [xmin, xmax, ymin, ymax, zmin, zmax]
+        ws_limits_raw = teleop_config.get('workspace_limits')
+        ws_limits_flat = None
+        if ws_limits_raw is not None:
+            if isinstance(ws_limits_raw, dict):
+                # 字典格式: {'x': [min, max], 'y': [min, max], 'z': [min, max]}
+                ws_limits_flat = [
+                    ws_limits_raw['x'][0], ws_limits_raw['x'][1],
+                    ws_limits_raw['y'][0], ws_limits_raw['y'][1],
+                    ws_limits_raw['z'][0], ws_limits_raw['z'][1],
+                ]
+            elif isinstance(ws_limits_raw, (list, tuple)) and len(ws_limits_raw) == 6:
+                ws_limits_flat = list(ws_limits_raw)
+            self._log(f"工作空间限制: {ws_limits_flat}", "INFO")
+
+        # 创建遥操作控制器
+        # 新增参数(vr-teleop-kit 风格):
+        #   - pos_reach_limit / rot_reach_limit:增量累积 Reach Limit,鼠标到边语义
+        #   - control_rate_hz:控制循环频率(原 20Hz → 默认 50Hz,跟手更紧)
+        #   - max_dq_pos / max_dq_rot:每 tick 关节限幅,防奇异处追跑
+        #   - ik_fail_reset:连续失败 N 次自动重置目标
+        self._teleop_controller = TeleopController(
+            robot_interface=self._real,
+            simu_interface=self._simu,
+            position_scale=teleop_config.get('position_scale', 1.0),
+            orientation_scale=teleop_config.get('orientation_scale', 0.5),
+            max_linear_speed=teleop_config.get('max_linear_speed', 0.5),
+            max_angular_speed=teleop_config.get('max_angular_speed', 30.0),
+            workspace_limits=ws_limits_flat,
+            initial_joints=self._grasp_executor.initial_joints if self._grasp_executor else None,
+            initial_gripper=self._grasp_executor.initial_gripper if self._grasp_executor else 0.0,
+            frame_callback=self._simu_data_collector.collect_frame if self._simu_data_collector else None,
+            pos_reach_limit=teleop_config.get('pos_reach_limit', 0.25),
+            rot_reach_limit=teleop_config.get('rot_reach_limit', 0.6),
+            control_rate_hz=teleop_config.get('control_rate_hz', 50.0),
+            max_dq_pos=teleop_config.get('max_dq_pos', 0.04),
+            max_dq_rot=teleop_config.get('max_dq_rot', 0.10),
+            ik_fail_reset=teleop_config.get('ik_fail_reset', 30),
+        )
+
+        # 创建 WebSocket 服务
+        ws_config = teleop_config.get('websocket', {})
+        ws_host = ws_config.get('host', '0.0.0.0')
+        ws_port = ws_config.get('port', 8765)
+        self._ws_server = WebSocketServer(
+            host=ws_host,
+            port=ws_port,
+            on_pose_delta=self._on_teleop_pose_delta,
+            on_gripper=self._on_teleop_gripper,
+            on_command=self._on_teleop_command,
+            on_connect=self._on_teleop_connect,
+            on_disconnect=self._on_teleop_disconnect,
+            on_align_direction=self._on_teleop_align_direction,
+            on_calib_obs=self._on_teleop_calib_obs,
+            on_wrist_pivot=self._on_teleop_wrist_pivot,
+            heartbeat_interval=float(ws_config.get('heartbeat_interval', 3.0)),
+            heartbeat_timeout=float(ws_config.get('heartbeat_timeout', 6.0)),
+        )
+        if not self._ws_server.start(wait_startup=2.0):
+            self._log(
+                f"[ERROR] WebSocket 服务启动失败，端口 {ws_port} 可能被占用。"
+                f"请检查端口占用或修改配置文件中的端口。", "ERROR"
+            )
+            self._ws_server = None
+            return
+
+        mode = "simu" if self._simu is not None else "real"
+        # 打印所有候选局域网 IP，便于用户在手机端填写
+        lan_ips = self._get_lan_ips()
+        if ws_host in ('0.0.0.0', '::'):
+            ip_hint = "、".join(lan_ips) if lan_ips else "(未找到局域网 IP)"
+            self._log(
+                f"遥操作模式已启动 ({mode})，监听 {ws_host}:{ws_port}，"
+                f"手机请连接到: {ip_hint}", "INFO"
+            )
+        else:
+            self._log(
+                f"遥操作模式已启动 ({mode})，监听 {ws_host}:{ws_port}，"
+                f"手机请连接到同一 IP", "INFO"
+            )
+
+    @staticmethod
+    def _get_lan_ips() -> list:
+        """获取本机所有 IPv4 地址（排除回环），用于在日志中提示手机端连接 IP"""
+        ips = []
+        try:
+            import socket
+            # 通过 UDP 连接获取本机出口 IP（不真正发包）
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                ips.append(s.getsockname()[0])
+            finally:
+                s.close()
+            # 再补充 gethostbyname_ex 的所有地址
+            hostname = socket.gethostname()
+            try:
+                _, _, addrlist = socket.gethostbyname_ex(hostname)
+                for ip in addrlist:
+                    if ip not in ips and not ip.startswith("127."):
+                        ips.append(ip)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return ips
+
+    def _on_teleop_connect(self):
+        """手机连接成功回调"""
+        self._log("手机已连接", "SUCCESS")
+        # 发送当前模式
+        mode = "simu" if self._simu is not None else "real"
+        if self._ws_server:
+            self._ws_server.send({"type": "mode", "value": mode})
+        # Publisher 接管 step(改造后:控制循环只算 IK 不 step)
+        self._set_publisher_auto_step(True)
+        # 同步当前状态给手机端
+        self._sync_state_to_phone()
+        # 启动定期状态同步（每2秒），防止网络抖动导致状态不一致
+        self._start_periodic_state_sync()
+
+    def _on_teleop_disconnect(self):
+        """手机断开回调"""
+        self._log("手机已断开", "WARNING")
+        self._stop_periodic_state_sync()
+        # Publisher 接管 step,保持画面刷新
+        self._set_publisher_auto_step(True)
+
+    def _set_publisher_auto_step(self, auto_step: bool):
+        """切换 Publisher 的 auto_step 模式
+
+        改造后(vr-teleop-kit 风格):
+          - TeleopController 控制循环只算 IK + set_joint_target,**不 step**
+          - SimuPublisher 的 auto_step 负责 mj_step 1 步/帧
+          - 两个线程短锁互补,无 simtime 回溯,无锁竞争
+        - 真正暂停采集/暂停步进时,临时关闭 auto_step 即可
+        """
+        if self._simu_manager and self._simu_manager._publisher:
+            self._simu_manager._publisher.set_auto_step(auto_step)
+
+    def _on_teleop_pose_delta(self, delta):
+        """处理 ARCore 增量位姿：只有在标定模式或任务执行中才转发给控制器"""
+        # 提前判断：如果既不在标定模式，也不在任务执行中，直接丢弃
+        if not (self._calibration_mode or self._task_in_progress):
+            return
+        # 检查控制器是否就绪
+        if not self._teleop_controller:
+            return
+        # 检查仿真是否就绪
+        if self._simu is None:
+            return
+        self._teleop_controller.apply_delta(delta)
+        # 低频回传实际末端位姿给手机端（每10次回传1次，约3Hz）
+        # 关键：使用独立线程异步读取TCP位姿，避免在WebSocket事件循环中阻塞
+        # get_tcp_position 内部持仿真锁，同步调用会阻塞事件循环
+        self._tcp_feedback_counter = getattr(self, '_tcp_feedback_counter', 0) + 1
+        if self._tcp_feedback_counter % 10 == 0 and self._ws_server:
+            import threading
+            def _send_tcp_feedback():
+                try:
+                    tcp = self._teleop_controller.get_current_tcp_pose()
+                    if tcp is not None:
+                        self._ws_server.send({
+                            "type": "tcp_pose",
+                            "x": float(tcp[0]),
+                            "y": float(tcp[1]),
+                            "z": float(tcp[2]),
+                            "rx": float(tcp[3]) if len(tcp) > 3 else 0.0,
+                            "ry": float(tcp[4]) if len(tcp) > 4 else 0.0,
+                            "rz": float(tcp[5]) if len(tcp) > 5 else 0.0,
+                        })
+                except Exception:
+                    pass
+            threading.Thread(target=_send_tcp_feedback, daemon=True).start()
+
+    def _on_teleop_gripper(self, value: float):
+        """处理夹爪控制"""
+        logger.info(f"_on_teleop_gripper: value={value}, teleop_controller={self._teleop_controller is not None}")
+        if self._teleop_controller:
+            self._teleop_controller.apply_gripper(value)
+        else:
+            self._log(f"[遥操作] 夹爪控制失败: TeleopController 未初始化", "WARNING")
+
+    def _on_teleop_command(self, cmd: dict):
+        """处理手机端控制指令
+
+        统一状态流转:
+        idle -> start_task -> collection_started
+        collection_started -> start_episode -> preparing -> episode_running
+        episode_running -> end_episode -> collection_started
+        collection_started/episode_running -> end_task -> idle
+        idle/collection_started -> calibration_start -> calibrating
+        calibrating -> calibration_end -> idle
+        """
+        cmd_type = cmd.get("type", "")
+        # 用 print + flush 确保命令接收一定能被观测到（不依赖日志级别配置）
+        print(f"[遥操作] 收到手机指令: {cmd_type}", flush=True)
+        self._log(f"[遥操作] 收到手机指令: {cmd_type}", "INFO")
+
+        if cmd_type == "start_task":
+            self.start_collection()
+
+        elif cmd_type == "start_episode":
+            # 遥操作模式：执行任务（创建场景），对齐和开始采集在 _execute_current_task 中完成
+            self.execute_next_task()
+
+        elif cmd_type == "end_episode":
+            # 异步执行，避免 finish_current_task 中的 stop_simulation 阻塞 WebSocket 事件循环
+            def _end_episode_thread():
+                try:
+                    # 先停止采集活跃状态
+                    if self._teleop_controller:
+                        self._teleop_controller.set_collecting_active(False)
+                        self._set_publisher_auto_step(True)
+                    # 先回到初始位（finish_current_task 会关闭仿真，所以必须先回位）
+                    if self._teleop_controller and self._simu_manager and self._simu_manager._simu is not None:
+                        self._teleop_controller.move_to_initial()
+                    # 结束当前任务（会关闭仿真、保存数据）
+                    self.finish_current_task()
+                    # 通知手机 episode 已保存
+                    if self._ws_server:
+                        self._ws_server.send({
+                            "type": "episode_saved",
+                            "id": self._current_episode,
+                            "success": True,
+                        })
+                    self._sync_state_to_phone()
+                except Exception as e:
+                    self._log(f"结束任务异常: {e}", "ERROR")
+            threading.Thread(target=_end_episode_thread, daemon=True).start()
+
+        elif cmd_type == "retry_episode":
+            # 异步执行，避免 stop_simulation 阻塞 WebSocket 事件循环
+            def _retry_episode_thread():
+                try:
+                    if self._teleop_controller:
+                        self._teleop_controller.set_collecting_active(False)
+                        self._set_publisher_auto_step(True)
+                    self.retry_current_task()
+                    self._sync_state_to_phone()
+                except Exception as e:
+                    self._log(f"重做任务异常: {e}", "ERROR")
+            threading.Thread(target=_retry_episode_thread, daemon=True).start()
+
+        elif cmd_type == "end_task":
+            # 异步执行，避免 stop() 中的 stop_simulation 阻塞 WebSocket 事件循环
+            def _end_task_thread():
+                try:
+                    if self._teleop_controller:
+                        self._teleop_controller.set_collecting_active(False)
+                        self._set_publisher_auto_step(True)
+                    self.stop()
+                    if self._ws_server:
+                        self._ws_server.send({"type": "task_complete"})
+                except Exception as e:
+                    self._log(f"结束收集异常: {e}", "ERROR")
+            threading.Thread(target=_end_task_thread, daemon=True).start()
+
+        elif cmd_type == "emergency_stop":
+            if self._teleop_controller:
+                self._teleop_controller.emergency_stop()
+            self.stop()
+            # stop 内部已调用 _sync_state_to_phone
+
+        elif cmd_type == "request_state_sync":
+            # 手机端主动请求状态同步（如页面切换、重连后）
+            self._sync_state_to_phone()
+            # 同时发送当前模式
+            mode = "simu" if self._simu is not None else "real"
+            if self._ws_server:
+                self._ws_server.send({"type": "mode", "value": mode})
+
+        elif cmd_type == "calibration_start":
+            self._calibration_mode = True
+            self._teleop_axis_mapping = {}
+            self._teleop_rot_mapping = {}
+            self._sync_state_to_phone()  # 立即同步标定状态
+            self._start_calibration_mode()
+            self._log("进入标定模式，移动手机观察机械臂方向", "INFO")
+
+        elif cmd_type == "calibration_end":
+            self._log("=== 退出标定模式 (开始) ===", "INFO")
+            self._log(f"退出标定前状态: _calibration_mode={self._calibration_mode}, "
+                     f"_simu={self._simu is not None}, "
+                     f"_simu_manager={self._simu_manager is not None}", "INFO")
+
+            self._calibration_mode = False
+            # 立即同步状态，让手机端知道已退出标定
+            self._sync_state_to_phone()
+
+            # 在独立线程中执行耗时的清理操作，避免阻塞 WebSocket 事件循环导致心跳超时断连
+            def _exit_calibration_thread():
+                try:
+                    # 1. 必须先停止控制循环（释放对 _lock 的占用），再停止 Publisher
+                    # 否则 Publisher.stop() 的 join 会等 Publisher 线程退出，
+                    # 而 Publisher 线程在等 _lock，_lock 被控制循环持有 → 死锁
+                    if self._teleop_controller:
+                        self._log("标定模式: 调用end_calibration()停止控制循环...", "INFO")
+                        self._teleop_controller.end_calibration()
+                        self._log("标定模式: 控制循环已停止", "INFO")
+
+                    # 2. 标记 Publisher 停止但不 join，让 Publisher 线程自然退出
+                    #    控制循环已停止，_lock 已释放，Publisher 能正常获取锁并退出
+                    self._set_publisher_auto_step(True)
+                    if self._simu_manager and self._simu_manager._publisher:
+                        self._simu_manager._publisher._fps = 20
+
+                    # 3. 移动到初始位（控制循环已停，这里同步执行）
+                    if self._teleop_controller and self._simu is not None:
+                        try:
+                            self._teleop_controller.move_to_initial()
+                            self._log("标定模式: 已回到初始位", "INFO")
+                        except Exception as e:
+                            self._log(f"标定模式: move_to_initial 异常: {e}", "WARNING")
+
+                    # 4. 停止仿真（此时控制循环已停，_lock 无竞争，Publisher 也能正常退出）
+                    if self._simu_manager is not None:
+                        try:
+                            if self._simu_manager.is_running:
+                                self._log("标定模式: 正在调用 stop_simulation()...", "INFO")
+                                self._simu_manager.stop_simulation()
+                                self._log("标定模式: stop_simulation() 完成", "INFO")
+                        except Exception as e:
+                            tb = traceback.format_exc()
+                            self._log(f"标定模式: 停止仿真异常: {e}\n{tb}", "ERROR")
+                        finally:
+                            self._simu = None
+                            self._log("标定模式: _simu 已设为 None", "INFO")
+                    else:
+                        self._simu = None
+
+                    # 5. 应用映射
+                    rot_map = self._teleop_rot_mapping
+                    if self._teleop_controller:
+                        self._teleop_controller.set_axis_mapping(
+                            self._teleop_axis_mapping,
+                            rot_mapping=rot_map
+                        )
+                        pos_count = len(self._teleop_axis_mapping)
+                        rot_count = len(rot_map) if rot_map else 0
+                        self._log(f"标定映射已应用: 位置={pos_count}/6, 姿态={rot_count}/6", "SUCCESS")
+
+                    self._sync_state_to_phone()
+                    self._log("=== 退出标定模式 (完成) ===", "INFO")
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    self._log(f"退出标定模式异常: {e}\n{tb}", "ERROR")
+
+            threading.Thread(target=_exit_calibration_thread, daemon=True).start()
+
+    def _on_teleop_calib_obs(self, msg: dict):
+        """处理交互式智能标定消息
+
+        消息类型:
+        - calib_obs_start: 开始观察 {"mode": "position"/"orientation"}
+        - calib_obs_stop: 停止观察，返回机械臂实际运动方向
+        - calib_apply_mapping: 应用映射 {"phone_dir": "z+", "expected_dir": "x+", "mode": "position"}
+        - calib_reset_position: 重置机械臂到标定起始位置
+        """
+        if not self._teleop_controller:
+            self._log("[标定] 控制器未初始化", "ERROR")
+            return
+
+        msg_type = msg.get("type", "")
+        self._log(f"[交互式标定] 收到: {msg_type}", "INFO")
+
+        if msg_type == "calib_obs_start":
+            mode = msg.get("mode", "position")
+            self._teleop_controller.start_calibration_observation(mode)
+            self._log(f"[标定] 开始观察 {mode}", "INFO")
+
+        elif msg_type == "calib_obs_stop":
+            result = self._teleop_controller.stop_calibration_observation()
+            if self._ws_server:
+                self._ws_server.send({
+                    "type": "calib_obs_result",
+                    **result
+                })
+            self._log(f"[标定] 观察结果: {result}", "INFO")
+
+        elif msg_type == "calib_apply_mapping":
+            phone_dir = msg.get("phone_dir", "")
+            expected_dir = msg.get("expected_dir", "")
+            mode = msg.get("mode", "position")
+            success = self._teleop_controller.build_mapping_from_observation(
+                phone_dir, expected_dir, mode
+            )
+            if success:
+                # 同步到 main_qt 的映射字典
+                mapping = self._teleop_controller.get_current_mapping()
+                self._teleop_axis_mapping = mapping["position_mapping"]
+                self._teleop_rot_mapping = mapping["rotation_mapping"]
+                # 通知手机端
+                if self._ws_server:
+                    self._ws_server.send({
+                        "type": "calib_mapping_updated",
+                        "success": True,
+                        "position_mapping": self._teleop_axis_mapping,
+                        "rotation_mapping": self._teleop_rot_mapping,
+                    })
+                self._log(f"[标定] 映射已更新: phone_{phone_dir} -> robot_{expected_dir}", "INFO")
+            else:
+                if self._ws_server:
+                    self._ws_server.send({
+                        "type": "calib_mapping_updated",
+                        "success": False,
+                        "error": "映射建立失败",
+                    })
+                self._log(f"[标定] 映射建立失败", "ERROR")
+
+        elif msg_type == "calib_reset_position":
+            self._teleop_controller.move_to_initial()
+            self._teleop_controller.align()
+            self._log("[标定] 已重置到标定起始位置", "INFO")
+
+    def _on_teleop_wrist_pivot(self, msg_type: str, msg: dict):
+        """处理 wrist-pivot 校准消息(仿 vr-teleop-kit)
+
+        流程:
+          1. 手机端检测到双手 grip → 发 wrist_pivot_start
+          2. PC 端 5s 期间记录 controller._target(arm base 帧)样本
+          3. 5s 结束后 LS 求解 offset
+          4. 回 wrist_pivot_result 给手机
+        """
+        if not self._teleop_controller:
+            self._log("[WristPivot] 控制器未初始化", "ERROR")
+            return
+
+        if msg_type == "wrist_pivot_start":
+            duration_s = float(msg.get("duration_s", 5.0))
+
+            def _on_result(result: dict):
+                if result.get("ok"):
+                    self._log(
+                        f"[WristPivot] 校准成功 offset={result['o']}, "
+                        f"rms={result['rms'] * 1000:.1f} mm, n={result['n']}",
+                        "SUCCESS",
+                    )
+                else:
+                    self._log(
+                        f"[WristPivot] 校准失败: {result.get('reason')}",
+                        "WARNING",
+                    )
+                # 推回手机端(供 UI 显示)
+                if self._ws_server:
+                    try:
+                        self._ws_server.send({
+                            "type": "wrist_pivot_result",
+                            "ok": result.get("ok", False),
+                            "offset": result.get("o", [0, 0, 0]),
+                            "rms": result.get("rms", 0.0),
+                            "n": result.get("n", 0),
+                            "reason": result.get("reason"),
+                        })
+                    except Exception as e:
+                        logger.debug(f"send wrist_pivot_result: {e}", exc_info=True)
+
+            ok = self._teleop_controller.start_wrist_pivot_calibration(
+                on_result=_on_result,
+                duration_s=duration_s,
+            )
+            if ok:
+                self._log(
+                    f"[WristPivot] 开始校准,时长 {duration_s}s,"
+                    f"请双手握紧手柄并自由转动腕部",
+                    "INFO",
+                )
+            else:
+                self._log("[WristPivot] 启动失败(未对齐?)", "ERROR")
+
+        elif msg_type == "wrist_pivot_stop":
+            self._teleop_controller.stop_wrist_pivot_calibration()
+            self._log("[WristPivot] 已停止校准", "INFO")
+
+    def _on_teleop_align_direction(self, axis: str, phone_axis: str):
+        """处理方向标定结果
+
+        Args:
+            axis: 机械臂方向 (如 "x+", "y-", "z+", "rx+", "ry-", "rz+")
+            phone_axis: 手机方向 (如 "x+", "y-", "z+")
+        """
+        # 区分位置映射和姿态映射
+        is_rotation = axis.startswith('r')  # "rx+", "ry-", "rz+" 等
+
+        if is_rotation:
+            # 姿态映射：存储到单独的字典
+            # 统一key格式：去掉前缀'r'，使key为 "x+"/"y-"/"z+" 等
+            # 这样与 DEFAULT_ROT_MAPPING 和 apply_delta 中的格式一致
+            normalized_axis = axis[1:]  # "rx+" -> "x+", "ry-" -> "y-"
+            self._teleop_rot_mapping[normalized_axis] = phone_axis
+            self._log(f"姿态标定: {axis}(存储为{normalized_axis}) -> {phone_axis} "
+                     f"(当前已标定 {len(self._teleop_rot_mapping)}/6)", "INFO")
+
+            # 实时更新控制器姿态映射
+            if self._teleop_controller and len(self._teleop_rot_mapping) > 0:
+                self._teleop_controller.set_axis_mapping(
+                    self._teleop_axis_mapping,
+                    rot_mapping=self._teleop_rot_mapping
+                )
+        else:
+            # 位置映射
+            self._teleop_axis_mapping[axis] = phone_axis
+            self._log(f"位置标定: {axis} -> {phone_axis} (当前已标定 {len(self._teleop_axis_mapping)}/6)", "INFO")
+
+            # 实时更新控制器位置映射
+            if self._teleop_controller and len(self._teleop_axis_mapping) > 0:
+                rot_map = self._teleop_rot_mapping
+                self._teleop_controller.set_axis_mapping(
+                    self._teleop_axis_mapping,
+                    rot_mapping=rot_map
+                )
+
+    def _start_calibration_mode(self):
+        """启动标定模式：仿真=启动仿真不录制，实机=控制实机
+
+        标定模式不进行任何数据录制，仅让用户移动手机观察机械臂方向，
+        以确认轴映射是否正确。
+        """
+        def _calibration_thread():
+            try:
+                self._log("标定模式: 开始初始化...", "INFO")
+
+                # 检查可用接口
+                has_simu = self._simu is not None or (self._simu_base_xml_path and self._simu_manager)
+                has_real = self._real_connected
+
+                self._log(f"标定模式: has_simu={has_simu}, _simu exists={self._simu is not None}, "
+                         f"_simu_base_xml_path={bool(self._simu_base_xml_path)}, "
+                         f"_simu_manager exists={self._simu_manager is not None}", "INFO")
+                self._log(f"标定模式: has_real={has_real}, _teleop_controller exists={self._teleop_controller is not None}", "INFO")
+
+                if has_simu:
+                    # 仿真模式：启动一个简单仿真场景（无物体、不录制）
+                    if self._simu is None and self._simu_manager:
+                        calib_config = {
+                            'base_scene_xml': self._simu_base_xml_path,
+                            'camera_names': self.get_simu_camera_names() if hasattr(self, 'get_simu_camera_names') else ['top'],
+                            'use_ik': True,
+                            'fps': 20,
+                            'show_viewer': False,  # 不启动被动查看器，避免与GLFW查看器冲突
+                        }
+                        if self._sim_initial_joints_deg is not None:
+                            calib_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
+                            self._log(f"标定模式: 初始关节={calib_config['initial_joints_deg']}", "INFO")
+                        else:
+                            self._log("标定模式: 未配置初始关节，将使用全0姿态", "WARNING")
+                        calib_config['initial_gripper'] = getattr(self, '_sim_initial_gripper', 0.0)
+
+                        self._log(f"标定模式: 正在启动仿真, xml={calib_config['base_scene_xml']}", "INFO")
+                        if not self._simu_manager.start_task_simulation(calib_config):
+                            self._log("标定模式: 仿真启动失败", "ERROR")
+                            self._calibration_mode = False
+                            self._sync_state_to_phone()
+                            return
+
+                        self._simu = self._simu_manager.simu
+                        self._log(f"标定模式: 仿真已启动, simu={self._simu is not None}", "INFO")
+
+                        if self._simu is not None:
+                            joints = self._simu.get_joint_state()  # 度数
+                            pos = self._simu.get_tcp_position()
+                            self._log(f"标定模式: 当前关节(deg)={joints.tolist() if joints is not None else 'None'}", "INFO")
+                            self._log(f"标定模式: 当前位置={pos.tolist() if pos is not None else 'None'}", "INFO")
+
+                    # 启动 GLFW 查看器（遥操作模式下强制启动，非遥操作模式按配置）
+                    if self._simu and (self._teleop_mode or self._show_simu_viewer):
+                        self._log("标定模式: 启动仿真查看器...", "INFO")
+                        viewer_started = self._simu.start_glfw_viewer(width=1200, height=900, title="Calibration Mode")
+                        if viewer_started:
+                            self._log("标定模式: GLFW 查看器已启动", "SUCCESS")
+                        else:
+                            self._log("标定模式: GLFW 查看器启动失败", "WARNING")
+
+                    # 更新 TeleopController 的仿真接口
+                    if self._teleop_controller:
+                        self._log("标定模式: 配置 TeleopController...", "INFO")
+                        self._teleop_controller.set_simu_interface(self._simu)
+                        # 禁用 Publisher 自动推进，由控制循环负责 step()
+                        self._set_publisher_auto_step(False)
+                        # 标定模式降低 publisher 频率到5Hz，减少相机渲染锁竞争，提高控制循环响应速度
+                        if self._simu_manager and self._simu_manager._publisher:
+                            self._simu_manager._publisher._fps = 5
+                            self._log("标定模式: Publisher 频率降为5Hz减少锁竞争", "INFO")
+                        # 调用start_calibration启动标定模式（自动对齐+启动控制循环）
+                        self._teleop_controller.start_calibration()
+                        self._log(f"标定模式(仿真): aligned={self._teleop_controller.is_aligned}, "
+                                 f"control_running={self._teleop_controller.is_control_running}, "
+                                 f"calibrating={self._calibration_mode}", "INFO")
+
+                elif has_real:
+                    # 实机模式：直接控制实机
+                    self._log("标定模式: 使用实机模式", "INFO")
+                    if self._teleop_controller:
+                        self._teleop_controller.set_simu_interface(None)
+                        # 调用start_calibration启动标定模式
+                        self._teleop_controller.start_calibration()
+                        self._log("标定模式(实机): 已启动，移动手机观察机械臂", "SUCCESS")
+                else:
+                    self._log("标定模式: 无仿真或实机可用", "ERROR")
+                    self._calibration_mode = False
+
+                # 标定模式启动后同步状态
+                self._sync_state_to_phone()
+                self._log("标定模式: 初始化完成", "INFO")
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                self._log(f"标定模式启动失败: {e}\n{tb}", "ERROR")
+                self._calibration_mode = False
+                self._sync_state_to_phone()
+
+        threading.Thread(target=_calibration_thread, daemon=True).start()
+
+    def is_teleop_mode(self) -> bool:
+        """是否为遥操作模式"""
+        return self._teleop_mode
+
+    def is_phone_connected(self) -> bool:
+        """手机是否已连接"""
+        return self._ws_server is not None and self._ws_server.is_connected
+
+    def _sync_state_to_phone(self):
+        """将当前 PC 端状态同步给手机端，避免双端操作冲突
+
+        统一状态定义:
+        - idle: 未开始收集
+        - collection_started: 已开启收集，等待开启任务/标定
+        - preparing: 正在准备场景（创建仿真、加载模型）
+        - calibrating: 标定模式中（仿真已启动，可移动手机调试）
+        - episode_running: 任务执行中（仿真已启动、已对齐、控制循环运行，可遥操作）
+        """
+        if not self._ws_server or not self._ws_server.is_connected:
+            return
+
+        # 标定模式优先
+        if self._calibration_mode:
+            pc_state = "calibrating"
+        elif not self._running:
+            pc_state = "idle"
+        elif self._task_in_progress:
+            pc_state = "episode_running"
+        elif self._waiting_for_next_task:
+            pc_state = "preparing"
+        else:
+            pc_state = "collection_started"
+
+        # 获取遥操作控制器状态
+        ctrl = self._teleop_controller
+        simu_ready = (self._simu is not None)
+        aligned = ctrl.is_aligned if ctrl else False
+        control_running = ctrl.is_control_running if ctrl else False
+        can_control = simu_ready and aligned and control_running and not (ctrl.is_emergency_stopped if ctrl else True)
+
+        self._ws_server.send({
+            "type": "state_sync",
+            "state": pc_state,
+            "episode": self._current_episode,
+            "task_index": self._current_task_index,
+            "task_in_progress": self._task_in_progress,
+            "collecting": self._running,
+            "calibrating": self._calibration_mode,
+            "simu_ready": simu_ready,
+            "aligned": aligned,
+            "control_running": control_running,
+            "can_control": can_control,
+        })
+
+    def _start_periodic_state_sync(self):
+        """启动定期状态同步（每2秒），防止网络抖动导致双端状态不一致"""
+        self._stop_periodic_state_sync()
+        self._state_sync_timer = threading.Timer(2.0, self._periodic_state_sync_tick)
+        self._state_sync_timer.daemon = True
+        self._state_sync_timer.start()
+
+    def _periodic_state_sync_tick(self):
+        """定期同步一次状态，然后重新设置定时器"""
+        if self._ws_server and self._ws_server.is_connected:
+            self._sync_state_to_phone()
+            self._state_sync_timer = threading.Timer(2.0, self._periodic_state_sync_tick)
+            self._state_sync_timer.daemon = True
+            self._state_sync_timer.start()
+
+    def _stop_periodic_state_sync(self):
+        """停止定期状态同步"""
+        if self._state_sync_timer is not None:
+            self._state_sync_timer.cancel()
+            self._state_sync_timer = None
+
+    def get_local_ip(self) -> str:
+        """获取本机局域网 IP 地址"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+
+    def get_teleop_port(self) -> int:
+        """获取遥操作 WebSocket 端口"""
+        if self._ws_server is not None:
+            return self._ws_server._port
+        return 8765
 
     def _redirect_tqdm_to_log(self):
         """将 tqdm 进度条（LeRobot 内部使用）重定向到 Qt 日志面板"""
@@ -481,13 +1185,18 @@ class DataCollectionSystem:
                         info = info[:97] + "..."
                     _self._log(info, "INFO")
                 except Exception:
-                    pass  # 静默失败，不干扰正常流程
+                    logger.debug("Frame callback error", exc_info=True)
 
+        # 仅替换当前模块引用，不影响其他库的 tqdm 使用
+        import sys
         _tqdm_module.tqdm = _TqdmToLog
+        # 保存原始 tqdm 以便恢复
+        self._original_tqdm = _tqdm_original
     
     def _log(self, message: str, level: str = "INFO"):
         """输出日志"""
-        print(f"[{level}] {message}")
+        log_level = getattr(logging, level, logging.INFO)
+        logger.log(log_level, message)
         if self._log_callback:
             self._log_callback(message, level)
     
@@ -555,7 +1264,6 @@ class DataCollectionSystem:
         if not object_model_xml:
             return fallback
         try:
-            import xml.etree.ElementTree as ET
             root = ET.parse(object_model_xml).getroot()
             worldbody = root.find("worldbody")
             if worldbody is None:
@@ -624,9 +1332,33 @@ class DataCollectionSystem:
         object_position: Optional[np.ndarray] = None,
         object_model_xml: Optional[str] = None,
     ) -> bool:
-        if self._simu is None or self._grasp_executor is None:
+        if self._grasp_executor is None:
             self._log('系统未初始化，无法进入标定模式', 'ERROR')
             return False
+
+        # 如果仿真尚未启动，先启动基础仿真
+        if self._simu is None:
+            self._log('prepare_object_tuning: 仿真未启动，先启动基础仿真', 'INFO')
+            if self._simu_manager is None or not self._simu_base_xml_path:
+                self._log('prepare_object_tuning: 无法启动仿真，缺少 SimuManager 或 xml_path', 'ERROR')
+                return False
+
+            calib_config = {
+                'base_scene_xml': self._simu_base_xml_path,
+                'camera_names': self.get_simu_camera_names() if hasattr(self, 'get_simu_camera_names') else ['top'],
+                'use_ik': True,
+                'fps': 20,
+                'show_viewer': False,
+            }
+            if self._sim_initial_joints_deg is not None:
+                calib_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
+            calib_config['initial_gripper'] = getattr(self, '_sim_initial_gripper', 0.0)
+
+            if not self._simu_manager.start_task_simulation(calib_config):
+                self._log('prepare_object_tuning: 仿真启动失败', 'ERROR')
+                return False
+            self._simu = self._simu_manager.simu
+            self._log(f'prepare_object_tuning: 仿真已启动, simu={self._simu is not None}', 'INFO')
 
         try:
             task_id_resolved, obj_name, obj_pos = self._resolve_tuning_task(task_id, object_name, object_position)
@@ -666,14 +1398,14 @@ class DataCollectionSystem:
             waypoints = self._grasp_executor.get_waypoints()
             pre_pose = np.array(waypoints[0][0], dtype=float)
             pre_pos = pre_pose[:3]
-            pre_ori = self._grasp_executor._euler_xyz_deg_to_rotmat(pre_pose[3:6]) if len(pre_pose) >= 6 else None
+            pre_ori = self._grasp_executor.euler_xyz_deg_to_rotmat(pre_pose[3:6]) if len(pre_pose) >= 6 else None
 
             self._log(f'标定模式: 先执行IK到目标上方，task={task_id_resolved}, object={obj_name}', 'INFO')
             ok = self._simu.move_to_cartesian(pre_pos, orientation=pre_ori, duration=2.0, steps=100)
             if not ok:
                 self._log('IK到预抓取位失败，可直接手动拖动关节继续标定', 'WARNING')
 
-            self._simu.step(120)
+            self._simu.step(30)
             return True
         except Exception as e:
             self._log(f'prepare_object_tuning 失败: {e}', 'ERROR')
@@ -684,7 +1416,7 @@ class DataCollectionSystem:
             return False
         ok = self._simu.set_joint_target(np.asarray(joints_deg[:6], dtype=float))
         if ok:
-            self._simu.step(30)
+            self._simu.step(10)
         return ok
 
     def set_tuning_gripper(self, gripper: float) -> bool:
@@ -692,7 +1424,7 @@ class DataCollectionSystem:
             return False
         ok = self._simu.set_gripper(float(np.clip(gripper, 0.0, 1.0)))
         if ok:
-            self._simu.step(30)
+            self._simu.step(10)
         return ok
 
     def tuning_move_to_pose(self, pose: np.ndarray) -> bool:
@@ -712,7 +1444,7 @@ class DataCollectionSystem:
                 euler = np.asarray(pose[3:6], dtype=float)
                 # 将欧拉角归一化到 [-180, 180]
                 euler = np.mod(euler + 180, 360) - 180
-                target_ori = self._grasp_executor._euler_xyz_deg_to_rotmat(euler)
+                target_ori = self._grasp_executor.euler_xyz_deg_to_rotmat(euler)
             
             success = self._simu.move_to_cartesian(
                 target_pos,
@@ -740,9 +1472,7 @@ class DataCollectionSystem:
                     if viewer.is_running():
                         return True
                 except Exception:
-                    pass
-            
-            # 按需启动查看器
+                    logger.debug("Viewer check failed", exc_info=True)
             if self._real_connected:
                 # 实机已连接：启动被动查看器
                 if hasattr(self._simu, 'start_viewer'):
@@ -767,12 +1497,11 @@ class DataCollectionSystem:
                 try:
                     self._simu.sync_control_to_current_state()
                 except Exception:
-                    pass
+                    logger.debug("sync_control_to_current_state failed", exc_info=True)
         except Exception:
-            pass
+            logger.debug("Simu state sync failed", exc_info=True)
 
-        joints_rad = self._simu.get_joint_state()
-        joints_deg = np.rad2deg(joints_rad)
+        joints_deg = self._simu.get_joint_state()  # 度数
         gripper = float(self._simu.get_gripper_state())
 
         tcp_pos = np.zeros(3, dtype=float)
@@ -791,8 +1520,9 @@ class DataCollectionSystem:
                 if float(np.linalg.norm(body_pos)) > 1e-9:
                     obj_pos = body_pos
             except Exception:
-                pass
+                logger.debug("Failed to get object position", exc_info=True)
 
+        # 计算抓取偏移：TCP 相对于物体中心的偏移
         offset = tcp_pos - obj_pos
 
         return {
@@ -846,6 +1576,9 @@ class DataCollectionSystem:
 
     def start_collection(self, start_task_index: int = 0, episode: int = None):
         """开始数据收集 - 每个任务是一个独立的 episode"""
+        if self._running:
+            self._log("数据收集已在进行中", "WARNING")
+            return
         self._current_task_index = start_task_index
         if episode is not None:
             self._current_episode = episode
@@ -873,6 +1606,7 @@ class DataCollectionSystem:
         self._log(f"数据收集已启动，当前 Episode 编号: {self._current_episode}", "SUCCESS")
         
         self._update_status("等待执行任务", "#ffa500")
+        self._sync_state_to_phone()
     
     def execute_next_task(self):
         """执行下一个任务（由 GUI 按钮触发）"""
@@ -898,6 +1632,7 @@ class DataCollectionSystem:
             return
 
         self._waiting_for_next_task = True
+        self._sync_state_to_phone()  # 立即同步 preparing 状态
         task_thread = threading.Thread(target=self._execute_current_task, daemon=True)
         task_thread.start()
 
@@ -919,20 +1654,30 @@ class DataCollectionSystem:
 
             if success:
                 self._task_in_progress = True
-                self._log('任务已启动，自动执行中...', "INFO")
-                self._update_status("自动执行中", "#44ff44")
+                if self._teleop_mode:
+                    self._log('任务已准备就绪，请移动手机开始遥操作', "INFO")
+                    self._update_status("遥操作采集中", "#44ff44")
+                    # 遥操作时降低 Publisher 频率到10Hz，减少相机渲染锁竞争，提高控制循环响应速度
+                    if self._simu_manager and self._simu_manager._publisher:
+                        self._simu_manager._publisher._fps = 10
+                        self._log("遥操作模式: Publisher 频率降为10Hz减少锁竞争", "INFO")
+                else:
+                    self._log('任务已启动，自动执行中...', "INFO")
+                    self._update_status("自动执行中", "#44ff44")
             else:
                 self._task_in_progress = False
                 self._log("任务准备失败", "WARNING")
                 self._update_status("准备失败", "#ff4444")
+            self._sync_state_to_phone()
 
         except Exception as e:
             self._log(f"任务错误: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Failed to connect to real robot: {e}")
+            logger.debug(traceback.format_exc())
             self._waiting_for_next_task = False
             self._task_in_progress = False
             self._update_status("错误", "#ff0000")
+            self._sync_state_to_phone()
 
     def retry_current_task(self):
         """重做当前任务（仅任务执行中可用）
@@ -980,6 +1725,7 @@ class DataCollectionSystem:
         # 重置任务状态
         self._task_in_progress = False
         self._active_task_info = {}
+        self._sync_state_to_phone()
 
         # 重新执行当前任务
         tasks = self._config.get('tasks', {})
@@ -1064,6 +1810,7 @@ class DataCollectionSystem:
             else:
                 self._log("等待下一个任务...", "INFO")
                 self._update_status("等待执行任务", "#ffa500")
+            self._sync_state_to_phone()
         finally:
             self._finish_lock.release()
     
@@ -1108,34 +1855,232 @@ class DataCollectionSystem:
         
         self._log(f"数据收集已停止 (共 {self._current_episode} 个 episode)", "WARNING")
         self._update_status("已停止", "#ff4444")
+        self._sync_state_to_phone()
     
     def _execute_task(self, task_id: str, task_config: dict) -> bool:
-        """准备并执行单个任务"""
+        """准备并执行单个任务
+        
+        遥操作模式流程（完全独立，无自动执行）：
+        1. 检查手机连接状态
+        2. 停止旧仿真，创建新仿真场景
+        3. 强制启动仿真查看器
+        4. 配置TeleopController
+        5. 执行对齐
+        6. 启动数据录制
+        7. 设置collecting_active=True，等待手机遥操作
+        """
+        task_name = task_config.get('description', task_id)
+        object_name = task_config.get('object_name', 'cube')
+        
+        self._log(f"═══════════════════════════════════════════════════════", "INFO")
+        self._log(f"开始执行任务: {task_name}", "INFO")
+        self._log(f"遥操作模式: {self._teleop_mode}", "INFO")
+        
+        phone_connected = False
+        if self._ws_server is not None:
+            try:
+                # is_connected 是 @property，不是方法，不能用 is_connected()
+                phone_connected = self._ws_server.is_connected
+            except Exception:
+                phone_connected = False
+        self._log(f"手机连接状态: {phone_connected}", "INFO")
+        
         try:
-            task_name = task_config.get('description', task_id)
-            object_name = task_config.get('object_name', 'cube')
+            # ==============================================================
+            # 遥操作模式：优先处理，提前返回，绝不执行后面的自动执行逻辑
+            # ==============================================================
+            if self._teleop_mode:
+                self._log("【遥操作模式】开始准备任务场景...", "INFO")
+                
+                if not phone_connected:
+                    self._log("遥操作模式错误：手机未连接，无法开始任务", "ERROR")
+                    return False
+                
+                if not self._simu_base_xml_path or not self._simu_manager:
+                    self._log("遥操作模式错误：缺少仿真配置或SimuManager", "ERROR")
+                    return False
+                
+                if self._teleop_controller is None:
+                    self._log("遥操作模式错误：TeleopController未初始化", "ERROR")
+                    return False
+                
+                plate_pos_config = task_config.get('plate_position', [0.35, -0.15, 0.44])
+                plate_pos = self._resolve_position(plate_pos_config)
+                min_dist = self._config.get('workspace', {}).get('min_object_plate_distance', 0.15)
+                object_pos_config = task_config.get('object_position', [0.35, 0.15, 0.44])
+                object_pos = self._resolve_position(object_pos_config, existing_position=plate_pos, min_distance=min_dist)
+                
+                self._grasp_executor.set_object_type(object_name)
+                self._log(f"物体类型: {object_name}", "INFO")
+                
+                self._grasp_executor.set_target(
+                    object_position=object_pos.tolist(),
+                    place_position=plate_pos.tolist(),
+                )
+                
+                self._log("清理之前的仿真...", "INFO")
+                if self._simu is not None:
+                    try:
+                        if self._simu_manager.is_running:
+                            self._simu_manager.stop_simulation()
+                    except Exception:
+                        pass
+                    self._simu = None
+                    self._log("旧仿真已停止", "INFO")
+                
+                object_body_name = self._infer_object_body_name(object_name, task_config)
+                plate_body_name = self._infer_plate_body_name()
+                
+                self._log(f"创建任务仿真场景: object={object_name}", "INFO")
+                task_simu_config = {
+                    'base_scene_xml': self._simu_base_xml_path,
+                    'object_model_xml': self._get_object_model_xml(object_name),
+                    'object_body_name': object_body_name,
+                    'camera_names': self.get_simu_camera_names(),
+                    'use_ik': True,
+                    'fps': 20,
+                    'show_viewer': False,
+                    'use_process_renderer': False,
+                }
+                
+                plate_model_xml = self._get_plate_model_xml()
+                if plate_model_xml:
+                    task_simu_config['plate_model_xml'] = plate_model_xml
+                    task_simu_config['plate_body_name'] = plate_body_name
+                
+                simu_object_pos = self._transform_position(object_pos)
+                task_simu_config['object_position'] = simu_object_pos.tolist()
+                if self._sim_initial_joints_deg is not None:
+                    task_simu_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
+                task_simu_config['initial_gripper'] = getattr(self, '_sim_initial_gripper', 0.0)
+                
+                simu_plate_pos = self._transform_position(plate_pos)
+                if plate_model_xml and plate_body_name:
+                    task_simu_config['plate_position'] = simu_plate_pos.tolist()
+                
+                self._log("启动仿真...", "INFO")
+                if not self._simu_manager.start_task_simulation(task_simu_config):
+                    self._log(f"仿真场景创建失败: {object_name}", "ERROR")
+                    return False
+                self._simu = self._simu_manager.simu
+                self._log(f"仿真启动成功，simu={self._simu is not None}", "SUCCESS")
+                
+                self._grasp_executor.set_simu_interface(self._simu)
+                if self._simu_data_collector is not None:
+                    self._simu_data_collector.set_simu_interface(self._simu)
+                self._grasp_executor.set_sim_object_body_name(object_body_name)
+                self._simu.set_active_object_body_name(object_body_name)
+                self._teleop_controller.set_simu_interface(self._simu)
+                self._teleop_controller.set_frame_callback(None)
+                
+                self._log("启动仿真查看器...", "INFO")
+                viewer_started = False
+                try:
+                    if hasattr(self._simu, 'start_glfw_viewer'):
+                        viewer_started = self._simu.start_glfw_viewer(
+                            width=1200,
+                            height=900,
+                            title=f"遥操作 - {task_name}"
+                        )
+                except Exception as e:
+                    self._log(f"启动查看器异常: {e}", "WARNING")
+                
+                if viewer_started:
+                    self._log("仿真查看器已启动", "SUCCESS")
+                else:
+                    self._log("警告：仿真查看器启动失败，但控制仍可继续", "WARNING")
+                
+                self._active_task_info = {
+                    'task_id': task_id,
+                    'task_name': task_name,
+                    'object_name': object_name,
+                    'object_body_name': object_body_name,
+                    'object_pos': np.asarray(simu_object_pos, dtype=float),
+                    'target_pos': np.asarray(simu_plate_pos, dtype=float),
+                    'target_pos_user': np.asarray(plate_pos, dtype=float),
+                }
+                
+                single_task_info = {
+                    'task_id': task_id,
+                    'task_name': task_name,
+                    'description': task_config.get('description', task_id),
+                }
+                
+                ik_ok = False
+                if self._simu is not None:
+                    try:
+                        ik_ok = self._simu.is_ik_available()
+                    except Exception:
+                        ik_ok = False
+                self._log(f"IK求解器可用: {ik_ok}", "INFO" if ik_ok else "ERROR")
+                if not ik_ok:
+                    self._log("错误：IK不可用，机械臂无法移动", "ERROR")
+                    return False
+                
+                self._update_status("对齐中...", "#ffa500")
+                self._sync_state_to_phone()
+                self._log("执行对齐...", "INFO")
+                
+                align_ok = False
+                try:
+                    align_ok = self._teleop_controller.align()
+                except Exception as e:
+                    self._log(f"对齐异常: {e}", "ERROR")
+                    align_ok = False
+                self._log(f"对齐结果: {'成功' if align_ok else '失败'}, aligned={self._teleop_controller.is_aligned}", 
+                         "SUCCESS" if align_ok else "ERROR")
+                
+                if not align_ok:
+                    self._log("对齐失败，无法开始任务", "ERROR")
+                    self._update_status("对齐失败", "#ff4444")
+                    self._sync_state_to_phone()
+                    return False
+                
+                if self._simu_data_collector is not None:
+                    try:
+                        self._simu_data_collector.start_episode(
+                            self._current_episode,
+                            self.get_simu_camera_names(),
+                            single_task_info,
+                        )
+                        self._simu_data_collector.start_recording()
+                        self._teleop_controller.set_frame_callback(self._simu_data_collector.collect_frame)
+                    except Exception as e:
+                        self._log(f"启动数据录制失败: {e}", "WARNING")
+                self._log(f"Episode {self._current_episode} 已启动，等待手机遥操作", "INFO")
+                
+                self._set_publisher_auto_step(False)
+                self._teleop_controller.set_collecting_active(True)
+                
+                self._log("任务就绪，可以开始遥操作采集", "SUCCESS")
+                self._update_status("遥操作采集中", "#44ff44")
+                self._sync_state_to_phone()
+                return True
 
-            # 解析位置
+            # ==============================================================
+            # 非遥操作模式：离线/实机自动执行
+            # ==============================================================
+            self._log("【非遥操作模式】执行自动流程...", "INFO")
+            
             plate_pos_config = task_config.get('plate_position', [0.35, -0.15, 0.44])
             plate_pos = self._resolve_position(plate_pos_config)
             min_dist = self._config.get('workspace', {}).get('min_object_plate_distance', 0.15)
             object_pos_config = task_config.get('object_position', [0.35, 0.15, 0.44])
             object_pos = self._resolve_position(object_pos_config, existing_position=plate_pos, min_distance=min_dist)
-
+            
             self._grasp_executor.set_object_type(object_name)
             self._log(f"物体类型: {object_name}", "INFO")
-
-            # 设定抓取目标（实机和仿真共用）
+            
             self._grasp_executor.set_target(
                 object_position=object_pos.tolist(),
                 place_position=plate_pos.tolist(),
             )
-
-            # ── 仿真模式：重建场景、加载模型 ──
-            if self._simu is not None and self._simu_base_xml_path:
+            
+            has_simu = self._simu is not None or (self._simu_base_xml_path and self._simu_manager)
+            if has_simu:
                 object_body_name = self._infer_object_body_name(object_name, task_config)
                 plate_body_name = self._infer_plate_body_name()
-
+                
                 self._log(f"重建仿真场景: object={object_name}", "INFO")
                 task_simu_config = {
                     'base_scene_xml': self._simu_base_xml_path,
@@ -1144,37 +2089,36 @@ class DataCollectionSystem:
                     'camera_names': self.get_simu_camera_names(),
                     'use_ik': not self._real_connected,
                     'fps': 20,
-                    'show_viewer': False,
+                    'show_viewer': self._show_simu_viewer,
                     'use_process_renderer': self._real_connected,
                 }
-
+                
                 plate_model_xml = self._get_plate_model_xml()
                 if plate_model_xml:
                     task_simu_config['plate_model_xml'] = plate_model_xml
                     task_simu_config['plate_body_name'] = plate_body_name
-
+                
                 simu_object_pos = self._transform_position(object_pos)
                 task_simu_config['object_position'] = simu_object_pos.tolist()
                 if self._sim_initial_joints_deg is not None:
                     task_simu_config['initial_joints_deg'] = self._sim_initial_joints_deg.tolist()
                 task_simu_config['initial_gripper'] = getattr(self, '_sim_initial_gripper', 0.0)
-
+                
                 simu_plate_pos = self._transform_position(plate_pos)
                 if plate_model_xml and plate_body_name:
                     task_simu_config['plate_position'] = simu_plate_pos.tolist()
-
+                
                 if not self._simu_manager.start_task_simulation(task_simu_config):
                     self._log(f"动态加载物体失败: {object_name}", "ERROR")
                     return False
                 self._simu = self._simu_manager.simu
-
-                # 同步 SimuInterface 引用到使用方
+                
                 self._grasp_executor.set_simu_interface(self._simu)
                 if self._simu_data_collector is not None:
                     self._simu_data_collector.set_simu_interface(self._simu)
                 self._grasp_executor.set_sim_object_body_name(object_body_name)
                 self._simu.set_active_object_body_name(object_body_name)
-
+                
                 self._active_task_info = {
                     'task_id': task_id,
                     'task_name': task_name,
@@ -1185,81 +2129,84 @@ class DataCollectionSystem:
                     'target_pos_user': np.asarray(plate_pos, dtype=float),
                 }
             else:
-                # 实机模式：轻量 task_info
                 self._active_task_info = {
                     'task_id': task_id,
                     'task_name': task_name,
                     'object_name': object_name,
                     'description': task_config.get('description', task_id),
                 }
-
-            # 每个任务是一个独立的 episode
+            
             single_task_info = {
                 'task_id': task_id,
                 'task_name': task_config.get('description', task_id),
                 'description': task_config.get('description', task_id),
             }
-            if self._real_data_collector is not None:
-                self._real_data_collector.start_episode(
-                    self._current_episode,
-                    self.get_real_camera_names(),
-                    single_task_info,
-                )
-            if self._simu_data_collector is not None:
-                self._simu_data_collector.start_episode(
-                    self._current_episode,
-                    self.get_simu_camera_names(),
-                    single_task_info,
-                )
-            self._log(f"Episode {self._current_episode} 已启动 (任务: {task_name})", "INFO")
-
-            if self._real_data_collector is not None:
-                self._real_data_collector.start_recording()
-            if self._simu_data_collector is not None:
-                self._simu_data_collector.start_recording()
-            self._log("数据记录已开始，等待操作...", "INFO")
-
+            
             if self._real_connected:
-                # 实机已连接：自动执行抓取流程
                 self._log("实机模式: 自动执行抓取流程...", "INFO")
                 self._update_status("自动抓取中", "#44ff44")
-                # 在新线程中执行抓取，避免阻塞 GUI
-                import threading as _th
-                _self = self  # 闭包捕获
+                if self._real_data_collector is not None:
+                    self._real_data_collector.start_episode(
+                        self._current_episode,
+                        self.get_real_camera_names(),
+                        single_task_info,
+                    )
+                    self._real_data_collector.start_recording()
+                if self._simu_data_collector is not None:
+                    self._simu_data_collector.start_episode(
+                        self._current_episode,
+                        self.get_simu_camera_names(),
+                        single_task_info,
+                    )
+                    self._simu_data_collector.start_recording()
+                self._log(f"Episode {self._current_episode} 已启动", "INFO")
+                
                 def _auto_execute():
-                    success = _self._grasp_executor.execute()
-                    _self._log(f"自动抓取流程{'完成' if success else '未完全成功'}", "SUCCESS" if success else "WARNING")
-                    # 抓取完成后自动提交任务
-                    _self._log("正在保存 Episode...", "INFO")
-                    _self.finish_current_task()
-                _th.Thread(target=_auto_execute, daemon=True).start()
-                self._log("抓取流程已启动，等待完成...", "INFO")
+                    success = self._grasp_executor.execute()
+                    self._log(f"自动抓取流程{'完成' if success else '未完全成功'}", "SUCCESS" if success else "WARNING")
+                    self.finish_current_task()
+                threading.Thread(target=_auto_execute, daemon=True).start()
             elif self._simu is not None:
-                # 仿真模式
-                self._log("仿真模式: 使用仿真进行操作", "INFO")
+                self._log("仿真离线模式: 准备自动执行", "INFO")
+                if self._real_data_collector is not None:
+                    self._real_data_collector.start_episode(
+                        self._current_episode,
+                        self.get_real_camera_names(),
+                        single_task_info,
+                    )
+                    self._real_data_collector.start_recording()
+                if self._simu_data_collector is not None:
+                    self._simu_data_collector.start_episode(
+                        self._current_episode,
+                        self.get_simu_camera_names(),
+                        single_task_info,
+                    )
+                    self._simu_data_collector.start_recording()
+                self._log(f"Episode {self._current_episode} 已启动", "INFO")
                 if self._show_simu_viewer:
-                    self._log(f"调用 start_glfw_viewer", "INFO")
-                    viewer_started = self._simu.start_glfw_viewer(
+                    self._simu.start_glfw_viewer(
                         width=1200,
                         height=900,
-                        title=f"Offline Mode - {task_config.get('description', task_id)}"
+                        title=f"离线模式 - {task_name}"
                     )
-                    if viewer_started:
-                        self._log("GLFW 查看器已启动", "SUCCESS")
-                    else:
-                        self._log("GLFW 查看器启动失败", "WARNING")
-                # 自动 IK 到预抓取位点
                 self.move_current_task_to_pre_grasp()
-
+            
             return True
+            
         except Exception as e:
             if self._real_data_collector:
-                self._real_data_collector.stop_recording()
+                try:
+                    self._real_data_collector.stop_recording()
+                except Exception:
+                    pass
             if self._simu_data_collector:
-                self._simu_data_collector.stop_recording()
+                try:
+                    self._simu_data_collector.stop_recording()
+                except Exception:
+                    pass
             self._log(f"任务执行错误: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Task execution error: {e}")
+            logger.debug(traceback.format_exc())
             return False
 
     def _evaluate_task_success(self) -> bool:
@@ -1309,7 +2256,7 @@ class DataCollectionSystem:
             return False
         pose = np.asarray(waypoints[0][0], dtype=float)
         self._log("执行 IK 到预抓取位", "INFO")
-        return bool(self._grasp_executor._move_to_position(pose))
+        return bool(self._grasp_executor.move_to_position(pose))
 
     def move_current_task_to_grasp(self) -> bool:
         if self._grasp_executor is None:
@@ -1319,7 +2266,7 @@ class DataCollectionSystem:
             return False
         pose = np.asarray(waypoints[1][0], dtype=float)
         self._log("执行 IK 到抓取位", "INFO")
-        return bool(self._grasp_executor._move_to_position(pose))
+        return bool(self._grasp_executor.move_to_position(pose))
 
     def move_current_task_to_lift(self) -> bool:
         if self._grasp_executor is None:
@@ -1329,7 +2276,7 @@ class DataCollectionSystem:
             return False
         pose = np.asarray(waypoints[2][0], dtype=float)
         self._log("执行 IK 到抬起位", "INFO")
-        return bool(self._grasp_executor._move_to_position(pose))
+        return bool(self._grasp_executor.move_to_position(pose))
 
     def move_current_task_to_pre_place(self) -> bool:
         if self._grasp_executor is None:
@@ -1339,7 +2286,7 @@ class DataCollectionSystem:
             return False
         pose = np.asarray(waypoints[3][0], dtype=float)
         self._log("执行 IK 到预放置位", "INFO")
-        return bool(self._grasp_executor._move_to_position(pose))
+        return bool(self._grasp_executor.move_to_position(pose))
 
     def move_current_task_to_place(self) -> bool:
         if self._grasp_executor is None:
@@ -1349,7 +2296,7 @@ class DataCollectionSystem:
             return False
         pose = np.asarray(waypoints[4][0], dtype=float)
         self._log("执行 IK 到放置位", "INFO")
-        return bool(self._grasp_executor._move_to_position(pose))
+        return bool(self._grasp_executor.move_to_position(pose))
 
     def move_to_home_pose(self) -> bool:
         if self._grasp_executor is None:
@@ -1360,96 +2307,7 @@ class DataCollectionSystem:
     def get_gripper_close_position(self) -> float:
         if self._grasp_executor is None:
             return 0.65
-        return float(self._grasp_executor._gripper_close_position)
-
-    def set_mock_adhesion_targets(
-        self,
-        object_body_name: str,
-        object_pos: np.ndarray,
-        plate_pos: np.ndarray,
-        attach_distance: float = 0.06,
-        detach_distance: float = 0.05,
-        gripper_close_threshold: float = 0.3,
-    ):
-        """设置Mock模式吸附目标"""
-        self._mock_adhesion_object_body_name = object_body_name or "cube"
-        self._mock_adhesion_object_pos = np.asarray(object_pos[:3], dtype=float)
-        self._mock_adhesion_plate_pos = np.asarray(plate_pos[:3], dtype=float)
-        self._mock_attach_distance = float(max(0.005, attach_distance))
-        self._mock_detach_distance = float(max(0.005, detach_distance))
-        self._mock_gripper_close_threshold = float(np.clip(gripper_close_threshold, 0.0, 1.0))
-        self._mock_adhesion_enabled = True
-        self._mock_adhesion_attached = False
-        self._log(f"Mock吸附目标已设置: object={object_body_name}, attach_dist={self._mock_attach_distance}m", "INFO")
-
-    def clear_mock_adhesion_targets(self):
-        """清除Mock模式吸附目标"""
-        self._mock_adhesion_enabled = False
-        self._mock_adhesion_attached = False
-        self._log("Mock吸附目标已清除", "INFO")
-
-    def is_mock_adhesion_attached(self) -> bool:
-        """获取Mock模式吸附状态"""
-        return self._mock_adhesion_attached
-
-    def update_mock_adhesion(self):
-        """更新Mock模式吸附状态（应在关节/夹爪控制后调用）"""
-        if not self._mock_adhesion_enabled:
-            return
-        if self._simu is None:
-            return
-        if not hasattr(self._simu, 'get_tcp_position'):
-            return
-
-        tcp_pos = self._simu.get_tcp_position()
-        if tcp_pos is None:
-            return
-        tcp_pos = np.asarray(tcp_pos[:3], dtype=float)
-
-        body_name = self._mock_adhesion_object_body_name
-        obj_pos = np.asarray(self._simu.get_object_position(body_name), dtype=float)
-
-        gripper_state = float(self._simu.get_gripper_state())
-        gripper_is_closed = gripper_state > self._mock_gripper_close_threshold
-
-        if not self._mock_adhesion_attached:
-            dist_to_object = np.linalg.norm(tcp_pos - obj_pos)
-            if dist_to_object <= self._mock_attach_distance and gripper_is_closed:
-                self._mock_adhesion_attached = True
-                self._log(f"Mock物体已吸附: body={body_name}, dist={dist_to_object:.4f}m, gripper={gripper_state:.3f}", "INFO")
-
-        if self._mock_adhesion_attached:
-            if gripper_is_closed:
-                self._simu.set_object_position(body_name, tcp_pos, reset_z=False)
-            else:
-                dist_to_plate = np.linalg.norm(obj_pos - self._mock_adhesion_plate_pos)
-                if dist_to_plate <= self._mock_detach_distance:
-                    self._mock_adhesion_attached = False
-                    self._simu.set_object_position(body_name, self._mock_adhesion_plate_pos, reset_z=True)
-                    self._log(f"Mock物体已脱附并放置: body={body_name}, dist_to_plate={dist_to_plate:.4f}m", "INFO")
-                else:
-                    self._mock_adhesion_attached = False
-                    self._log(f"Mock物体已脱附(夹爪松开): body={body_name}, gripper={gripper_state:.3f}", "INFO")
-
-    def manual_attach_object(self) -> bool:
-        """手动强制吸附物体"""
-        if not self._mock_adhesion_enabled:
-            self._log("吸附未启用，请先设置吸附目标", "WARNING")
-            return False
-        self._mock_adhesion_attached = True
-        self._log("手动强制吸附物体", "INFO")
-        return True
-
-    def manual_detach_object(self) -> bool:
-        """手动强制脱附物体"""
-        if not self._mock_adhesion_attached:
-            return False
-        self._mock_adhesion_attached = False
-        if self._simu is not None:
-            body_name = self._mock_adhesion_object_body_name
-            self._simu.set_object_position(body_name, self._mock_adhesion_plate_pos, reset_z=True)
-        self._log("手动强制脱附物体", "INFO")
-        return True
+        return float(self._grasp_executor.gripper_close_position)
 
     def pause(self):
         """暂停数据收集"""
@@ -1512,24 +2370,36 @@ class DataCollectionSystem:
     def cleanup(self):
         """清理资源"""
         self.stop()
-        
+
+        # 停止遥操作服务
+        if self._ws_server is not None:
+            self._ws_server.stop()
+            self._ws_server = None
+        self._teleop_controller = None
+
         # 停止发布者
         if self._real_publisher is not None:
             self._real_publisher.stop()
             self._real_publisher = None
-        
+
         # 通过 SimuManager 清理仿真
         self._simu_manager.stop_simulation()
         self._simu = None
-        
+
         # 清理真实机器人
         if self._real:
             self._real.disconnect()
-        
+
         self._log("系统已清理", "INFO")
 
 
 def main():
+    # 配置日志：让 INFO 级别诊断日志能输出到控制台
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
     script_dir = Path(__file__).parent
     real_config = str(script_dir / "config" / "real_config.yaml")
     simu_config = str(script_dir / "config" / "simu_config.yaml")
@@ -1557,7 +2427,14 @@ def main():
         action="store_true",
         help="离线模式：跳过实机连接，仅使用仿真（调试用），自动使用 simu_config.yaml"
     )
+    parser.add_argument(
+        "--teleop",
+        action="store_true",
+        help="手机遥操作模式：启用 WebSocket 服务端，接收手机 ARCore 增量位姿控制机械臂"
+    )
     args = parser.parse_args()
+
+    teleop_mode = args.teleop
 
     if args.real:
         use_real = True
@@ -1571,12 +2448,15 @@ def main():
         use_real = False
         mode_name = "模拟模式 (默认)"
         default_config = simu_config
+
+    if teleop_mode:
+        mode_name += " + 遥操作"
     
     # 如果用户指定了配置文件，优先使用
     config_path = args.config if args.config else default_config
 
-    print(f"启动模式: {mode_name}")
-    print(f"配置文件: {config_path}")
+    logger.info(f"启动模式: {mode_name}")
+    logger.info(f"配置文件: {config_path}")
 
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -1587,7 +2467,8 @@ def main():
     system = DataCollectionSystem(
         config_path,
         use_real=use_real,
-        show_simu_viewer=not use_real
+        show_simu_viewer=not use_real,
+        teleop_mode=teleop_mode,
     )
 
     window.set_data_system(system)
@@ -1605,7 +2486,7 @@ def main():
 
     # 检查实机连接状态
     if use_real and not system.is_real_connected():
-        window.log("⚠️ 实机未连接，以离线模式运行（仅仿真）", "WARNING")
+        window.log("[!] 实机未连接，以离线模式运行（仅仿真）", "WARNING")
         window.update_status("离线模式（实机未连接）", "#ffa500")
 
     # 始终设置相机显示（模拟模式下实机相机为空列表）

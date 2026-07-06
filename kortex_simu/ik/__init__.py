@@ -26,10 +26,12 @@
 from .ik_solver import IKSolver, KinovaGen3LiteIK
 from .mujoco_ik import MuJoCoIK
 from .simulation_controller import SimulationController
+from .decoupled_ik import DecoupledIKSolver
 
 __all__ = [
     'IKSolver',
     'KinovaGen3LiteIK', 
     'MuJoCoIK',
-    'SimulationController'
+    'SimulationController',
+    'DecoupledIKSolver',
 ]

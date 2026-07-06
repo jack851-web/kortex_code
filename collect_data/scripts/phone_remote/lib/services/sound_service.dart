@@ -49,6 +49,16 @@ class SoundService {
     );
   }
 
+  /// 播放任务完成提示音（三连升音）
+  Future<void> playTaskComplete() async {
+    await _playProgrammaticSound(
+      frequencies: [523.25, 659.25, 783.99], // C5, E5, G5
+      durations: [150, 150, 300],
+      volumes: [0.8, 0.8, 0.7],
+      gapMs: 50,
+    );
+  }
+
   /// 程序化生成声音并播放
   Future<void> _playProgrammaticSound({
     required List<double> frequencies,
@@ -112,8 +122,21 @@ class SoundService {
 
     try {
       await _player.play(DeviceFileSource(tempFile.path));
+      // 播放完成后清理临时文件
+      _player.onPlayerComplete.first.then((_) {
+        try {
+          tempFile.deleteSync();
+        } catch (_) {}
+      }).timeout(const Duration(seconds: 5), onTimeout: () {
+        try {
+          tempFile.deleteSync();
+        } catch (_) {}
+      });
     } catch (e) {
-      // 播放失败时静默处理
+      // 播放失败时清理临时文件
+      try {
+        tempFile.deleteSync();
+      } catch (_) {}
     }
   }
 
